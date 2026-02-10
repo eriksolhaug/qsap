@@ -1,4 +1,4 @@
-# qasap Spectrum Plotter --- v0.10
+# qasap Spectrum Plotter --- v0.10 
 """
 Main spectrum plotter widget for interactive spectral analysis
 
