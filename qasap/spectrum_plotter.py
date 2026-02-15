@@ -1,4 +1,4 @@
-# qasap Spectrum Plotter --- v0.10 
+# qasap Spectrum Plotter --- v0.11
 """
 Main spectrum plotter widget for interactive spectral analysis
 
@@ -107,6 +107,7 @@ warnings.filterwarnings('ignore', category=UserWarning, module='pandas.core.comp
 from .linelist_window import LineListWindow
 from .listfit_window import ListfitWindow
 from .item_tracker import ItemTracker
+from .fit_information_window import FitInformationWindow
 from .linelist import get_available_line_lists
 from .linelist_selector_window import LineListSelector
 
@@ -186,7 +187,11 @@ class HelpWindow(QtWidgets.QDialog):
 - **-** / **_** / **=** / **+** - Show filter bandpasses
 
 ## Item Management
-- **j** - Toggle Item Tracker window
+- **j** - Toggle Item Tracker window (shows summary of all fitted profiles)
+- **K** - Toggle Fit Information window (shows detailed parameters for all fitted profiles)
+
+## Application Control
+- **q** or **Q** - Quit QASAP
 
 ## Help
 - **?** - Show this help window
@@ -323,10 +328,14 @@ class SpectrumPlotter(QtWidgets.QWidget):
 
         # Item Tracker
         self.item_tracker = ItemTracker()
+        self.fit_information_window = FitInformationWindow()
         self.item_id_counter = 0
         self.item_id_map = {}  # Maps item_id to {'type': 'gaussian', 'fit': fit_dict, ...}
         self.highlighted_item_ids = set()  # Track all currently highlighted items
         self.redshift_selected_line = None  # Track the line object selected for redshift
+        
+        # Connect items_changed signal to update total line if displayed
+        self.item_tracker.items_changed.connect(self.update_total_line_if_shown)
         
         # Help Window
         self.help_window = None
@@ -343,7 +352,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
         from qasap.ui_utils import get_qasap_icon
         self.setWindowTitle("QASAP - Control Panel")
         self.setWindowIcon(get_qasap_icon())
-        self.setGeometry(100, 100, 440, 200)
+        self.setGeometry(100, 100, 440, 230)
 
         # Create redshift input field
         self.label_redshift = QLabel("Redshift:", self)
@@ -401,13 +410,34 @@ class SpectrumPlotter(QtWidgets.QWidget):
         self.open_button = QPushButton("Load Spectrum...", self)
         self.open_button.move(120, 120)
         self.open_button.clicked.connect(self.open_spectrum_file)
+        
+        # Create a separator line
+        self.separator_line = QtWidgets.QFrame(self)
+        self.separator_line.setGeometry(20, 155, 380, 2)
+        self.separator_line.setFrameShape(QtWidgets.QFrame.HLine)
+        self.separator_line.setFrameShadow(QtWidgets.QFrame.Sunken)
+        
+        # Create a "Quit" button (positioned below Enter with spacing)
+        self.quit_button = QPushButton("Quit", self)
+        self.quit_button.move(20, 165)
+        self.quit_button.clicked.connect(self.quit_application)
+        
+        # Expand window height to accommodate new layout
+        self.setGeometry(100, 100, 440, 220)
+
+        # Create a separator line between Quit and Poly Order (hidden by default)
+        self.separator_line_poly = QtWidgets.QFrame(self)
+        self.separator_line_poly.setGeometry(20, 200, 380, 2)
+        self.separator_line_poly.setFrameShape(QtWidgets.QFrame.HLine)
+        self.separator_line_poly.setFrameShadow(QtWidgets.QFrame.Sunken)
+        self.separator_line_poly.hide()
 
         # Create polynomial order field (for continuum fitting, hidden by default)
         self.label_poly_order = QLabel("Poly Order:", self)
-        self.label_poly_order.move(20, 160)
+        self.label_poly_order.move(20, 210)
         self.label_poly_order.hide()
         self.input_poly_order = QLineEdit(self)
-        self.input_poly_order.move(105, 155)
+        self.input_poly_order.move(105, 205)
         self.input_poly_order.resize(100, 30)
         self.input_poly_order.setText("1")  # Default to first-order polynomial
         self.input_poly_order.hide()
@@ -415,6 +445,9 @@ class SpectrumPlotter(QtWidgets.QWidget):
         self.input_poly_order.setValidator(poly_validator)
         
         self.poly_order = 1  # Store the current polynomial order
+        
+        # Expand window height to accommodate poly order field when shown
+        self.setGeometry(100, 100, 440, 250)
 
         # Show the window
         self.show()
@@ -422,7 +455,9 @@ class SpectrumPlotter(QtWidgets.QWidget):
     def adjust_redshift(self, delta):
         """Adjust redshift by a specified delta value and update the input field."""
         self.redshift += delta
-        self.input_redshift.setText(f"{self.redshift:.6f}")  # Update input field with new redshift
+        # Format redshift without trailing zeros
+        redshift_str = f"{self.redshift:.6f}".rstrip('0').rstrip('.')
+        self.input_redshift.setText(redshift_str)  # Update input field with new redshift
         
         # Redisplay active line lists with new redshift
         if self.active_line_lists:
@@ -441,6 +476,10 @@ class SpectrumPlotter(QtWidgets.QWidget):
             # Update redshift and zoom factor from input fields
             self.redshift = float(self.input_redshift.text())
             self.zoom_factor = float(self.input_zoom.text())
+            
+            # Format redshift without trailing zeros for display
+            redshift_str = f"{self.redshift:.6f}".rstrip('0').rstrip('.')
+            self.input_redshift.setText(redshift_str)
             
             # Update polynomial order if visible
             if not self.input_poly_order.isHidden():
@@ -537,6 +576,10 @@ class SpectrumPlotter(QtWidgets.QWidget):
         print(f"Wavelength: {wav[0]:.2f} - {wav[-1]:.2f} Å")
         print(f"Flux range: {np.min(spec):.2e} - {np.max(spec):.2e}")
 
+    def quit_application(self):
+        """Quit the QASAP application"""
+        QtWidgets.QApplication.quit()
+
     def clear_plot_and_reset(self):
         """Clear the current plot and reset all fitting data and item tracker."""
         # Clear the axis if it exists
@@ -550,6 +593,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
         self.continuum_points_x = []
         self.continuum_points_y = []
         self.item_tracker.clear_all()
+        self.fit_information_window.clear_all()
         
         # Reset item selection tracking
         self.highlighted_item_ids.clear()
@@ -737,7 +781,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
         self.update_ticks(self.ax)
 
         # Set the custom window title
-        self.fig.canvas.manager.set_window_title("QASAP - Quick Analysis of Spectra and Profiles (v0.10)")
+        self.fig.canvas.manager.set_window_title("QASAP - Quick Analysis of Spectra and Profiles (v0.11)")
 
         self.ax.legend()
 
@@ -757,6 +801,11 @@ class SpectrumPlotter(QtWidgets.QWidget):
         self.item_tracker.estimate_redshift.connect(self.on_estimate_redshift_from_tracker)
         self.item_tracker.setGeometry(1100, 700, 650, 350)  # Position on the right side
         self.item_tracker.show()
+
+        # Connect Fit Information window signals
+        self.fit_information_window.item_selected.connect(self.on_fit_info_item_selected)
+        self.fit_information_window.item_deselected.connect(self.on_fit_info_item_deselected)
+        self.fit_information_window.setGeometry(100, 500, 1200, 400)  # Position below main window
 
         # Set icon for the matplotlib figure window
         if hasattr(self.fig, 'canvas') and hasattr(self.fig.canvas, 'manager'):
@@ -991,6 +1040,21 @@ class SpectrumPlotter(QtWidgets.QWidget):
         except (ValueError, KeyError):
             print("No existing continuum within bounds")
             return None, None, None
+    
+    def check_continuum_partial_overlap(self, left_bound, right_bound):
+        """Check if fit bounds partially overlap with any continuum region.
+        Returns (has_partial_overlap, overlap_message)
+        """
+        for continuum_fit in self.continuum_fits:
+            cont_left, cont_right = continuum_fit['bounds']
+            # Check if bounds are partially outside the continuum
+            if (left_bound < cont_left and right_bound > cont_left and right_bound <= cont_right) or \
+               (left_bound >= cont_left and left_bound < cont_right and right_bound > cont_right) or \
+               (left_bound < cont_left and right_bound > cont_right):
+                # Partial overlap - one or both bounds are outside continuum region
+                if not (cont_left <= left_bound and cont_right >= right_bound):
+                    return True, f"Fit bounds [{left_bound:.2f}, {right_bound:.2f}] partially overlap continuum region [{cont_left:.2f}, {cont_right:.2f}]"
+        return False, None
 
     def get_bounds(self, fit):
         if self.is_velocity_mode:
@@ -1956,6 +2020,8 @@ class SpectrumPlotter(QtWidgets.QWidget):
             'original_linewidth': original_linewidth
         }
         self.item_tracker.add_item(item_id, item_type, name, position=position, color=color, line_obj=line_obj)
+        # Also add to Fit Information window
+        self.fit_information_window.add_fit(item_id, item_type, fit_dict, name)
         return item_id
     
     def unregister_item(self, item_id):
@@ -1963,6 +2029,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
         if item_id in self.item_id_map:
             del self.item_id_map[item_id]
             self.item_tracker.remove_item(item_id)
+            self.fit_information_window.remove_fit(item_id)
         
         # Clean up highlighting tracking if this item was highlighted
         if item_id in self.highlighted_item_ids:
@@ -2190,6 +2257,21 @@ class SpectrumPlotter(QtWidgets.QWidget):
             df.to_csv(filename, sep='\t', index=False, float_format='%.6f')
         else:
             print("No line selected.")
+    
+    def on_fit_info_item_selected(self, item_id):
+        """Handle item selection from Fit Information window - sync with item tracker"""
+        if item_id not in self.item_id_map:
+            return
+        
+        # Call the same handler as item tracker selection
+        self.on_item_selected_from_tracker(item_id)
+        # Also highlight the corresponding item in the tracker
+        self.item_tracker.highlight_item(item_id)
+    
+    def on_fit_info_item_deselected(self):
+        """Handle item deselection from Fit Information window - sync with item tracker"""
+        # Call the same handler as item tracker deselection
+        self.on_item_deselected_from_tracker()
 
     def select_line_from_list():
         """
@@ -3012,6 +3094,103 @@ class SpectrumPlotter(QtWidgets.QWidget):
     def keyPressEvent(self, event):
         self.on_key(event)
 
+    def update_total_line_if_shown(self):
+        """Redraw the total line if it's currently displayed. Called when fits change."""
+        if self.show_total_line and (self.continuum_fits or self.voigt_fits or self.gaussian_fits or self.listfit_fits):
+            # Remove existing total line
+            total_lines = [line for line in self.ax.get_lines() if line.get_label() == "Total Line"]
+            for line in total_lines:
+                line.remove()
+            
+            # Redraw the total line
+            self.draw_total_line()
+            self.ax.figure.canvas.draw()
+    
+    def draw_total_line(self):
+        """Draw the total line from all fitted profiles."""
+        # Generate x values for plotting
+        x_plot = np.linspace(self.x_data.min(), self.x_data.max(), 10000)
+
+        # Combine continuum fits
+        total_continuum = np.zeros_like(x_plot)
+        for fit in self.continuum_fits:
+            left_bound, right_bound = fit['bounds']
+            mask = (x_plot >= left_bound) & (x_plot <= right_bound)
+            if mask.any():
+                coeffs = fit['coeffs']
+                total_continuum[mask] += np.polyval(coeffs, x_plot[mask])
+        
+        # Combine Gaussian fits
+        total_gaussian = np.zeros_like(x_plot)
+        for fit in self.gaussian_fits:
+            fit_x = fit['line'].get_xdata()
+            fit_y = fit['line'].get_ydata()
+            left_bound, right_bound = min(fit_x), max(fit_x)
+            
+            # Get continuum coefficients and interpolate to fit line's x values
+            existing_continuum_vals, a, b = self.get_existing_continuum(left_bound, right_bound)
+            if existing_continuum_vals is not None:
+                # Interpolate continuum to fit line's x values
+                continuum_interp = interp1d(self.x_data[(self.x_data >= left_bound) & (self.x_data <= right_bound)], 
+                                           existing_continuum_vals, bounds_error=False, fill_value='extrapolate')
+                existing_continuum = continuum_interp(fit_x)
+            else:
+                existing_continuum = np.zeros_like(fit_y)
+            
+            if fit['is_velocity_mode'] and self.is_velocity_mode:
+                profile_interp = interp1d(fit_x, fit_y - existing_continuum, bounds_error=False, fill_value=0)
+            elif not fit['is_velocity_mode'] and not self.is_velocity_mode:
+                profile_interp = interp1d(fit_x, fit_y - existing_continuum, bounds_error=False, fill_value=0)
+            elif not fit['is_velocity_mode'] and self.is_velocity_mode:
+                profile_interp = interp1d(self.wav_to_vel(fit_x, fit['rest_wavelength'], z=self.redshift), fit_y - existing_continuum, bounds_error=False, fill_value=0)
+            elif fit['is_velocity_mode'] and not self.is_velocity_mode:
+                profile_interp = interp1d(self.vel_to_wav(fit_x, fit['rest_wavelength'], z=self.redshift), fit_y - existing_continuum, bounds_error=False, fill_value=0)
+            total_gaussian += profile_interp(x_plot)
+
+        # Combine Voigt fits
+        total_voigt = np.zeros_like(x_plot)
+        for fit in self.voigt_fits:
+            fit_x = fit['line'].get_xdata()
+            fit_y = fit['line'].get_ydata()
+            left_bound, right_bound = min(fit_x), max(fit_x)
+            
+            # Get continuum coefficients and interpolate to fit line's x values
+            existing_continuum_vals, a, b = self.get_existing_continuum(left_bound, right_bound)
+            if existing_continuum_vals is not None:
+                # Interpolate continuum to fit line's x values
+                continuum_interp = interp1d(self.x_data[(self.x_data >= left_bound) & (self.x_data <= right_bound)], 
+                                           existing_continuum_vals, bounds_error=False, fill_value='extrapolate')
+                existing_continuum = continuum_interp(fit_x)
+            else:
+                existing_continuum = np.zeros_like(fit_y)
+            
+            if fit['is_velocity_mode'] and self.is_velocity_mode:
+                profile_interp = interp1d(fit_x, fit_y - existing_continuum, bounds_error=False, fill_value=0)
+            elif not fit['is_velocity_mode'] and not self.is_velocity_mode:
+                profile_interp = interp1d(fit_x, fit_y - existing_continuum, bounds_error=False, fill_value=0)
+            elif not fit['is_velocity_mode'] and self.is_velocity_mode:
+                profile_interp = interp1d(self.wav_to_vel(fit_x, fit['rest_wavelength'], z=self.redshift), fit_y - existing_continuum, bounds_error=False, fill_value=0)
+            elif fit['is_velocity_mode'] and not self.is_velocity_mode:
+                profile_interp = interp1d(self.vel_to_wav(fit_x, fit['rest_wavelength'], z=self.redshift), fit_y - existing_continuum, bounds_error=False, fill_value=0)
+            total_voigt += profile_interp(x_plot)
+
+        # Combine Listfit fits
+        total_listfit = np.zeros_like(x_plot)
+        for fit in self.listfit_fits:
+            if 'y_fit' in fit and 'x_fit' in fit:
+                left_bound, right_bound = fit['left_bound'], fit['right_bound']
+                mask = (x_plot >= left_bound) & (x_plot <= right_bound)
+                if mask.any():
+                    # Interpolate listfit result
+                    fit_interp = interp1d(fit['x_fit'], fit['y_fit'], bounds_error=False, fill_value=0)
+                    total_listfit[mask] += fit_interp(x_plot[mask])
+
+        total_y = total_continuum + total_gaussian + total_voigt + total_listfit
+
+        # Plot the total line
+        self.ax.plot(x_plot, total_y, label="Total Line", color='#0ed8ca', linestyle='-')
+        self.ax.legend()
+
     # Function for handling key events
     def on_key(self, event):
 
@@ -3021,12 +3200,19 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 if not (self.x_lower_bound <= event.xdata <= self.x_upper_bound and self.y_lower_bound <= event.ydata <= self.y_upper_bound):
                     return  # Exit if the cursor is outside the plot area
 
-        # Show/hide item tracker with 'Ctrl+I' or similar accessible key - using '*' key
+        # Show/hide item tracker with 'j' key
         if event.key == 'j':
             if self.item_tracker.isVisible():
                 self.item_tracker.hide()
             else:
                 self.show_item_tracker()
+
+        # Show/hide fit information window with 'K' key (uppercase)
+        if event.key == 'K':
+            if self.fit_information_window.isVisible():
+                self.fit_information_window.hide()
+            else:
+                self.fit_information_window.show()
 
         # Show help window with '?' key
         if event.key == '?':
@@ -3035,6 +3221,10 @@ class SpectrumPlotter(QtWidgets.QWidget):
             self.help_window.show()
             self.help_window.raise_()
             self.help_window.activateWindow()
+
+        # Quit application with 'q' or 'Q' key
+        if event.key == 'q' or event.key == 'Q':
+            self.quit_application()
 
         # Toggle residual panel
         if event.key == 'r':
@@ -3138,6 +3328,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 self.continuum_mode = False
                 self.label_poly_order.hide()
                 self.input_poly_order.hide()
+                self.separator_line_poly.hide()
                 self.setGeometry(100, 100, 440, 200)  # Restore original window size
                 self.continuum_regions = []  # Clear any defined regions
                 print('Exiting continuum mode.')
@@ -3146,6 +3337,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 self.continuum_mode = True
                 self.label_poly_order.show()
                 self.input_poly_order.show()
+                self.separator_line_poly.show()
                 self.setGeometry(100, 100, 440, 250)  # Expand window to fit poly order field
                 print("Continuum fitting mode: Use the spacebar to define regions.")
                 print(f"Current polynomial order: {self.poly_order}")
@@ -3324,6 +3516,19 @@ class SpectrumPlotter(QtWidgets.QWidget):
             if self.gaussian_mode and len(self.bounds) == 2:
                 self.gaussian_mode = False
                 left_bound, right_bound = sorted(self.bounds)
+                
+                # Check for partial continuum overlap
+                has_partial_overlap, overlap_msg = self.check_continuum_partial_overlap(left_bound, right_bound)
+                if has_partial_overlap:
+                    print(f"WARNING: {overlap_msg}")
+                    print("Fit aborted to avoid ambiguous continuum handling.")
+                    # Clear bounds
+                    for line in self.bound_lines:
+                        line.remove()
+                    self.bound_lines.clear()
+                    self.bounds.clear()
+                    plt.draw()
+                    return
 
                 # Check for existing continuum
                 existing_continuum, _, _ = self.get_existing_continuum(left_bound, right_bound)
@@ -3341,18 +3546,9 @@ class SpectrumPlotter(QtWidgets.QWidget):
                     print("Using existing continuum for Gaussian fit.")
 
                 else:
-                    # Fit a new continuum if none exists within bounds
-                    overall_continuum, continuum_params, continuum_err = self.fit_continuum(self.x_data, self.spec, self.err)
-                    continuum_fit = {'bounds': (min(self.x_data), max(self.x_data)), 'coeffs': continuum_params, 'coeffs_err': continuum_err, 'poly_order': 1}
-                    self.continuum_fits.append(continuum_fit)
-                    # Register with ItemTracker
-                    bounds_str = f"λ: {min(self.x_data):.2f}-{max(self.x_data):.2f} Å"
-                    self.register_item('continuum', 'Continuum (auto)', fit_dict=continuum_fit, position=bounds_str, color='magenta')
-                    # Update residual display if shown
-                    if self.is_residual_shown:
-                        self.calculate_and_plot_residuals()
-                    overall_continuum = overall_continuum[(self.x_data >= left_bound) & (self.x_data <= right_bound)]
-                    continuum_subtracted_y = comp_y - overall_continuum
+                    # No continuum defined - fit directly to data without continuum subtraction
+                    continuum_subtracted_y = comp_y
+                    print("No existing continuum found; fitting Gaussian directly to data.")
                     print("No existing continuum found; fitted new continuum.")
 
                 # Fit Gaussian to the continuum-subtracted data
@@ -3465,6 +3661,21 @@ class SpectrumPlotter(QtWidgets.QWidget):
         elif self.multi_gaussian_mode_old and event.key == 'enter' and len(self.bounds) >= 4 and len(self.bounds) % 2 == 0:
             self.multi_gaussian_mode_old = False
             bound_pairs = [(self.bounds[i], self.bounds[i + 1]) for i in range(0, len(self.bounds), 2)]
+            
+            # Pre-flight check: Verify no partial overlaps with continuum before processing
+            for left_bound, right_bound in bound_pairs:
+                has_partial_overlap, overlap_msg = self.check_continuum_partial_overlap(left_bound, right_bound)
+                if has_partial_overlap:
+                    print(f"WARNING: {overlap_msg}")
+                    print("Multi-Gaussian fit aborted to avoid ambiguous continuum handling.")
+                    # Clear bounds
+                    for line in self.bound_lines:
+                        line.remove()
+                    self.bound_lines.clear()
+                    self.bounds.clear()
+                    plt.draw()
+                    return
+            
             comp_xs = []
             comp_ys = []
             comp_errs = []
@@ -3494,21 +3705,10 @@ class SpectrumPlotter(QtWidgets.QWidget):
                     print(f"Using existing continuum for bounds {left_bound}-{right_bound}.")
                     continuum_y = np.array(existing_continuum)
                 else:
-                    # Fit a new continuum if none exists within bounds
-                    overall_continuum, continuum_params, continuum_err = self.fit_continuum(self.x_data, self.spec, self.err)
-                    continuum_fit = {'bounds': (min(self.x_data), max(self.x_data)), 'coeffs': continuum_params, 'coeffs_err': continuum_err, 'poly_order': 1}
-                    self.continuum_fits.append(continuum_fit)
-                    # Register with ItemTracker
-                    bounds_str = f"λ: {min(self.x_data):.2f}-{max(self.x_data):.2f} Å"
-                    self.register_item('continuum', 'Continuum (auto)', fit_dict=continuum_fit, position=bounds_str, color='magenta')
-                    # Update residual display if shown
-                    if self.is_residual_shown:
-                        self.calculate_and_plot_residuals()
-                    overall_continuum = overall_continuum[(self.x_data >= left_bound) & (self.x_data <= right_bound)]
-                    continuum_subtracted_y = comp_y - overall_continuum
-                    continuum_ys.append(np.array(overall_continuum))
-                    print(f"No existing continuum found; fitted new continuum for bounds {left_bound}-{right_bound}.")
-                    continuum_y = np.array(overall_continuum)
+                    # No continuum defined - fit directly to data
+                    continuum_subtracted_y = comp_y
+                    continuum_y = np.zeros_like(comp_y)
+                    print(f"No existing continuum found; fitting directly to data for bounds {left_bound}-{right_bound}.")
 
                 continuum_ys.append(continuum_y)
                 comp_xs.extend(comp_x)
@@ -3532,7 +3732,8 @@ class SpectrumPlotter(QtWidgets.QWidget):
                     amp_err, mean_err, stddev_err = perr[i:i+3]
                     x_fit = self.x_data[(self.x_data >= bound_pairs[i // 3][0]) & (self.x_data <= bound_pairs[i // 3][1])]
                     y_fit = self.gaussian(x_fit, amp, mean, stddev) + continuum_ys[i // 3]
-                    residuals = continuum_subtracted_ys[i // 3] - y_fit
+                    continuum_sub_data = comp_ys[i // 3] - continuum_ys[i // 3]
+                    residuals = continuum_sub_data - self.gaussian(x_fit, amp, mean, stddev)
                     # Calculate chi2 with optional errors
                     if comp_errs:
                         chi2 = np.sum((residuals ** 2) / comp_errs[i // 3]) # Calculate chi2
@@ -3616,6 +3817,19 @@ class SpectrumPlotter(QtWidgets.QWidget):
             # If two bounds are selected, implement Voigt fitting
             if len(self.bounds) == 2:
                 left_bound, right_bound = sorted(self.bounds)
+                
+                # Check for partial continuum overlap
+                has_partial_overlap, overlap_msg = self.check_continuum_partial_overlap(left_bound, right_bound)
+                if has_partial_overlap:
+                    print(f"WARNING: {overlap_msg}")
+                    print("Fit aborted to avoid ambiguous continuum handling.")
+                    # Clear bounds
+                    for line in self.bound_lines:
+                        line.remove()
+                    self.bound_lines.clear()
+                    self.bounds.clear()
+                    plt.draw()
+                    return
 
                 # Check for existing continuum
                 existing_continuum, _, _ = self.get_existing_continuum(left_bound, right_bound)
@@ -3627,14 +3841,14 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 else:
                     comp_err = None
 
-                # Subtract existing continuum if found
+                # Subtract existing continuum if found, otherwise fit directly to data
                 if existing_continuum is not None:
                     continuum_subtracted_y = comp_y - existing_continuum
                     print("Using existing continuum for Voigt fit.")
                 else:
-                    overall_continuum, continuum_params, _ = self.fit_continuum(self.x_data, self.spec, self.err)
-                    continuum_subtracted_y = comp_y - overall_continuum
-                    print("No existing continuum found; fitted new continuum.")
+                    # No continuum defined - fit directly to data
+                    continuum_subtracted_y = comp_y
+                    print("No existing continuum found; fitting Voigt directly to data.")
 
                 left_bound, right_bound = sorted(self.bounds)
 
@@ -4432,60 +4646,12 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 self.update_marker_and_label_positions()
 
         elif event.key == ';':
-            # Toggle the total line
+            # Toggle the total line for ALL fitted profiles (single, multi-gaussian, voigt, continuum, listfit)
             self.show_total_line = not self.show_total_line
             if self.show_total_line:
                 # Ensure there is data to sum and plot
-                if self.continuum_fits or self.voigt_fits or self.gaussian_fits:
-                    # Generate x values for plotting (using the range of x_data)
-                    x_plot = np.linspace(self.x_data.min(), self.x_data.max(), 10000)
-
-                    # Combine continuum fits
-                    total_continuum = np.zeros_like(x_plot)
-                    for fit in self.continuum_fits:
-                        left_bound, right_bound = self.get_bounds(fit)
-                        mask = (x_plot >= left_bound) & (x_plot <= right_bound)
-                        if mask.any():
-                            a, b = fit['a'], fit['b']
-                            total_continuum[mask] += self.continuum_model(x_plot[mask], a, b)
-                    
-                    # Combine Gaussian fits
-                    total_gaussian = np.zeros_like(x_plot)
-                    for fit in self.gaussian_fits:
-                        left_bound, right_bound = min(fit['line'].get_xdata()), max(fit['line'].get_xdata())
-                        _, a, b = self.get_existing_continuum(left_bound, right_bound)
-                        existing_continuum = self.continuum_model(fit['line'].get_xdata(), a, b)
-                        if fit['is_velocity_mode'] and self.is_velocity_mode:
-                            profile_interp = interp1d(fit['line'].get_xdata(), fit['line'].get_ydata()-existing_continuum, bounds_error=False, fill_value=0)
-                        elif not fit['is_velocity_mode'] and not self.is_velocity_mode:
-                            profile_interp = interp1d(fit['line'].get_xdata(), fit['line'].get_ydata()-existing_continuum, bounds_error=False, fill_value=0)
-                        elif not fit['is_velocity_mode'] and self.is_velocity_mode:
-                            profile_interp = interp1d(self.wav_to_vel(fit['line'].get_xdata(), fit['rest_wavelength'], z=self.redshift), fit['line'].get_ydata()-existing_continuum, bounds_error=False, fill_value=0)
-                        elif fit['is_velocity_mode'] and not self.is_velocity_mode:
-                            profile_interp = interp1d(self.vel_to_wav(fit['line'].get_xdata(), fit['rest_wavelength'], z=self.redshift), fit['line'].get_ydata()-existing_continuum, bounds_error=False, fill_value=0)
-                        total_gaussian += profile_interp(x_plot)
-
-                    # Combine Voigt fits
-                    total_voigt = np.zeros_like(x_plot)
-                    for fit in self.voigt_fits:
-                        left_bound, right_bound = min(fit['line'].get_xdata()), max(fit['line'].get_xdata())
-                        _, a, b = self.get_existing_continuum(left_bound, right_bound)
-                        existing_continuum = self.continuum_model(fit['line'].get_xdata(), a, b)
-                        if fit['is_velocity_mode'] and self.is_velocity_mode:
-                            profile_interp = interp1d(fit['line'].get_xdata(), fit['line'].get_ydata()-existing_continuum, bounds_error=False, fill_value=0)
-                        elif not fit['is_velocity_mode'] and not self.is_velocity_mode:
-                            profile_interp = interp1d(fit['line'].get_xdata(), fit['line'].get_ydata()-existing_continuum, bounds_error=False, fill_value=0)
-                        elif not fit['is_velocity_mode'] and self.is_velocity_mode:
-                            profile_interp = interp1d(self.wav_to_vel(fit['line'].get_xdata(), fit['rest_wavelength'], z=self.redshift), fit['line'].get_ydata()-existing_continuum, bounds_error=False, fill_value=0)
-                        elif fit['is_velocity_mode'] and not self.is_velocity_mode:
-                            profile_interp = interp1d(self.vel_to_wav(fit['line'].get_xdata(), fit['rest_wavelength'], z=self.redshift), fit['line'].get_ydata()-existing_continuum, bounds_error=False, fill_value=0)
-                        total_voigt += profile_interp(x_plot)
-
-                    total_y = total_continuum + total_gaussian + total_voigt
-
-                    # Plot the total line
-                    self.ax.plot(x_plot, total_y, label="Total Line", color='#0ed8ca', linestyle='-')
-                    self.ax.legend()
+                if self.continuum_fits or self.voigt_fits or self.gaussian_fits or self.listfit_fits:
+                    self.draw_total_line()
                     self.ax.figure.canvas.draw()
                 else:
                     print("Warning: No fits available to sum for total line.")
@@ -4825,12 +4991,6 @@ class SpectrumPlotter(QtWidgets.QWidget):
         # Save a pdf of the current plot
         if event.key == '`':
             self.save_plot_as_pdf()
-
-        # Exit the application if 'Q' is pressed
-        elif event.key == 'Q':
-            # NOTE: lowercase 'q' will only close the main window, not the entire application
-            print("Quitting the application...")
-            sys.exit()  # Terminate the entire application
 
         if event.key == ',':  # Use ',' key to assign line ID and wavelength
             x_pos = event.xdata  # Get x position of mouse click

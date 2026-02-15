@@ -37,7 +37,28 @@ class SpectrumIO:
         if ext in (".txt", ".dat", ".csv", ".tsv", ".sed", ".ascii") or ext == "":
             try:
                 delim, ncol = SpectrumIO._peek_ascii_layout(path)
-                if ncol >= 3:
+                # If delimiter is None (whitespace) and we detected 3+ columns, 
+                # also offer 2-column as an option (most common for spectrum files)
+                if delim is None and ncol >= 2:
+                    # Try to read with whitespace and check actual column consistency
+                    try:
+                        test_data = np.genfromtxt(path, comments="#", delimiter=None, max_rows=50)
+                        if test_data.ndim == 2:
+                            actual_cols = test_data.shape[1]
+                            # If actual data has 2 columns, prefer 2-column format
+                            if actual_cols == 2:
+                                add("ascii:2col", 90, f"2 columns (whitespace-delimited)",
+                                    {"delimiter": None})
+                            elif actual_cols >= 3:
+                                add("ascii:3col", 90, f"{actual_cols} columns (whitespace-delimited)",
+                                    {"delimiter": None})
+                        else:
+                            add("ascii:2col", 85, f"2 columns (detected)",
+                                {"delimiter": None})
+                    except:
+                        add("ascii:2col", 85, f"2 columns (likely whitespace-delimited)",
+                            {"delimiter": None})
+                elif ncol >= 3:
                     add("ascii:3col", 90, f"{ncol} columns (delimiter={repr(delim)})",
                         {"delimiter": delim})
                 elif ncol == 2:
@@ -159,7 +180,11 @@ class SpectrumIO:
         
         elif fmt == "ascii:flex":
             cm = options.get("colmap", {"wave": 0, "flux": 1, "err": None})
-            return SpectrumIO._read_ascii(filepath, delimiter=options.get("delimiter"),
+            # If no delimiter specified in options, auto-detect it
+            delim = options.get("delimiter")
+            if delim is None:
+                delim, _ = SpectrumIO._peek_ascii_layout(filepath)
+            return SpectrumIO._read_ascii(filepath, delimiter=delim,
                                          colmap=cm, units=options.get("units"),
                                          wave_unit=options.get("wave_unit", 1.0))
         
@@ -199,7 +224,7 @@ class SpectrumIO:
     @staticmethod
     def _peek_ascii_layout(path: Path, max_lines: int = 200) -> Tuple[str, int]:
         """Return (delimiter, ncol) by scanning first few non-comment lines."""
-        trials = [("\t", "tab"), (",", "comma"), (" ", "space")]
+        trials = [("\t", "tab"), (None, "whitespace"), (",", "comma")]
         rows: List[str] = []
         
         with open(path, "r") as f:
@@ -212,16 +237,41 @@ class SpectrumIO:
                     break
         
         if not rows:
-            return ("\t", 0)
+            return (None, 0)  # Default to whitespace if no rows
         
-        best_delim = "\t"
+        best_delim = None
         best_ncol = 0
+        best_score = -1
+        
         for delim, _name in trials:
-            counts = [len(r.split(delim)) for r in rows]
+            if delim is None:
+                # Use None for whitespace splitting (handles multiple spaces/tabs)
+                counts = [len(r.split()) for r in rows]
+            else:
+                counts = [len(r.split(delim)) for r in rows]
             ncol = max(counts) if counts else 0
-            if ncol > best_ncol:
+            
+            if ncol == 0:
+                continue
+            
+            # Score based on: consistent column count + reasonable number of columns
+            # Consistency: all rows have same column count
+            consistency = 1.0 if len(set(counts)) == 1 else 0.5
+            # Reasonableness: prefer 1-5 columns for spectrum data
+            if 1 <= ncol <= 5:
+                reasonableness = 1.0
+            elif ncol > 5:
+                reasonableness = 0.1  # Very unlikely
+            else:
+                reasonableness = 0.5
+            
+            score = consistency * reasonableness * ncol
+            
+            if score > best_score:
+                best_score = score
                 best_ncol = ncol
                 best_delim = delim
+        
         return (best_delim, best_ncol)
     
     @staticmethod
@@ -238,7 +288,15 @@ class SpectrumIO:
             Default 1.0 (wavelength already in Angstroms).
             Examples: 10 for nm, 10000 for microns
         """
-        data = np.genfromtxt(path, comments="#", delimiter=delimiter)
+        # Use filling_values=np.nan for explicit delimiters (tab, comma)
+        # but NOT for None (whitespace) which has different behavior
+        if delimiter is None:
+            # For whitespace-delimited files, don't use filling_values
+            data = np.genfromtxt(path, comments="#", delimiter=None)
+        else:
+            # For explicit delimiters, use filling_values to handle missing columns
+            data = np.genfromtxt(path, comments="#", delimiter=delimiter, filling_values=np.nan)
+        
         if data.ndim == 1:
             data = data[None, :]
         ncol = data.shape[1]

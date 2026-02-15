@@ -20,6 +20,7 @@ from qasap.spectrum_io import SpectrumIO
 from qasap.spectrum_analysis import SpectrumAnalysis
 from qasap.ui_components import SpectrumPlotter, SpectrumPlotterApp
 from qasap.format_picker_dialog import FormatPickerDialog
+from qasap.main_window import QASAPMainWindow
 
 
 def main():
@@ -180,9 +181,20 @@ Examples:
     if wav is not None and spec is not None:
         plotter.load_spectrum_data(wav, spec, err, meta, args.fits_file)
     
-    # Show control panel and create the spectrum plot window
+    # Create main window with menu bar (wraps the plotter)
+    main_window = QASAPMainWindow(plotter)
+    
+    # Show control panel and create the spectrum plot window FIRST
     plotter.show()
     plotter.plot_spectrum()  # Always create the plot window, even if empty
+    plotter.raise_()
+    plotter.activateWindow()
+    
+    # Refresh the View menu after windows are created
+    main_window.refresh_view_menu()
+    # Keep main window hidden but ensure it's created for menu bar access on macOS
+    # The menu bar will appear in the system menu bar on macOS even though the window is hidden
+    
     sys.exit(app.exec_())
 
 

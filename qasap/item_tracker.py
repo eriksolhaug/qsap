@@ -27,6 +27,7 @@ class ItemTracker(QtWidgets.QWidget):
     item_individually_deselected = pyqtSignal(str)  # Emits item_id when individually deselected from multi-selection
     item_deselected = pyqtSignal()   # Emits when no items are selected
     estimate_redshift = pyqtSignal(str)  # Emits item_id when estimate redshift is selected
+    items_changed = pyqtSignal()  # Emits when items list is updated (added or removed)
     
     def __init__(self):
         super().__init__()
@@ -85,12 +86,14 @@ class ItemTracker(QtWidgets.QWidget):
             'line_obj': line_obj
         }
         self.refresh_table()
+        self.items_changed.emit()
     
     def remove_item(self, item_id):
         """Remove item from tracker"""
         if item_id in self.items:
             del self.items[item_id]
             self.refresh_table()
+            self.items_changed.emit()
     
     def refresh_table(self):
         """Refresh the displayed table"""
@@ -197,4 +200,15 @@ class ItemTracker(QtWidgets.QWidget):
         for item_id in item_ids:
             self.item_deleted.emit(item_id)
             self.remove_item(item_id)
-
+    
+    def highlight_item(self, item_id):
+        """Programmatically select a row corresponding to item_id"""
+        if item_id not in self.items:
+            return
+        
+        # Find the row for this item_id
+        for row in range(self.item_table.rowCount()):
+            item = self.item_table.item(row, 0)
+            if item and item.data(Qt.UserRole) == item_id:
+                self.item_table.selectRow(row)
+                return
