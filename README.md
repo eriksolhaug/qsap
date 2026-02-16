@@ -69,6 +69,10 @@ conda install numpy scipy matplotlib astropy pandas lmfit pyqt emcee corner
 
 # Run QASAP
 python qasap.py <spectrum.fits>
+
+# An example spectrum is available. Run...
+python qasap.py example/sample_spectrum.txt
+# ...to get started!
 ```
 
 
@@ -152,109 +156,64 @@ This method uses the entry point defined in `setup.py` to create a proper comman
 
 ## Upgrading Versions
 
-If you already have QASAP installed (e.g., v0.9) and want to upgrade to a newer version (e.g., v0.10), follow these steps:
+If you already have QASAP installed and want to upgrade to a newer version, follow one of these methods:
 
-### Method 1: Clean Installation (Recommended)
+### Method 1: Git Pull
 
-This is the safest approach if you installed with `pip install -e .`:
+If you cloned from git and want to update to the latest version:
 
 ```bash
-# 1. Deactivate your conda environment (if using conda)
-conda deactivate
+# Navigate to your qasap directory
+cd /path/to/qasap
 
-# 2. Remove the old installation
-pip uninstall qasap
+# Pull the latest changes
+git pull origin main
 
-# 3. Remove the old local directory (optional but recommended)
-rm -rf /path/to/old/qasap
+# Reinstall (if dependencies changed)
+pip install -e .
 
-# 4. Clone the new version
+# Verify
+qasap --help
+```
+
+### Method 2: Update to a Specific Version Tag
+
+To update to a specific version (e.g., v0.10):
+
+```bash
+# Navigate to your qasap directory
+cd /path/to/qasap
+
+# Fetch all available versions/tags from remote
+git fetch origin
+
+# Checkout the specific version you want
+git checkout v0.10
+
+# Reinstall (if dependencies changed)
+pip install -e .
+
+# Verify
+qasap --help
+```
+
+### Method 3: Fresh Installation
+
+If you prefer a clean installation:
+
+```bash
+# Clone the latest version
 git clone https://github.com/eriksolhaug/qasap.git
 # OR clone a specific version tag
 git clone --depth 1 --branch v0.10 https://github.com/eriksolhaug/qasap.git
 
-# 5. Navigate to the new qasap directory
+# Navigate to the new qasap directory
 cd qasap
 
-# 6. Reactivate your conda environment
-conda activate qasap
-
-# 7. Install the new version
+# Install
 pip install -e .
 
-# 8. Verify installation
-qasap --help
-```
-
-### Method 2: Update Existing Repository
-
-If you cloned from git and want to update to a newer version:
-
-**Option A: Update to a Specific Version Tag (e.g., v0.10)**
-
-```bash
-# 1. Navigate to your qasap directory
-cd </path/to/qasap>
-
-# 2. Fetch all available versions/tags from remote
-git fetch origin
-
-# 3. Checkout the specific version you want
-git checkout v0.10
-
-# 4. Reinstall (if dependencies changed)
-pip install -e .
-
-# 5. Verify
-qasap --help
-```
-
-**Option B: Update to the Latest Development Version**
-
-```bash
-# 1. Navigate to your qasap directory
-cd /path/to/qasap
-
-# 2. Pull the latest changes
-git pull origin main
-
-# 3. Reinstall (if dependencies changed)
-pip install -e .
-
-# 4. Verify
-qasap --help
-```
-
-# 4. Reinstall the package (if dependencies changed)
-pip install -e .
-
-# 5. Verify the update
-qasap --help
-```
-
-### Method 3: Manual Update (Without Git)
-
-If you don't have git or prefer not to use it:
-
-```bash
-# 1. Download the new version from GitHub (as a zip file)
-# Visit: https://github.com/eriksolhaug/qasap/releases
-# Or use curl to download a specific tag:
-curl -L -o qasap-v0.10.zip https://github.com/eriksolhaug/qasap/archive/refs/tags/v0.10.zip
-
-# 2. Unzip the downloaded file
-unzip qasap-v0.10.zip
-
-# 3. Remove the old qasap directory
-rm -rf /path/to/old/qasap
-
-# 4. Navigate to the new directory
-cd qasap-v0.10
-
-# 5. Reinstall
-pip install -e .
-
-# 6. Verify
+# Verify
 qasap --help
 ```
 
@@ -302,7 +261,7 @@ You can load a spectrum file in two ways:
    ```
 
 2. **GUI Open Button**: 
-   - Launch QASAP with `qasap` (no file required)
+   - Launch QASAP by running `qasap` in the terminal (specifying a spectrum file is not required)
    - In the Control Panel (left side), click the **Open** button
    - A file browser will appear—navigate to and select your spectrum file
    - QASAP automatically detects the file format and loads the data
@@ -317,19 +276,23 @@ You can load a spectrum file in two ways:
 ├── LICENSE
 ├── README.md
 ├── __init__.py              # Package initialization
+├── example/                 # Example data
+│   └── sample_spectrum.txt  # Sample spectrum file to get started
 ├── qasap/                   # Main package directory
 │   ├── __init__.py
-│   ├── spectrum_io.py           # File I/O with auto-detection
-│   ├── spectrum_analysis.py     # Fitting and analysis functions
-│   ├── spectrum_plotter.py      # Main visualization widget
-│   ├── spectrum_plotter_app.py  # Application wrapper
-│   ├── ui_components.py         # UI component exports
-│   ├── linelist_window.py       # Line identification window
-│   ├── linelist_selector_window.py # Line list management UI
-│   ├── linelist.py              # Line list data structures
-│   ├── listfit_window.py        # Multi-component fitting dialog
-│   ├── item_tracker.py          # Component tracking and management
-│   └── format_picker_dialog.py  # Format selection dialog
+│   ├── spectrum_io.py                  # File I/O with auto-detection
+│   ├── spectrum_analysis.py            # Fitting and analysis functions
+│   ├── spectrum_plotter.py             # Main visualization widget
+│   ├── spectrum_plotter_app.py         # Application wrapper
+│   ├── ui_components.py                # UI component exports
+│   ├── linelist_window.py              # Line identification window
+│   ├── linelist_selector_window.py     # Line list management UI
+│   ├── linelist.py                     # Line list data structures
+│   ├── listfit_window.py               # Multi-component fitting dialog
+│   ├── item_tracker.py                 # Component tracking and management
+│   ├── fit_information_window.py       # Fit information display window
+│   ├── action_history_window.py        # Action history and undo/redo
+│   └── format_picker_dialog.py         # Format selection dialog
 └── resources/
     ├── linelist/                # Line list catalogs
     │   ├── emlines.txt
@@ -343,6 +306,9 @@ You can load a spectrum file in two ways:
 ```
 
 ## Data Files
+
+**Example Data** (in `example/`):
+- `sample_spectrum.txt`: Sample spectrum file to get started with QASAP
 
 **Line Lists** (in `resources/linelist/`):
 - `emlines.txt`: Emission line catalog
@@ -405,9 +371,7 @@ Note: You will need to select the line list and Toggle Display to view lines. Se
 - `w` - Remove fitted profile under cursor
 - `,` (comma) - Add a line tag to fitted profile under cursor
 - `<` (less than) - Remove tag from fitted profile under cursor
-- `a` - Save Gaussian fit info to file
-- `A` - Save Voigt fit info to file
-- `S` - Save continuum fit info to file
+- `S` - Save all fits information to file
 - `;` (semicolon) - Show/toggle total line for Single Mode fitted lines
 - `v` - Calculate equivalent width of fitted line. In progress. Use with caution.
 
@@ -537,6 +501,54 @@ Centralized feature management panel accessed with `*` key:
 - Right-click context menu: "Delete" to remove from plot
 - "Delete Selected" button: Remove multiple items at once
 - "Clear All" button: Remove all features
+
+### 6. Action History Window
+Comprehensive undo/redo interface for tracking all modifications to the spectrum analysis:
+
+**Access:**
+- Press `Ctrl+Z` to undo or `Ctrl+Shift+Z` to redo
+- Right-click on Item Tracker items for context menu access to history
+
+**Features:**
+- **Undo/Redo Stack**: Complete history of all actions performed during the session
+- **Action List**: Displays chronological list of performed actions with descriptions
+- **Navigation**: Step back/forward through analysis workflow
+- **Action Descriptions**: Clear labels showing what was done (e.g., "Added Gaussian fit", "Deleted Voigt component")
+
+**Supported Actions:**
+- Adding/removing spectral components (Gaussians, Voigts, polynomials)
+- Continuum fitting operations
+- Parameter modifications
+- Redshift changes
+- Component deletions
+
+### 7. Fit Information Window
+Detailed parameter display and management for all fitted components:
+
+**Access:**
+- Automatically shows when fits are performed
+- Can be toggled via View menu or keyboard shortcut
+
+**Display Sections:**
+- **Component List**: Shows all fitted components with type and status
+- **Parameters Tab**: Displays fitted parameters with uncertainties:
+  - Amplitude/strength
+  - Center wavelength
+  - FWHM (Full Width at Half Maximum)
+  - Sigma (standard deviation)
+  - Errors from covariance matrix
+- **Statistics Tab**: Quality metrics for the fit:
+  - χ² (chi-squared)
+  - Reduced χ² (chi-squared per degree of freedom)
+  - Number of free parameters
+  - Data points used
+
+**Workflow:**
+1. Perform a fit (Gaussian, Voigt, or Listfit)
+2. Fit Information Window automatically opens or updates
+3. Select components to view their detailed parameters
+4. Export or save fit results to file
+5. Use parameters for further analysis (equivalent width, line properties, etc.)
 
 ## Versions
 
