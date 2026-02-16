@@ -18,12 +18,11 @@ Interactive Python tool for 1D spectral analysis with file format detection. QAS
 ## Features
 
 - **File Format Auto-Detection**: Automatically detects 7+ ASCII and FITS spectrum formats
-- **Interactive Plotting**: 1D spectrum visualization with zoom, pan, and smooth controls
-- **Multi-Component Fitting**: Gaussian and Voigt profile fitting (single and multi-component) with Listfit mode for simultaneous fitting
-- **Line Analysis**: Equivalent width, redshift estimation, velocity mode analysis
-- **Other Fitting**: Bayesian MCMC with posterior distributions (work in progress still - works well for single profiles)
-- **Item Tracker**: Centralized management of all plotted components (Gaussians, Voigts, polynomials, continuum) with multi-select and deletion capabilities
-- **Utilities**: LSF convolution, line identification, filter overlays
+- **Interactive Plotting**: 1D spectrum visualization with a variety of navigation controls
+- **Multi-Component Fitting**: Gaussian and Voigt profile fitting (single and multi-component) with modes for simultaneous fitting using unconstrained and/or constrained optimization
+- **Line Analysis**: Redshift estimation, dynamic line list display and velocity restframe toggling
+- **Item and Action Trackers**: Centralized management of all components (Gaussians, Voigts, polynomials, continuum) with multi-select and deletion + undo/redo capabilities
+- **Utilities**: Filter overlays, smoothing functionality, etc.
 
 ## Installation
 
@@ -541,7 +540,8 @@ Centralized feature management panel accessed with `*` key:
 
 ## Versions
 
-- **v0.10** (current): Added robust Listfit capabilities. Listfit now works for higher-order Polynomials (>2) and with multiple line profiles fitted simultaneously.
+- **v0.11** (current): Action history (undo/redo actions), fit information window, output log (printing from terminal) in spectrum viewer, improved item tracker functionality.
+- **v0.10** (stable): Added robust Listfit capabilities. Listfit now works for higher-order Polynomials (>2) and with multiple line profiles fitted simultaneously.
 - **v0.9** (stable): Fixed Listfit parameter error extraction, PolynomialModel integration for proper coefficient variation, Item Tracker synchronization with internal storage removal
 - **v0.8**: Listfit mode for simultaneous multi-component fitting, ItemTracker for centralized feature management with multi-select and deletion, auto-fit registration, redshift mode improvements
 - **v0.7** (stable): Available as tagged release on GitHub. Refactored with intelligent format auto-detection, modular architecture, and comprehensive UI
