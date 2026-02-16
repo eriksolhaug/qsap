@@ -24,7 +24,7 @@ class ActionHistoryWindow(QtWidgets.QWidget):
         """Initialize UI"""
         self.setWindowTitle("QASAP - Action History")
         self.setWindowIcon(get_qasap_icon())
-        self.setGeometry(100, 400, 500, 300)
+        self.setGeometry(100, 400, 500, 400)
         
         layout = QtWidgets.QVBoxLayout()
         
@@ -34,6 +34,9 @@ class ActionHistoryWindow(QtWidgets.QWidget):
         # List widget to show history
         self.history_list_widget = QtWidgets.QListWidget()
         self.history_list_widget.itemClicked.connect(self.on_item_clicked)
+        # Ensure scrolling is enabled
+        self.history_list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.history_list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         layout.addWidget(self.history_list_widget)
         
         # Control buttons

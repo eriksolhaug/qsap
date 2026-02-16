@@ -129,18 +129,26 @@ class FormatPickerDialog(QtWidgets.QDialog):
         self.col_err.setPlaceholderText("blank for none")
         ascii_layout.addWidget(self.col_err, 4, 1)
         
-        # Wavelength unit conversion
-        ascii_layout.addWidget(QtWidgets.QLabel("Wave unit (Å conversion):"), 5, 0)
-        self.wave_unit = QtWidgets.QDoubleSpinBox()
-        self.wave_unit.setValue(1.0)
-        self.wave_unit.setDecimals(0)
-        self.wave_unit.setMinimum(0.001)
-        self.wave_unit.setMaximum(1e8)
-        self.wave_unit.setMaximumWidth(100)
-        ascii_layout.addWidget(self.wave_unit, 5, 1)
-        unit_help = QtWidgets.QLabel("<small>1=Å (default), 10=nm, 10000=μm</small>")
-        unit_help.setStyleSheet("color: gray; font-size: 9px;")
-        ascii_layout.addWidget(unit_help, 5, 2)
+        # Wavelength unit selection
+        ascii_layout.addWidget(QtWidgets.QLabel("Wavelength units:"), 5, 0)
+        
+        # Radio buttons for unit selection
+        unit_group = QtWidgets.QGroupBox()
+        unit_layout = QtWidgets.QHBoxLayout()
+        
+        self.unit_angstrom = QtWidgets.QRadioButton("Ångström (Å)")
+        self.unit_angstrom.setChecked(True)
+        unit_layout.addWidget(self.unit_angstrom)
+        
+        self.unit_nanometer = QtWidgets.QRadioButton("Nanometer (nm)")
+        unit_layout.addWidget(self.unit_nanometer)
+        
+        self.unit_micron = QtWidgets.QRadioButton("Micron (μm)")
+        unit_layout.addWidget(self.unit_micron)
+        
+        unit_layout.addStretch()
+        unit_group.setLayout(unit_layout)
+        ascii_layout.addWidget(unit_group, 5, 1, 1, 2)
         
         ascii_layout.addItem(QtWidgets.QSpacerItem(0, 0), 6, 0, 1, 3)
         ascii_group.setLayout(ascii_layout)
@@ -275,7 +283,16 @@ class FormatPickerDialog(QtWidgets.QDialog):
                 flux_col = self.col_flux.value()
                 err_str = self.col_err.text().strip()
                 err_col = int(err_str) if err_str else None
-                wave_unit = self.wave_unit.value()
+                
+                # Get selected wavelength unit
+                if self.unit_angstrom.isChecked():
+                    wave_unit = "angstrom"
+                elif self.unit_nanometer.isChecked():
+                    wave_unit = "nanometer"
+                elif self.unit_micron.isChecked():
+                    wave_unit = "micron"
+                else:
+                    wave_unit = "angstrom"  # Default
             except ValueError:
                 QtWidgets.QMessageBox.warning(self, "Error", "Columns must be integers (err can be blank)")
                 return

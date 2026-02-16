@@ -77,6 +77,7 @@ import os
 import sys
 import warnings
 from pathlib import Path
+from copy import deepcopy
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -93,7 +94,7 @@ from lmfit.models import PolynomialModel
 from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton
 from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtCore import pyqtSignal, Qt
-from PyQt5.QtGui import QDoubleValidator, QIntValidator, QIcon
+from PyQt5.QtGui import QDoubleValidator, QIntValidator, QIcon, QKeyEvent
 from PyQt5.QtWidgets import QFileDialog
 from datetime import datetime
 import ast
@@ -110,6 +111,83 @@ from .item_tracker import ItemTracker
 from .fit_information_window import FitInformationWindow
 from .linelist import get_available_line_lists
 from .linelist_selector_window import LineListSelector
+from .action_history import ActionHistory
+from .action_history_window import ActionHistoryWindow
+
+
+class OutputStreamCapture:
+    """Helper class to capture stdout/stderr and emit to output panel."""
+    def __init__(self, output_panel):
+        self.output_panel = output_panel
+        self.original_stdout = sys.stdout
+        self.original_stderr = sys.stderr
+    
+    def write(self, message):
+        """Write message to output panel."""
+        if message and message != '\n':
+            self.output_panel.append_text(message)
+        # Also print to original stdout
+        self.original_stdout.write(message)
+    
+    def flush(self):
+        """Flush the stream."""
+        self.original_stdout.flush()
+
+
+class OutputPanel(QtWidgets.QWidget):
+    """Panel for displaying output (stdout/stderr) from the application."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.init_ui()
+        
+        # Set up output capture
+        self.stream_capture = OutputStreamCapture(self)
+        self.original_stdout = sys.stdout
+        self.original_stderr = sys.stderr
+        
+        # Redirect stdout and stderr
+        sys.stdout = self.stream_capture
+        sys.stderr = self.stream_capture
+    
+    def init_ui(self):
+        """Initialize the UI."""
+        layout = QVBoxLayout()
+        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(0)
+        
+        # Create text display area
+        self.text_edit = QtWidgets.QPlainTextEdit()
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setMaximumHeight(100)  # Set reasonable height
+        self.text_edit.setStyleSheet("""
+            QPlainTextEdit {
+                background-color: #f5f5f5;
+                color: #333333;
+                font-family: 'Courier New', monospace;
+                font-size: 12pt;
+                border: 1px solid #cccccc;
+            }
+        """)
+        
+        layout.addWidget(self.text_edit)
+        self.setLayout(layout)
+    
+    def append_text(self, text):
+        """Append text to the output panel."""
+        self.text_edit.appendPlainText(text.rstrip('\n'))
+        # Auto-scroll to bottom
+        scrollbar = self.text_edit.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+    
+    def clear_output(self):
+        """Clear the output panel."""
+        self.text_edit.clear()
+    
+    def restore_streams(self):
+        """Restore original stdout/stderr."""
+        sys.stdout = self.original_stdout
+        sys.stderr = self.original_stderr
+
 
 class HelpWindow(QtWidgets.QDialog):
     """Help window displaying all keyboard shortcuts."""
@@ -172,9 +250,7 @@ class HelpWindow(QtWidgets.QDialog):
 - **w** - Remove fitted profile under cursor
 - **,** (comma) - Add a line tag to fitted profile under cursor
 - **<** (less than) - Remove tag from fitted profile under cursor
-- **a** - Save Gaussian fit info to file
-- **A** - Save Voigt fit info to file
-- **S** - Save continuum fit info to file
+- **S** - Save all fitted profiles (Gaussian, Voigt, Continuum, Listfit) to files
 - **;** (semicolon) - Show/toggle total line for Single Mode fitted lines
 - **v** - Calculate equivalent width of fitted line. In progress. Use with caution.
 
@@ -188,7 +264,7 @@ class HelpWindow(QtWidgets.QDialog):
 
 ## Item Management
 - **j** - Toggle Item Tracker window (shows summary of all fitted profiles)
-- **K** - Toggle Fit Information window (shows detailed parameters for all fitted profiles)
+- **Z** - Toggle Fit Information window (shows detailed parameters for all fitted profiles)
 
 ## Application Control
 - **q** or **Q** - Quit QASAP
@@ -199,8 +275,15 @@ class HelpWindow(QtWidgets.QDialog):
 ## File Storage
 All saved screenshots, redshifts, and profile info are stored in the directory where QASAP was launched from.
 """
+    
+    def keyPressEvent(self, event):
+        """Handle key press events in help window - forward Q to parent"""
+        if event.key() in (Qt.Key_Q, Qt.Key_Q):
+            self.close()
+            return
+        super().keyPressEvent(event)
 
-class SpectrumPlotter(QtWidgets.QWidget):
+class SpectrumPlotter(QtWidgets.QMainWindow):
     def __init__(self, fits_file, redshift=0.0, zoom_factor=0.1, file_flag=0, lsf="10",):
         super().__init__()
 
@@ -215,8 +298,24 @@ class SpectrumPlotter(QtWidgets.QWidget):
         # Process LSF
         self.process_lsf(lsf)
 
-        # Initialize the control panel
+        # Create central widget for the control panel
+        central_widget = QtWidgets.QWidget()
+        self.setCentralWidget(central_widget)
+
+        # Initialize the control panel (will be added to central widget)
+        # This must be done BEFORE create_menu_bar() since the menu bar references windows created here
         self.init_controlpanel()
+        
+        # Initialize window creation attempt flags and resources BEFORE create_menu_bar()
+        self.help_window = None
+        self.help_window_attempted = False  # Track if we've already tried to create it
+        resources_dir = str(Path(__file__).parent.parent / 'resources')
+        self.line_list_selector = None  # Will be created on demand
+        self.line_list_selector_attempted = False  # Track if we've already tried to create it
+        self.resources_dir = resources_dir
+        
+        # Create the menu bar (after control panel is initialized)
+        self.create_menu_bar()
 
         self.wav = []
         self.spec = []
@@ -251,10 +350,12 @@ class SpectrumPlotter(QtWidgets.QWidget):
         self.listfit_components = []
         self.listfit_fits = []  # Stores completed listfit results
         self.listfit_component_lines = {}  # Store plotted component lines by component ID
+        self.deleted_listfit_polynomials = set()  # Track deleted polynomial item_ids for residual calculation
 
         self.redshift_estimation_mode = False
         self.rest_wavelength = None  # Set to `None` if no initial rest wavelength
         self.rest_id = None
+        self.wavelength_unit = "Å"  # Current wavelength unit (Å, nm, or µm)
 
         self.x_upper_bound = None
         self.x_lower_bound = None
@@ -337,15 +438,178 @@ class SpectrumPlotter(QtWidgets.QWidget):
         # Connect items_changed signal to update total line if displayed
         self.item_tracker.items_changed.connect(self.update_total_line_if_shown)
         
-        # Help Window
-        self.help_window = None
+        # Action History for Undo/Redo
+        self.action_history = ActionHistory()
+        self.action_history_window = ActionHistoryWindow()
+        self.action_history_window.set_action_history(self.action_history)
+        self.action_history_window.action_selected.connect(self.on_action_selected)
         
-        # Line List Selector
-        resources_dir = str(Path(__file__).parent.parent / 'resources')
-        self.line_list_selector = None  # Will be created on demand
-        self.resources_dir = resources_dir
+        # Track if this is the first spectrum load (for initial action recording)
+        self.is_first_load = True
+        self.initial_spectrum_file = fits_file
+        
+        # Active line lists tracking (resources_dir and line_list_selector already initialized earlier)
         self.active_line_lists = []  # {linelist: LineList, color: str}
         self.current_linelist_lines = []  # Store plotted linelist lines for removal
+
+    def create_menu_bar(self):
+        """Create the menu bar with Qasap, File, Edit, and View menus"""
+        menubar = self.menuBar()
+        
+        # Create Qasap menu (application menu on macOS)
+        self.qasap_menu = menubar.addMenu("Qasap")
+        
+        # Add Quit action to Qasap menu
+        quit_action = self.qasap_menu.addAction("Quit QASAP")
+        quit_action.setShortcut("Cmd+Q")
+        quit_action.triggered.connect(self.quit_application)
+        
+        # Create File menu
+        self.file_menu = menubar.addMenu("File")
+        
+        # Create Edit menu
+        self.edit_menu = menubar.addMenu("Edit")
+        
+        # Add Undo action
+        undo_action = self.edit_menu.addAction("Undo")
+        undo_action.setShortcut("Cmd+Z")
+        undo_action.triggered.connect(self.on_undo)
+        
+        # Add Redo action
+        redo_action = self.edit_menu.addAction("Redo")
+        redo_action.setShortcut("Cmd+Shift+Z")
+        redo_action.triggered.connect(self.on_redo)
+        
+        # Create View menu
+        self.view_menu = menubar.addMenu("View")
+        self.update_view_menu()
+
+    def update_view_menu(self):
+        """Update the View menu with all available windows"""
+        self.view_menu.clear()
+        
+        # Get windows to display with their visibility status
+        windows = []
+        
+        # Always add Control Panel (self)
+        is_visible = self.isVisible()
+        windows.append(("Control Panel", self, is_visible))
+        
+        # Add Spectrum Plotter (matplotlib window)
+        # Check if figure exists and has a visible canvas
+        if hasattr(self, 'fig') and self.fig is not None:
+            if hasattr(self.fig, 'canvas'):
+                try:
+                    # The spectrum plotter is always visible by default since it's shown with plt.show()
+                    is_visible = True
+                    windows.append(("Spectrum Plotter", self.fig.canvas, is_visible))
+                except:
+                    pass
+        
+        # Add Item Tracker (always exists after initialization)
+        if hasattr(self, 'item_tracker') and self.item_tracker is not None:
+            is_visible = self.item_tracker.isVisible()
+            windows.append(("Item Tracker", self.item_tracker, is_visible))
+        
+        # Add Fit Information (always exists after initialization)
+        if hasattr(self, 'fit_information_window') and self.fit_information_window is not None:
+            is_visible = self.fit_information_window.isVisible()
+            windows.append(("Fit Information", self.fit_information_window, is_visible))
+        
+        # Add Action History (always exists after initialization)
+        if hasattr(self, 'action_history_window') and self.action_history_window is not None:
+            is_visible = self.action_history_window.isVisible()
+            windows.append(("Action History", self.action_history_window, is_visible))
+        
+        # Add Help window (create if doesn't exist, but only try once)
+        if not self.help_window_attempted:
+            self._create_help_window()
+            self.help_window_attempted = True
+        if self.help_window is not None:
+            is_visible = self.help_window.isVisible()
+            windows.append(("Help", self.help_window, is_visible))
+        
+        # Add Line List window (create if doesn't exist, but only try once)
+        if not self.line_list_selector_attempted:
+            self._create_line_list_selector()
+            self.line_list_selector_attempted = True
+        if self.line_list_selector is not None:
+            is_visible = self.line_list_selector.isVisible()
+            windows.append(("Line List", self.line_list_selector, is_visible))
+        
+        # Add Listfit window (create if doesn't exist)
+        if hasattr(self, 'listfit_window'):
+            if self.listfit_window is None:
+                self._create_listfit_window()
+            if self.listfit_window is not None:
+                is_visible = self.listfit_window.isVisible()
+                windows.append(("Listfit", self.listfit_window, is_visible))
+        
+        # Add each window as a checkable menu item with visual indicator
+        for window_name, window_obj, is_visible in windows:
+            action = self.view_menu.addAction(window_name)
+            action.setCheckable(True)
+            action.setChecked(is_visible)
+            # Store the window object as data so we can retrieve it in the handler
+            action.window_obj = window_obj
+            action.triggered.connect(lambda checked, obj=window_obj: self.toggle_window(obj))
+        
+        # If no windows were added, add a placeholder so the menu isn't empty
+        if len(self.view_menu.actions()) == 0:
+            placeholder = self.view_menu.addAction("(No windows available)")
+            placeholder.setEnabled(False)
+    
+    def _create_help_window(self):
+        """Create the Help window if it doesn't exist"""
+        try:
+            from qasap.help_window import HelpWindow
+            self.help_window = HelpWindow()
+        except Exception as e:
+            print(f"Could not create Help window: {e}")
+    
+    def _create_line_list_selector(self):
+        """Create the Line List Selector if it doesn't exist"""
+        try:
+            from qasap.line_list_selector import LineListSelector
+            self.line_list_selector = LineListSelector(self.resources_dir)
+            self.line_list_selector.line_lists_changed.connect(self.on_line_lists_changed)
+        except Exception as e:
+            print(f"Could not create Line List Selector: {e}")
+    
+    def _create_listfit_window(self):
+        """Create the Listfit window if it doesn't exist"""
+        try:
+            # Listfit window initialization - may need special setup
+            # For now, we'll skip auto-creation as it may have dependencies
+            pass
+        except Exception as e:
+            print(f"Could not create Listfit window: {e}")
+
+    def toggle_window(self, window_obj):
+        """Toggle the visibility of a window"""
+        if window_obj is None:
+            return
+        
+        # Handle matplotlib canvas specially
+        if hasattr(window_obj, 'figure'):
+            # It's a matplotlib canvas
+            if window_obj.isVisible():
+                window_obj.hide()
+            else:
+                window_obj.show()
+        elif hasattr(window_obj, 'isVisible'):
+            # It's a QWidget or similar
+            if window_obj.isVisible():
+                window_obj.hide()
+            else:
+                window_obj.show()
+        
+        # Refresh the View menu after toggling to update checkmarks
+        self.update_view_menu()
+
+    def refresh_view_menu(self):
+        """Refresh the View menu - called after windows are created or shown/hidden"""
+        self.update_view_menu()
 
     def init_controlpanel(self):
         # Set main window title and geometry
@@ -365,26 +629,32 @@ class SpectrumPlotter(QtWidgets.QWidget):
         # Create fine-tuning buttons for the redshift
         self.button_redshift_decrease_01 = QPushButton("↓ 0.1", self)
         self.button_redshift_decrease_01.move(210, 40)
+        self.button_redshift_decrease_01.resize(65, 30)
         self.button_redshift_decrease_01.clicked.connect(lambda: self.adjust_redshift(-0.1))
 
         self.button_redshift_decrease_001 = QPushButton("↓ 0.01", self)
         self.button_redshift_decrease_001.move(275, 40)
+        self.button_redshift_decrease_001.resize(65, 30)
         self.button_redshift_decrease_001.clicked.connect(lambda: self.adjust_redshift(-0.01))
 
         self.button_redshift_decrease_0001 = QPushButton("↓ 0.001", self)
         self.button_redshift_decrease_0001.move(345, 40)
+        self.button_redshift_decrease_0001.resize(75, 30)
         self.button_redshift_decrease_0001.clicked.connect(lambda: self.adjust_redshift(-0.001))
 
         self.button_redshift_increase_01 = QPushButton("↑ 0.1", self)
         self.button_redshift_increase_01.move(210, 10)
+        self.button_redshift_increase_01.resize(65, 30)
         self.button_redshift_increase_01.clicked.connect(lambda: self.adjust_redshift(0.1))
 
         self.button_redshift_increase_001 = QPushButton("↑ 0.01", self)
         self.button_redshift_increase_001.move(275, 10)
+        self.button_redshift_increase_001.resize(65, 30)
         self.button_redshift_increase_001.clicked.connect(lambda: self.adjust_redshift(0.01))
 
         self.button_redshift_increase_0001 = QPushButton("↑ 0.001", self)
         self.button_redshift_increase_0001.move(345, 10)
+        self.button_redshift_increase_0001.resize(75, 30)
         self.button_redshift_increase_0001.clicked.connect(lambda: self.adjust_redshift(0.001))
 
         # Create zoom factor input field
@@ -404,11 +674,13 @@ class SpectrumPlotter(QtWidgets.QWidget):
         # Create an "Apply" button
         self.apply_button = QPushButton("Enter", self)
         self.apply_button.move(20, 120)
+        self.apply_button.resize(75, 30)
         self.apply_button.clicked.connect(self.apply_changes)
         
         # Create a "Load Spectrum..." button to load a new spectrum
         self.open_button = QPushButton("Load Spectrum...", self)
         self.open_button.move(120, 120)
+        self.open_button.resize(143, 30)
         self.open_button.clicked.connect(self.open_spectrum_file)
         
         # Create a separator line
@@ -421,6 +693,18 @@ class SpectrumPlotter(QtWidgets.QWidget):
         self.quit_button = QPushButton("Quit", self)
         self.quit_button.move(20, 165)
         self.quit_button.clicked.connect(self.quit_application)
+        
+        # Create "Undo" button (to the right of Quit with spacing)
+        self.undo_button = QPushButton("← Undo", self)
+        self.undo_button.move(120, 165)
+        self.undo_button.resize(75, 30)
+        self.undo_button.clicked.connect(self.on_undo)
+        
+        # Create "Redo" button (to the right of Undo)
+        self.redo_button = QPushButton("Redo →", self)
+        self.redo_button.move(220, 165)
+        self.redo_button.resize(75, 30)
+        self.redo_button.clicked.connect(self.on_redo)
         
         # Expand window height to accommodate new layout
         self.setGeometry(100, 100, 440, 220)
@@ -503,7 +787,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
 
     def open_spectrum_file(self):
         """Open a file dialog to select and load a new spectrum file."""
-        from PyQt5.QtWidgets import QFileDialog
+        from PyQt5.QtWidgets import QFileDialog, QMessageBox
         from qasap.format_picker_dialog import FormatPickerDialog
         
         dialog = QFileDialog(
@@ -524,6 +808,20 @@ class SpectrumPlotter(QtWidgets.QWidget):
         file_path = files[0]
         
         try:
+            # If this is not the first load and we have fits, ask if user wants to clear them
+            if not self.is_first_load and (self.gaussian_fits or self.voigt_fits or self.continuum_fits or self.listfit_fits):
+                reply = QMessageBox.question(
+                    self,
+                    "Clear Existing Fits?",
+                    "You have existing fits from the previous spectrum. Do you want to clear them before loading the new spectrum?\n\n"
+                    "Click 'Yes' to clear all fits and load cleanly.\n"
+                    "Click 'No' to keep existing fits (may cause issues).",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                if reply == QMessageBox.Yes:
+                    self.clear_all_fits()
+            
             # Auto-detect format
             candidates = SpectrumIO.detect_spectrum_format(file_path)
             if not candidates:
@@ -562,19 +860,124 @@ class SpectrumPlotter(QtWidgets.QWidget):
 
     def load_spectrum_data(self, wav, spec, err, meta, fits_file):
         """Load spectrum data into the plotter."""
+        # If in velocity mode, exit it first before loading new spectrum
+        if self.is_velocity_mode:
+            print("Exiting velocity mode to load new spectrum...")
+            self.exit_velocity_mode()
+        
+        # Record initial load action only on first load
+        if self.is_first_load:
+            if self.initial_spectrum_file:
+                import os
+                filename = os.path.basename(self.initial_spectrum_file)
+                self.record_action('load_spectrum', f'Load Spectrum: {filename}')
+            else:
+                self.record_action('open_qasap', 'Open qasap')
+            self.is_first_load = False
+        else:
+            # Record subsequent spectrum loads from GUI
+            import os
+            filename = os.path.basename(fits_file)
+            self.record_action('load_spectrum', f'Load Spectrum: {filename}')
+        
         self.wav = wav
         self.spec = spec
         self.err = err
         self.fits_file = fits_file
         self.data_loaded_from_gui = True  # Mark that data was loaded from GUI
         
+        # Extract and store wavelength unit from metadata
+        if meta and 'wave_unit' in meta:
+            self.wavelength_unit = meta['wave_unit']
+        else:
+            self.wavelength_unit = "Å"  # Default to Angstroms
+        
         # Reset smoothing and other processing
         self.smoothing_kernel = None
         self.smoothed_spectrum = None
         
         print(f"Loaded {len(wav)} wavelength points")
-        print(f"Wavelength: {wav[0]:.2f} - {wav[-1]:.2f} Å")
+        print(f"Wavelength: {wav[0]:.2f} - {wav[-1]:.2f} {self.wavelength_unit}")
         print(f"Flux range: {np.min(spec):.2e} - {np.max(spec):.2e}")
+
+    def clear_all_fits(self):
+        """Clear all fits (Gaussian, Voigt, continuum, listfit) and remove them from plot."""
+        # Remove all fit lines and continuum patches from the plot
+        for fit in self.gaussian_fits:
+            if 'line' in fit and fit['line']:
+                try:
+                    fit['line'].remove()
+                except (ValueError, AttributeError):
+                    pass
+        
+        for fit in self.voigt_fits:
+            if 'line' in fit and fit['line']:
+                try:
+                    fit['line'].remove()
+                except (ValueError, AttributeError):
+                    pass
+        
+        for fit in self.listfit_fits:
+            if 'line' in fit and fit['line']:
+                try:
+                    fit['line'].remove()
+                except (ValueError, AttributeError):
+                    pass
+        
+        # Remove continuum patches
+        for patch in self.continuum_patches:
+            if 'patch_obj' in patch and patch['patch_obj']:
+                try:
+                    patch['patch_obj'].remove()
+                except (ValueError, AttributeError):
+                    pass
+        
+        # Clear all fit lists
+        self.gaussian_fits.clear()
+        self.voigt_fits.clear()
+        self.continuum_fits.clear()
+        self.listfit_fits.clear()
+        self.continuum_patches.clear()
+        self.deleted_listfit_polynomials.clear()
+        
+        # Clear item tracker
+        self.item_tracker.clear_all()
+        self.item_id_map.clear()
+        self.highlighted_item_ids.clear()
+        self.fit_information_window.clear_all()
+        
+        # Reset plotting state
+        self.gaussian_fit_display = None
+        self.voigt_fit_display = None
+        self.residuals = None
+        self.is_residual_shown = False
+        if self.residual_ax:
+            self.residual_ax.clear()
+            self.residual_ax.set_visible(False)
+        
+        plt.draw()
+
+    def _convert_wavelength_from_angstrom(self, wavelength_angstrom):
+        """Convert wavelength from Angstroms to current display unit"""
+        if self.wavelength_unit == "nm":
+            return wavelength_angstrom / 10.0
+        elif self.wavelength_unit == "µm" or self.wavelength_unit == "um":
+            return wavelength_angstrom / 1e4
+        else:  # Angstrom (default)
+            return wavelength_angstrom
+    
+    def _convert_wavelength_to_angstrom(self, wavelength_display):
+        """Convert wavelength from current display unit to Angstroms"""
+        if self.wavelength_unit == "nm":
+            return wavelength_display * 10.0
+        elif self.wavelength_unit == "µm" or self.wavelength_unit == "um":
+            return wavelength_display * 1e4
+        else:  # Angstrom (default)
+            return wavelength_display
+    
+    def _get_wavelength_unit_label(self):
+        """Get the x-axis label with current wavelength unit"""
+        return f"Wavelength ({self.wavelength_unit})"
 
     def quit_application(self):
         """Quit the QASAP application"""
@@ -741,11 +1144,15 @@ class SpectrumPlotter(QtWidgets.QWidget):
         self.x_data = self.wav # Default is wavelength
 
         # Set up plot - reuse existing figure if available, otherwise create new
-        if not hasattr(self, 'fig') or self.fig is None:
+        is_first_plot = not hasattr(self, 'fig') or self.fig is None
+        if is_first_plot:
             # Create new figure for first time
             self.fig, self.ax = plt.subplots(figsize=(10, 6))
             # Adjust plot
             self.fig.subplots_adjust(bottom=0.35)
+            
+            # Create output panel for first plot only
+            self.output_panel = OutputPanel()
         else:
             # Reuse existing figure - clear axes
             self.ax.clear()
@@ -766,7 +1173,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
         
         self.spectrum_line = self.step_spec if self.is_step_plot else self.line_spec
         self.ax.plot(self.x_data, [0] * len(self.x_data), color='gray', linestyle='--', linewidth=1) # Add horizontal line at y=0
-        self.ax.set_xlabel('Wavelength (Å)')
+        self.ax.set_xlabel(self._get_wavelength_unit_label())
         self.ax.set_ylabel(r'Flux (arbitrary units)') # Use arbitrary units instead
         # self.ax.set_ylabel(r'Flux (erg s$^{-1}$ cm$^{-2}$ Å$^{-1}$)')
         self.ax.set_title(title)
@@ -783,7 +1190,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
         # Set the custom window title
         self.fig.canvas.manager.set_window_title("QASAP - Quick Analysis of Spectra and Profiles (v0.11)")
 
-        self.ax.legend()
+        self.ax.legend(loc='upper right')
 
         # Connect the key press and mouse move event
         self.fig.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
@@ -815,7 +1222,40 @@ class SpectrumPlotter(QtWidgets.QWidget):
                     self.fig.canvas.manager.window.setWindowIcon(QIcon(str(logo_path)))
                 self.fig.canvas.manager.window.setWindowTitle("QASAP - Spectrum Viewer")
 
-        plt.show()
+        # Update the View menu now that the spectrum plotter figure has been created
+        self.update_view_menu()
+
+        # Only show the figure window on first plot creation
+        if is_first_plot:
+            # Show the plot without blocking
+            plt.show(block=False)
+            
+            if hasattr(self.fig.canvas, 'manager') and hasattr(self.fig.canvas.manager, 'window'):
+                mpl_window = self.fig.canvas.manager.window
+                mpl_window.setWindowTitle("QASAP - Spectrum Viewer")
+                
+                # Integrate output panel with matplotlib window
+                import time
+                time.sleep(0.1)  # Give Qt time to fully create the window
+                
+                # Get the current central widget (matplotlib canvas)
+                original_canvas = mpl_window.centralWidget()
+                
+                # Create wrapper widget with vertical layout
+                wrapper_widget = QtWidgets.QWidget()
+                wrapper_layout = QVBoxLayout()
+                wrapper_layout.setContentsMargins(0, 0, 0, 0)
+                wrapper_layout.setSpacing(0)
+                
+                # Add matplotlib canvas to top (with more space)
+                wrapper_layout.addWidget(original_canvas, stretch=1)
+                
+                # Add output panel to bottom
+                wrapper_layout.addWidget(self.output_panel, stretch=0)
+                
+                # Set wrapper as central widget
+                wrapper_widget.setLayout(wrapper_layout)
+                mpl_window.setCentralWidget(wrapper_widget)
 
         self.fig.canvas.setFocus() # Removed this because it was not needed
         self.fig.canvas.draw() # Removed this because it was not needed
@@ -1119,7 +1559,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
         if self.is_velocity_mode:
             self.residual_ax.set_xlabel(r"Velocity (km s$^{-1}$)")
         else:
-            self.residual_ax.set_xlabel("Wavelength (Å)")
+            self.residual_ax.set_xlabel(self._get_wavelength_unit_label())
         self.residual_ax.set_ylabel("Residuals")
         self.update_bounds()
         self.update_residual_ticks()  # Update ticks to look nice
@@ -1136,7 +1576,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
             if self.is_velocity_mode:
                 self.residual_ax.set_xlabel(r"Velocity (km s$^{-1}$)")
             else:
-                self.residual_ax.set_xlabel("Wavelength (Å)")
+                self.residual_ax.set_xlabel(self._get_wavelength_unit_label())
             self.residual_ax.set_ylabel("Residuals")
 
             # Calculate and plot residuals
@@ -1161,11 +1601,17 @@ class SpectrumPlotter(QtWidgets.QWidget):
         gaussian_sum = np.zeros_like(self.spec)
         for fit in self.gaussian_fits:
             left_bound, right_bound = fit['bounds']
-            comp_x = self.x_data[(self.x_data >= left_bound) & (self.x_data <= right_bound)]
+            # Check if bounds are within current spectrum range
+            if right_bound < self.x_data.min() or left_bound > self.x_data.max():
+                continue  # Skip fits outside current spectrum
+            mask = (self.x_data >= left_bound) & (self.x_data <= right_bound)
+            if not np.any(mask):
+                continue  # No data points in this range
+            comp_x = self.x_data[mask]
             amp = fit['amp']
             mean = fit['mean']
             stddev = fit['stddev']
-            gaussian_sum[(self.x_data >= left_bound) & (self.x_data <= right_bound)] += self.gaussian(comp_x, amp, mean, stddev)
+            gaussian_sum[mask] += self.gaussian(comp_x, amp, mean, stddev)
 
         voigt_sum = np.zeros_like(self.spec)
         for fit in self.voigt_fits:  # Loop through each fit that's stored
@@ -1175,44 +1621,71 @@ class SpectrumPlotter(QtWidgets.QWidget):
             sigma = fit['sigma']
             left_bound, right_bound = fit['bounds']  # Get bounds from fit
             
-            # Create the comp_x array based on the left and right bounds
-            comp_x = self.x_data[(self.x_data >= left_bound) & (self.x_data <= right_bound)]
+            # Check if bounds are within current spectrum range
+            if right_bound < self.x_data.min() or left_bound > self.x_data.max():
+                continue  # Skip fits outside current spectrum
+            mask = (self.x_data >= left_bound) & (self.x_data <= right_bound)
+            if not np.any(mask):
+                continue  # No data points in this range
+            comp_x = self.x_data[mask]
 
             # Update voigt_sum for the valid range
-            voigt_sum[(self.x_data >= left_bound) & (self.x_data <= right_bound)] += self.voigt(comp_x, amp=amp, center=center, gamma=gamma, sigma=sigma)
+            voigt_sum[mask] += self.voigt(comp_x, amp=amp, center=center, gamma=gamma, sigma=sigma)
         
         continuum_sum = np.zeros_like(self.spec)
         if self.continuum_fits:
             for continuum_fit in self.continuum_fits:
                 left_bound, right_bound = continuum_fit['bounds']
-                comp_x = self.x_data[(self.x_data >= left_bound) & (self.x_data <= right_bound)]
+                # Check if bounds are within current spectrum range
+                if right_bound < self.x_data.min() or left_bound > self.x_data.max():
+                    continue  # Skip fits outside current spectrum
+                mask = (self.x_data >= left_bound) & (self.x_data <= right_bound)
+                if not np.any(mask):
+                    continue  # No data points in this range
+                comp_x = self.x_data[mask]
                 coeffs = continuum_fit['coeffs']
-                continuum_sum[(self.x_data >= left_bound) & (self.x_data <= right_bound)] = np.polyval(coeffs, comp_x)
+                continuum_sum[mask] = np.polyval(coeffs, comp_x)
 
-        # Add Listfit polynomial components to residuals
+        # Add Listfit polynomial components to residuals (skip deleted polynomials)
         listfit_poly_sum = np.zeros_like(self.spec)
         if self.listfit_fits:
             for listfit in self.listfit_fits:
                 left_bound, right_bound = listfit['bounds']
+                # Check if bounds are within current spectrum range
+                if right_bound < self.x_data.min() or left_bound > self.x_data.max():
+                    continue  # Skip listfit outside current spectrum
                 mask = (self.x_data >= left_bound) & (self.x_data <= right_bound)
+                if not np.any(mask):
+                    continue  # No data points in this range
                 comp_x = self.x_data[mask]
                 components = listfit['components']
                 result = listfit['result']
                 
-                # Find and add polynomial components from the listfit
+                # Find and add polynomial components from the listfit (skip deleted ones)
                 poly_count = 0
                 for comp in components:
                     if comp['type'] == 'polynomial':
-                        order = comp.get('order', 1)
-                        prefix = f'p{poly_count}_'
-                        poly_coeffs = []
-                        for i in range(order + 1):
-                            coeff_val = result.params[f'{prefix}c{i}'].value
-                            poly_coeffs.append(coeff_val)
-                        # Reverse coefficients for np.polyval (expects highest order first)
-                        poly_coeffs = poly_coeffs[::-1]
-                        y_poly = np.polyval(poly_coeffs, comp_x)
-                        listfit_poly_sum[mask] += y_poly
+                        # Check if this polynomial was deleted
+                        is_deleted = False
+                        for item_id, item_info in self.item_id_map.items():
+                            if (item_info.get('type') == 'polynomial' and 
+                                item_info.get('fit_dict', {}).get('listfit_bounds') == (left_bound, right_bound) and
+                                item_info.get('fit_dict', {}).get('poly_index') == poly_count):
+                                if item_id in self.deleted_listfit_polynomials:
+                                    is_deleted = True
+                                break
+                        
+                        if not is_deleted:
+                            order = comp.get('order', 1)
+                            prefix = f'p{poly_count}_'
+                            poly_coeffs = []
+                            for i in range(order + 1):
+                                coeff_val = result.params[f'{prefix}c{i}'].value
+                                poly_coeffs.append(coeff_val)
+                            # Reverse coefficients for np.polyval (expects highest order first)
+                            poly_coeffs = poly_coeffs[::-1]
+                            y_poly = np.polyval(poly_coeffs, comp_x)
+                            listfit_poly_sum[mask] += y_poly
                         poly_count += 1
 
         # Calculate residual as (spectrum - fitted Gaussians - Voigts - continuum - listfit polynomials)
@@ -1332,205 +1805,152 @@ class SpectrumPlotter(QtWidgets.QWidget):
     def set_rest_wavelength(self, line_id, line_wavelength):
         # Set rest_wavelength and perform the conversion
         self.rest_id, self.rest_wavelength = line_id, line_wavelength
-        print(f"Selected rest wavelength: {self.rest_wavelength:.2f}  d")
+        print(f"Selected rest wavelength: {self.rest_wavelength:.2f} Å")
+        
+        # Convert spectrum wavelengths to Angstroms for velocity calculation
+        wav_in_angstrom = self._convert_wavelength_to_angstrom(self.wav)
         
         # Calculate velocity for each wavelength point in the spectrum
-        self.velocities = self.wav_to_vel(self.wav, self.rest_wavelength, z=self.redshift)
+        self.velocities = self.wav_to_vel(wav_in_angstrom, self.rest_wavelength, z=self.redshift)
         self.x_data = self.velocities  # Set x_data to velocities
 
         # Update x-axis labels and limits for the main plot
         self.spectrum_line.set_xdata(self.x_data)
         self.step_spec.set_xdata(self.x_data)
-        self.step_error.set_xdata(self.x_data)
+        # Only update error lines if they exist
+        if self.step_error is not None:
+            self.step_error.set_xdata(self.x_data)
+        if self.line_error is not None:
+            self.line_error.set_xdata(self.x_data)
         self.line_spec.set_xdata(self.x_data)
-        self.line_error.set_xdata(self.x_data)
         self.ax.set_xlabel(r"Velocity (km s$^{-1}$)")
-        self.ax.plot(self.x_data, [0] * len(self.x_data), color='gray', linestyle='--', linewidth=1) # Add horizontal line at y=0
+        self.ax.plot(self.x_data, [0] * len(self.x_data), color='gray', linestyle='--', linewidth=1)
 
         # Update continuum fits to velocity space
         for fit in self.continuum_fits:
-            # Convert the line data to velocity space
-            # region_start, region_end = fit['bounds']
-            # region_wav = np.linspace(region_start, region_end, num=100)  # Increase num for smoother line
-            # continuum_values = np.polyval((fit['a'], fit['b']), region_wav)  # Calculate continuum fit values
-
-            # # Convert wavelength region to velocity
-            # continuum_velocities = self.wav_to_vel(region_wav, self.rest_wavelength, z=self.redshift)
-            
-            # # Update the line to display in velocity space
-            # fit['line'].set_xdata(continuum_velocities)
-            # fit['line'].set_ydata(continuum_values)
             velocity_line_data = self.convert_to_velocity(fit['line'])
             fit['line'].set_xdata(velocity_line_data)
 
             for patch_data in fit['patches']:
                 if fit['is_velocity_mode']:
                     vel_start, vel_end = patch_data['bounds']
-                    # if fit['rest_wavelength'] != self.rest_wavelength: # Convert to the new rest wavelength based on the rest wavelength used for the fit
-                    #     vel_start = self.wav_to_vel(wav_start, self.rest_wavelength, z=self.redshift) + self.wav_to_vel(fit['rest_wavelength'], self.rest_wavelength, z=0)
-                    #     vel_end = self.wav_to_vel(wav_end, self.rest_wavelength, z=self.redshift) + self.wav_to_vel(fit['rest_wavelength'], self.rest_wavelength, z=0)
                 else:
-                    wav_start, wav_end = patch_data['bounds']
-                    vel_start = self.wav_to_vel(wav_start, self.rest_wavelength, z=self.redshift)
-                    vel_end = self.wav_to_vel(wav_end, self.rest_wavelength, z=self.redshift)
-                patch_data['patch'].remove()  # Remove original wavelength-based patch
+                    # Bounds stored in current display unit, convert to Angstrom then to velocity
+                    wav_start_angstrom = self._convert_wavelength_to_angstrom(patch_data['bounds'][0])
+                    wav_end_angstrom = self._convert_wavelength_to_angstrom(patch_data['bounds'][1])
+                    vel_start = self.wav_to_vel(wav_start_angstrom, self.rest_wavelength, z=self.redshift)
+                    vel_end = self.wav_to_vel(wav_end_angstrom, self.rest_wavelength, z=self.redshift)
+                patch_data['patch'].remove()
                 new_patch = self.ax.axvspan(vel_start, vel_end, color='magenta', alpha=0.3, hatch='//')
-                patch_data['patch'] = new_patch  # Update with new velocity-space patch
-
-            # # Store wavelength-based patch bounds before removing original patches
-            # patch_bounds = []
-            # for original_patch in fit['patches']:
-            #     # Check if the original_patch is a valid patch object
-            #     if isinstance(original_patch, plt.Polygon) or isinstance(original_patch, plt.Rectangle):
-            #         wav_start, wav_end = original_patch.get_xy()[0][0], original_patch.get_xy()[2][0]
-            #         patch_bounds.append((wav_start, wav_end))
-            #         original_patch.remove()  # Remove the wavelength-based patch
-            #     else:
-            #         print(f"Warning: Expected a patch object but found {type(original_patch)}. Skipping.")
-
-            # # Clear the patches list and add new velocity-space patches
-            # fit['patches'].clear()
-            # for wav_start, wav_end in patch_bounds:
-            #     vel_start = self.wav_to_vel(wav_start, self.rest_wavelength, z=self.redshift)
-            #     vel_end = self.wav_to_vel(wav_end, self.rest_wavelength, z=self.redshift)
-                
-            #     # Create and add the new patch in velocity space
-            #     new_patch = self.ax.axvspan(vel_start, vel_end, color='magenta', alpha=0.3, hatch='//')
-            #     fit['patches'].append(new_patch)  # Store the new patch
+                patch_data['patch'] = new_patch
 
         # Convert Gaussian fits to velocity space
         for fit in self.gaussian_fits:
-            # FOR NOW, DON'T WORRY ABOUT THE CONVERSION BETWEEN WAVELENGTH AND VELOCITY AND INSTEAD ACCESS BOUNDS
-            # wavelength_mean, wavelength_bounds, wavelength_line = fit['mean'], fit['bounds'], fit['line']
-            # velocity_mean, velocity_bounds, velocity_line = self.convert_gaussian_to_velocity(fit, wavelength_bounds)
-            # fit['mean'] = velocity_mean
-            # fit['bounds'] = velocity_bounds
-            # Update the Gaussian line to plot in velocity space
             velocity_line_data = self.convert_to_velocity(fit['line'])
             fit['line'].set_xdata(velocity_line_data)
 
         # Convert Voigt fits to velocity space
         for fit in self.voigt_fits:
-            # FOR NOW, DON'T WORRY ABOUT THE CONVERSION BETWEEN WAVELENGTH AND VELOCITY AND INSTEAD ACCESS BOUNDS
-            # wavelength_mean, wavelength_bounds, wavelength_line = fit['center'], fit['bounds'], fit['line']
-            # velocity_mean, velocity_bounds, velocity_line = self.convert_voigt_to_velocity(fit, wavelength_bounds)
-            # fit['center'] = velocity_mean
-            # fit['bounds'] = velocity_bounds
-            # Update the Voigt line to plot in velocity space
             velocity_line_data = self.convert_to_velocity(fit['line'])
             fit['line'].set_xdata(velocity_line_data)
 
+        # Convert Listfit components to velocity space
+        for listfit in self.listfit_fits:
+            component_lines = self.listfit_component_lines.get(listfit.get('id'))
+            if component_lines:
+                for line in component_lines.values():
+                    velocity_line_data = self.convert_to_velocity(line)
+                    line.set_xdata(velocity_line_data)
+
         # Update residual plot if shown
         if self.is_residual_shown:
-            self.residual_ax.set_xlim(-3000, 3000)  # Set limits in velocity
+            self.residual_line.set_xdata(self.x_data)
+            self.residual_ax.set_xlim(-3000, 3000)
             self.residual_ax.set_xlabel(r"Velocity (km s$^{-1}$)")
             self.update_residual_ticks()
             self.update_residual_ybounds()
-            self.calculate_and_plot_residuals()
 
         # Update main axis ticks and redraw the plot
         self.update_ticks(self.ax)
-        self.ax.set_xlim(-3000, 3000)  # Adjust as needed for viewing range
+        self.ax.set_xlim(-3000, 3000)
 
-        plt.draw()
+        self.is_velocity_mode = True
+        self.fig.canvas.draw()  # Force immediate redraw for tick labels
         print(f"Velocity mode activated with rest wavelength {self.rest_wavelength:.2f} Å and redshift {self.redshift:.3f}.")
 
     def exit_velocity_mode(self):
         
         # Revert x-axis data to wavelength for main plot elements
-        self.x_data = self.wav  # Reset x_data to wavelength data
+        # Note: self.wav is still in original units, so just use it directly
+        self.x_data = self.wav
         self.spectrum_line.set_xdata(self.x_data)
         self.step_spec.set_xdata(self.x_data)
-        self.step_error.set_xdata(self.x_data)
+        # Only update error lines if they exist
+        if self.step_error is not None:
+            self.step_error.set_xdata(self.x_data)
+        if self.line_error is not None:
+            self.line_error.set_xdata(self.x_data)
         self.line_spec.set_xdata(self.x_data)
-        self.line_error.set_xdata(self.x_data)
         
-        # Set x-axis labels and limits back to wavelength
-        self.ax.set_xlabel("Wavelength (Å)")
+        # Set x-axis labels back to wavelength
+        self.ax.set_xlabel(self._get_wavelength_unit_label())
+        self.ax.plot(self.x_data, [0] * len(self.x_data), color='gray', linestyle='--', linewidth=1)
 
-        # Update continuum fits to velocity space
+        # Convert continuum fits back to wavelength space
         for fit in self.continuum_fits:
-            # Convert the line data to velocity space
-            # region_start, region_end = fit['bounds']
-            # region_vel = np.linspace(region_start, region_end, num=100)  # Increase num for smoother line
-            # continuum_values = np.polyval((fit['a'], fit['b']), region_vel)  # Calculate continuum fit values
-
-            # # Convert wavelength region to wavelength
-            # continuum_wav = self.vel_to_wav(region_vel, self.rest_wavelength, z=self.redshift)
-            
-            # # Update the line to display in velocity space
-            # fit['line'].set_xdata(continuum_wav)
-            # fit['line'].set_ydata(continuum_values)
             wavelength_line_data = self.convert_to_wavelength(fit['line'])
             fit['line'].set_xdata(wavelength_line_data)
 
-            # Update continuum patches back to wavelength space
             for patch_data in fit['patches']:
-                if not fit['is_velocity_mode']:
-                    wav_start, wav_end = patch_data['bounds']
-                else:
+                if fit['is_velocity_mode']:
+                    # These bounds are in velocity, convert to wavelength then to display unit
                     vel_start, vel_end = patch_data['bounds']
-                    wav_start = self.vel_to_wav(vel_start, self.rest_wavelength, z=self.redshift)
-                    wav_end = self.vel_to_wav(vel_end, self.rest_wavelength, z=self.redshift)
-                patch_data['patch'].remove()  # Remove original wavelength-based patch
+                    wav_start_angstrom = self.vel_to_wav(vel_start, self.rest_wavelength, z=self.redshift)
+                    wav_end_angstrom = self.vel_to_wav(vel_end, self.rest_wavelength, z=self.redshift)
+                    wav_start = self._convert_wavelength_from_angstrom(wav_start_angstrom)
+                    wav_end = self._convert_wavelength_from_angstrom(wav_end_angstrom)
+                else:
+                    # These bounds are already in display unit
+                    wav_start, wav_end = patch_data['bounds']
+                patch_data['patch'].remove()
                 new_patch = self.ax.axvspan(wav_start, wav_end, color='magenta', alpha=0.3, hatch='//')
-                patch_data['patch'] = new_patch  # Update with new velocity-space patch
+                patch_data['patch'] = new_patch
 
-            # # Store wavelength-based patch bounds before removing original patches
-            # patch_bounds = []
-            # for original_patch in fit['patches']:
-            #     vel_start, vel_end = original_patch.get_xy()[0][0], original_patch.get_xy()[2][0]
-            #     patch_bounds.append((vel_start, vel_end))
-            #     original_patch.remove()  # Remove the wavelength-based patch
-
-            # # Clear the patches list and add new velocity-space patches
-            # fit['patches'].clear()
-            # for vel_start, vel_end in patch_bounds:
-            #     wav_start = self.vel_to_wav(vel_start, self.rest_wavelength, z=self.redshift)
-            #     wav_end = self.vel_to_wav(vel_end, self.rest_wavelength, z=self.redshift)
-                
-            #     # Create and add the new patch in velocity space
-            #     new_patch = self.ax.axvspan(wav_start, wav_end, color='magenta', alpha=0.3, hatch='//')
-            #     fit['patches'].append(new_patch)  # Store the new patch
-
-        # Update Gaussian fits back to wavelength space
+        # Convert Gaussian fits back to wavelength space
         for fit in self.gaussian_fits:
-            # velocity_mean, velocity_bounds, velocity_line = fit['mean'], fit['bounds'], fit['line']
-            # wavelength_mean, wavelength_bounds, wavelength_line = self.convert_gaussian_to_wavelength(velocity_mean, velocity_bounds, velocity_line)
-            # fit['mean'] = wavelength_mean
-            # fit['bounds'] = wavelength_bounds
-            # Update the Gaussian line data to wavelength space
             wavelength_line_data = self.convert_to_wavelength(fit['line'])
             fit['line'].set_xdata(wavelength_line_data)
 
-        # Update Voigt fits back to wavelength space
+        # Convert Voigt fits back to wavelength space
         for fit in self.voigt_fits:
-            # velocity_mean, velocity_bounds, velocity_line = fit['center'], fit['bounds'], fit['line']
-            # wavelength_mean, wavelength_bounds, wavelength_line = self.convert_voigt_to_wavelength(velocity_mean, velocity_bounds, velocity_line)
-            # fit['center'] = wavelength_mean
-            # fit['bounds'] = wavelength_bounds
-            # Update the Voigt line data to wavelength space
-            # fit['line'].set_xdata(wavelength_line)
             wavelength_line_data = self.convert_to_wavelength(fit['line'])
             fit['line'].set_xdata(wavelength_line_data)
 
-        # Update residual plot if it is shown
+        # Convert Listfit components back to wavelength space
+        for listfit in self.listfit_fits:
+            component_lines = self.listfit_component_lines.get(listfit.get('id'))
+            if component_lines:
+                for line in component_lines.values():
+                    wavelength_line_data = self.convert_to_wavelength(line)
+                    line.set_xdata(wavelength_line_data)
+
+        # Update residual plot if shown
         if self.is_residual_shown:
-            self.residual_line.set_xdata(self.wav)
-            self.residual_ax.set_xlim(self.wav.min(), self.wav.max())
-            self.residual_ax.set_xlabel("Wavelength (Å)")
+            self.residual_line.set_xdata(self.x_data)
+            self.residual_ax.set_xlim(self.x_data.min(), self.x_data.max())
+            self.residual_ax.set_xlabel(self._get_wavelength_unit_label())
             self.update_residual_ticks()
+            self.update_residual_ybounds()
 
         # Update main axis ticks and redraw plot
         self.update_ticks(self.ax)
         self.ax.set_xlim(self.x_data.min(), self.x_data.max())
-        if self.is_residual_shown:
-            self.update_residual_ybounds()
 
         self.rest_wavelength = None
         self.rest_id = None
+        self.is_velocity_mode = False
         
-        plt.draw()
+        self.fig.canvas.draw()  # Force immediate redraw for tick labels
         print("Exited velocity mode and reverted to wavelength space.")
 
     # Define fitted functions
@@ -1911,14 +2331,17 @@ class SpectrumPlotter(QtWidgets.QWidget):
             color = linelist_info['color']
             
             for line in linelist.lines:
-                # Apply redshift to the line wavelength
+                # Apply redshift to the line wavelength (linelist is in Angstroms)
                 shifted_wl = line.wave * (1 + self.redshift)
                 
+                # Convert from Angstroms to current display unit
+                shifted_wl_display = self._convert_wavelength_from_angstrom(shifted_wl)
+                
                 # Check if wavelength is within current x-limits
-                if xlim[0] <= shifted_wl <= xlim[1]:
+                if xlim[0] <= shifted_wl_display <= xlim[1]:
                     # Draw the vertical line
-                    vline = self.ax.axvline(shifted_wl, color=color, linestyle='--', alpha=0.7)
-                    label = self.ax.text(shifted_wl, 0, line.name,
+                    vline = self.ax.axvline(shifted_wl_display, color=color, linestyle='--', alpha=0.7)
+                    label = self.ax.text(shifted_wl_display, 0, line.name,
                                         rotation=90, verticalalignment='bottom', 
                                         color=color, fontsize=8)
                     self.current_linelist_lines.append((vline, label))
@@ -2048,6 +2471,9 @@ class SpectrumPlotter(QtWidgets.QWidget):
         item_info = self.item_id_map[item_id]
         item_type = item_info.get('type')
         
+        # Capture state before deletion for undo/redo
+        state_before = self.capture_state()
+        
         # Remove from internal storage lists based on item type
         fit_dict = item_info.get('fit_dict')
         if fit_dict:
@@ -2060,8 +2486,28 @@ class SpectrumPlotter(QtWidgets.QWidget):
             elif item_type == 'continuum':
                 # Remove from continuum_fits list
                 self.continuum_fits = [f for f in self.continuum_fits if f is not fit_dict]
+            elif item_type == 'listfit_total':
+                # Remove the Total Listfit - this removes the entire listfit fit
+                # Find and remove the corresponding listfit from listfit_fits
+                listfit_bounds = fit_dict.get('listfit_bounds')
+                if listfit_bounds:
+                    self.listfit_fits = [f for f in self.listfit_fits if f.get('bounds') != listfit_bounds]
+                    # Also remove any Gaussian/Voigt/Polynomial items that belonged to this listfit
+                    items_to_remove = []
+                    for check_id, check_info in self.item_id_map.items():
+                        check_bounds = check_info.get('fit_dict', {}).get('bounds')
+                        if check_bounds == listfit_bounds:
+                            items_to_remove.append(check_id)
+                    for remove_id in items_to_remove:
+                        if remove_id in self.item_id_map:
+                            # Remove from tracker (this will recursively call on_item_deleted_from_tracker)
+                            self.item_tracker.unregister_item(remove_id)
         
-        # Handle line objects (gaussian, voigt, continuum)
+        # Handle polynomial deletion - mark it as deleted for residual calculation
+        if item_type == 'polynomial':
+            self.deleted_listfit_polynomials.add(item_id)
+        
+        # Handle line objects (gaussian, voigt, continuum, polynomial, listfit_total)
         line_obj = item_info.get('line_obj')
         if line_obj:
             try:
@@ -2070,7 +2516,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 # Object may have already been removed or cannot be removed
                 pass
         
-        # Handle patches (continuum regions)
+        # Handle patches (continuum regions, masks)
         patch_obj = item_info.get('patch_obj')
         if patch_obj:
             try:
@@ -2084,11 +2530,18 @@ class SpectrumPlotter(QtWidgets.QWidget):
             bounds = item_info['bounds']
             self.continuum_patches = [p for p in self.continuum_patches if p.get('bounds') != bounds]
         
-        plt.draw()
         # Update residual display if shown
         if self.is_residual_shown:
             self.calculate_and_plot_residuals()
+        
+        # Redraw the figure immediately
+        if self.fig is not None:
+            self.fig.canvas.draw()
+        
         self.unregister_item(item_id)
+        
+        # Record action for undo/redo
+        self.record_action('delete_item', f'Delete {item_type}: {item_info.get("name", item_id)}')
     
     def on_item_selected_from_tracker(self, item_id):
         """Handle item selection from tracker - highlight with royal blue color"""
@@ -2368,27 +2821,6 @@ class SpectrumPlotter(QtWidgets.QWidget):
             'continuum_subtracted_y': continuum_subtracted_y
         })
 
-    # Define a callback for when a line is selected
-    def on_line_selected(line_id, line_wavelength):
-        """
-        Callback to handle the line selection from the line list window.
-        Sets the selected line ID and wavelength and closes the window.
-        """
-        selected_line_id = line_id
-        selected_line_wavelength = line_wavelength
-        linelist_window.destroy()  # Close the line list window once a selection is made
-
-        # Variables to store the selected line's ID and wavelength
-        selected_line_id, selected_line_wavelength = None, None
-
-        # Bind the selection event to the callback
-        linelist_window.bind("<LineSelect>", lambda event: on_line_selected(event.line_id, event.line_wavelength))
-
-        # Wait for the window to close before returning the selected values
-        linelist_window.wait_window()
-
-        return selected_line_id, selected_line_wavelength
-
     def plot_marker_and_label(self, profile_type, center_or_mean, line_id, bounds):
         # Get current y-axis limits and calculate the y-position at 3/4 of the plot height
         x_min, x_max = self.ax.get_xlim()
@@ -2409,6 +2841,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
         # Attach the bounds to the marker as a custom attribute
         setattr(marker, 'bounds', bounds)
         setattr(marker, 'center', center_or_mean)
+        setattr(marker, 'line_id', line_id)
         self.markers.append(marker)  # Append marker to the list
         
         # Add a vertically oriented textbox for the line ID
@@ -2424,7 +2857,12 @@ class SpectrumPlotter(QtWidgets.QWidget):
         # Attach the bounds to the label as a custom attribute
         setattr(label, 'bounds', bounds)
         setattr(label, 'center', center_or_mean)
+        setattr(label, 'marker', marker)  # Link label to marker for removal
         self.labels.append(label)  # Append label to the list
+        
+        # Add marker to item tracker
+        marker_id = f"marker_{len(self.markers)-1}_{line_id}"
+        self.item_tracker.add_item(marker_id, 'marker', f'Marker: {line_id}', position=f'{center_or_mean:.2f} Å', color=marker_color, line_obj=marker)
         
         # Redraw plot to ensure the new marker and label are visible
         plt.draw()
@@ -2447,6 +2885,9 @@ class SpectrumPlotter(QtWidgets.QWidget):
         bounds = selected_profile['bounds']
         line_id = selected_profile['line_id']
         self.plot_marker_and_label(profile_type, center_or_mean, line_id, bounds)
+        
+        # Record action
+        self.record_action('add_marker', f'Add Marker: {line_id} at λ={selected_wavelength:.2f} Å')
         
         # Clear selection references
         self.selected_gaussian = None
@@ -3066,6 +3507,10 @@ class SpectrumPlotter(QtWidgets.QWidget):
         fig.savefig(filename, bbox_inches='tight')
         print(f"Corner plot saved to {filename}.")
         plt.show()
+        
+        # Record action for undo/redo
+        self.record_action('perform_bayesian_fit', f'Perform Bayesian MCMC Fit')
+        
         self.bayes_mode = False
         print("Exiting Bayes fit mode")
 
@@ -3091,7 +3536,201 @@ class SpectrumPlotter(QtWidgets.QWidget):
                     self.y_lower_bound <= event.ydata <= self.y_upper_bound):
                 return  # Exit if the cursor is outside the plot area
 
+    def capture_state(self):
+        """Capture current state for undo/redo"""
+        # Extract only essential data from listfit_fits (exclude unpicklable result objects)
+        listfit_fits_simplified = []
+        for fit in self.listfit_fits:
+            simplified_fit = {
+                'bounds': fit.get('bounds'),
+                'x_data': deepcopy(fit.get('x_data')) if fit.get('x_data') is not None else None,
+                'y_data': deepcopy(fit.get('y_data')) if fit.get('y_data') is not None else None,
+                'err_data': deepcopy(fit.get('err_data')) if fit.get('err_data') is not None else None,
+            }
+            listfit_fits_simplified.append(simplified_fit)
+        
+        # Extract only bounds from continuum_patches (can't deepcopy matplotlib patches)
+        continuum_patches_simplified = []
+        for patch_info in self.continuum_patches:
+            continuum_patches_simplified.append({
+                'bounds': patch_info.get('bounds')
+            })
+        
+        return {
+            'gaussian_fits': deepcopy(self.gaussian_fits),
+            'voigt_fits': deepcopy(self.voigt_fits),
+            'continuum_fits': deepcopy(self.continuum_fits),
+            'continuum_regions': deepcopy(self.continuum_regions),
+            'continuum_patches': continuum_patches_simplified,
+            'listfit_fits': listfit_fits_simplified,
+            'redshift': self.redshift,
+            'fit_id': self.fit_id,
+            'component_id': self.component_id,
+        }
+    
+    def record_action(self, action_type, description):
+        """Record an action in the history"""
+        state = self.capture_state()
+        self.action_history.record_action(action_type, description, state)
+        self.action_history_window.refresh_display()
+        self.update_undo_redo_buttons()
+    
+    def restore_state(self, state):
+        """Restore a previously captured state"""
+        if not state:
+            return
+        
+        # Save current view bounds BEFORE any changes
+        current_xlim = self.ax.get_xlim() if self.ax is not None else None
+        current_ylim = self.ax.get_ylim() if self.ax is not None else None
+        
+        # Remove only fit lines from the axes, NOT the spectrum line
+        if self.ax is not None:
+            # Get all lines and identify which ones to keep
+            lines_to_remove = []
+            for line in self.ax.get_lines():
+                # Keep the spectrum line (stored in self.spectrum_line and self.line_spec/self.step_spec)
+                if line not in [self.spectrum_line, getattr(self, 'line_spec', None), getattr(self, 'step_spec', None)]:
+                    # Keep error lines too
+                    if line not in [getattr(self, 'line_error', None), getattr(self, 'step_error', None)]:
+                        lines_to_remove.append(line)
+            
+            # Remove only the fit lines
+            for line in lines_to_remove:
+                line.remove()
+            
+            # Remove all continuum patches
+            for patch in self.ax.patches[:]:
+                patch.remove()
+        
+        # Restore state
+        self.gaussian_fits = deepcopy(state.get('gaussian_fits', []))
+        self.voigt_fits = deepcopy(state.get('voigt_fits', []))
+        self.continuum_fits = deepcopy(state.get('continuum_fits', []))
+        self.continuum_regions = deepcopy(state.get('continuum_regions', []))
+        self.continuum_patches = state.get('continuum_patches', [])  # Don't deepcopy - will recreate patches below
+        self.listfit_fits = deepcopy(state.get('listfit_fits', []))
+        self.redshift = state.get('redshift', 0.0)
+        self.fit_id = state.get('fit_id', 0)
+        self.component_id = state.get('component_id', 0)
+        
+        # Clear tracking sets
+        self.deleted_listfit_polynomials.clear()
+        
+        # Clear item tracker
+        self.item_tracker.clear_all()
+        self.fit_information_window.clear_all()
+        self.item_id_map.clear()
+        
+        # Redraw all fits on existing axes
+        if self.ax is not None:
+            # Re-draw continuum region patches with proper styling and register with item tracker
+            for patch_info in self.continuum_patches:
+                bounds = patch_info.get('bounds')
+                if bounds:
+                    # Recreate the axvspan patch with magenta color and hatching (same as original)
+                    patch = self.ax.axvspan(bounds[0], bounds[1], color='magenta', alpha=0.3, hatch='//')
+                    # Store the patch object back in the patch_info dict
+                    patch_info['patch'] = patch
+                    # Register the region patch with ItemTracker
+                    position_str = f"λ: {bounds[0]:.2f}-{bounds[1]:.2f} Å"
+                    self.register_item('continuum_region', f'Continuum Region', patch_obj=patch, 
+                                     position=position_str, color='magenta', bounds=bounds)
+            
+            # Re-plot all continuum fits
+            for fit in self.continuum_fits:
+                if 'line' in fit and fit['line'] is not None:
+                    self.ax.plot(fit['line'].get_xdata(), fit['line'].get_ydata(), 
+                               color='magenta', linestyle='--', linewidth=1.5, label='Continuum')
+                    # Re-register with tracker
+                    bounds = fit.get('bounds')
+                    bounds_str = f"λ: {bounds[0]:.2f}-{bounds[1]:.2f} Å" if bounds else "Continuum"
+                    self.register_item('continuum', f'Continuum (order {fit.get("poly_order", 1)})', 
+                                     fit_dict=fit, line_obj=fit['line'], 
+                                     position=bounds_str, color='magenta')
+            
+            # Re-plot all Gaussian fits
+            for fit in self.gaussian_fits:
+                if 'line' in fit and fit['line'] is not None:
+                    self.ax.plot(fit['line'].get_xdata(), fit['line'].get_ydata(), 
+                               color='red', linestyle='--', linewidth=1.5, label='Gaussian')
+                    # Re-register with tracker
+                    mean = fit.get('mean', 0)
+                    position_str = f"λ: {mean:.2f} Å"
+                    self.register_item('gaussian', 'Gaussian', fit_dict=fit, 
+                                     line_obj=fit['line'], position=position_str, color='red')
+            
+            # Re-plot all Voigt fits
+            for fit in self.voigt_fits:
+                if 'line' in fit and fit['line'] is not None:
+                    self.ax.plot(fit['line'].get_xdata(), fit['line'].get_ydata(), 
+                               color='orange', linestyle='--', linewidth=1.5, label='Voigt')
+                    # Re-register with tracker
+                    center = fit.get('center', fit.get('mean', 0))
+                    position_str = f"λ: {center:.2f} Å"
+                    self.register_item('voigt', 'Voigt', fit_dict=fit, 
+                                     line_obj=fit['line'], position=position_str, color='orange')
+            
+            # Re-plot total line if it was shown
+            if self.show_total_line and (self.gaussian_fits or self.voigt_fits or self.continuum_fits or self.listfit_fits):
+                self.draw_total_line()
+            
+            # Restore view bounds - preserve the current zoom level
+            if current_xlim is not None:
+                self.ax.set_xlim(current_xlim)
+            if current_ylim is not None:
+                self.ax.set_ylim(current_ylim)
+            
+            # Redraw canvas
+            self.ax.figure.canvas.draw_idle()
+        
+        self.update_undo_redo_buttons()
+    
+    def update_undo_redo_buttons(self):
+        """Update the enabled state of undo/redo buttons"""
+        if hasattr(self, 'undo_button'):
+            self.undo_button.setEnabled(self.action_history.can_undo())
+        if hasattr(self, 'redo_button'):
+            self.redo_button.setEnabled(self.action_history.can_redo())
+    
+    def on_undo(self):
+        """Perform undo action"""
+        state = self.action_history.undo()
+        if state:
+            self.restore_state(state)
+            self.action_history_window.refresh_display()
+    
+    def on_redo(self):
+        """Perform redo action"""
+        state = self.action_history.redo()
+        if state:
+            self.restore_state(state)
+            self.action_history_window.refresh_display()
+    
+    def on_action_selected(self, index):
+        """User selected an action from history window"""
+        state = self.action_history.goto_action(index)
+        if state:
+            self.restore_state(state)
+            self.action_history_window.refresh_display()
+
     def keyPressEvent(self, event):
+        """Handle key press events - check for undo/redo shortcuts and quit first"""
+        if isinstance(event, QKeyEvent):
+            # Check for Ctrl+Z (undo) or Cmd+Z (undo) on macOS
+            if event.key() == Qt.Key_Z and (event.modifiers() & Qt.ControlModifier or event.modifiers() & Qt.MetaModifier):
+                # Check if Shift is also pressed (for Redo)
+                if event.modifiers() & Qt.ShiftModifier:
+                    self.on_redo()
+                else:
+                    self.on_undo()
+                return
+            
+            # Check for 'q' or 'Q' to quit
+            if event.key() == Qt.Key_Q:
+                self.quit_application()
+                return
+        
         self.on_key(event)
 
     def update_total_line_if_shown(self):
@@ -3174,25 +3813,83 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 profile_interp = interp1d(self.vel_to_wav(fit_x, fit['rest_wavelength'], z=self.redshift), fit_y - existing_continuum, bounds_error=False, fill_value=0)
             total_voigt += profile_interp(x_plot)
 
-        # Combine Listfit fits
+        # Combine Listfit fits - extract and add all components including polynomials
         total_listfit = np.zeros_like(x_plot)
         for fit in self.listfit_fits:
-            if 'y_fit' in fit and 'x_fit' in fit:
-                left_bound, right_bound = fit['left_bound'], fit['right_bound']
-                mask = (x_plot >= left_bound) & (x_plot <= right_bound)
-                if mask.any():
-                    # Interpolate listfit result
-                    fit_interp = interp1d(fit['x_fit'], fit['y_fit'], bounds_error=False, fill_value=0)
-                    total_listfit[mask] += fit_interp(x_plot[mask])
+            left_bound, right_bound = fit.get('bounds', (0, 0))
+            mask = (x_plot >= left_bound) & (x_plot <= right_bound)
+            if mask.any():
+                components = fit.get('components', [])
+                result = fit.get('result')
+                
+                # Calculate Gaussian components from the listfit
+                gauss_count = 0
+                for comp in components:
+                    if comp['type'] == 'gaussian':
+                        prefix = f'g{gauss_count}_'
+                        g_amp = result.params[f'{prefix}amp'].value
+                        g_mean = result.params[f'{prefix}mean'].value
+                        g_stddev = result.params[f'{prefix}stddev'].value
+                        y_gauss = self.gaussian(x_plot[mask], g_amp, g_mean, g_stddev)
+                        total_listfit[mask] += y_gauss
+                        gauss_count += 1
+                
+                # Calculate Voigt components from the listfit
+                voigt_count = 0
+                for comp in components:
+                    if comp['type'] == 'voigt':
+                        prefix = f'v{voigt_count}_'
+                        v_amp = result.params[f'{prefix}amp'].value
+                        v_center = result.params[f'{prefix}center'].value
+                        v_sigma = result.params[f'{prefix}sigma'].value
+                        v_gamma = result.params[f'{prefix}gamma'].value
+                        y_voigt = self.voigt(x_plot[mask], v_amp, v_center, v_sigma, v_gamma)
+                        total_listfit[mask] += y_voigt
+                        voigt_count += 1
+                
+                # Calculate polynomial components from the listfit
+                poly_count = 0
+                for comp in components:
+                    if comp['type'] == 'polynomial':
+                        order = comp.get('order', 1)
+                        prefix = f'p{poly_count}_'
+                        poly_coeffs = []
+                        for i in range(order + 1):
+                            coeff_key = f'{prefix}c{i}'
+                            if coeff_key in result.params:
+                                coeff_val = result.params[coeff_key].value
+                                poly_coeffs.append(coeff_val)
+                        # Reverse coefficients for np.polyval (expects highest order first)
+                        if poly_coeffs:
+                            poly_coeffs = poly_coeffs[::-1]
+                            y_poly = np.polyval(poly_coeffs, x_plot[mask])
+                            total_listfit[mask] += y_poly
+                        poly_count += 1
 
         total_y = total_continuum + total_gaussian + total_voigt + total_listfit
 
         # Plot the total line
         self.ax.plot(x_plot, total_y, label="Total Line", color='#0ed8ca', linestyle='-')
-        self.ax.legend()
+        self.ax.legend(loc='upper right')
 
     # Function for handling key events
     def on_key(self, event):
+
+        # Check for undo/redo shortcuts (Cmd+Z for undo, Cmd+Shift+Z for redo)
+        if hasattr(event, 'key') and event.key is not None:
+            # Check for undo: Cmd+Z (macOS) or Ctrl+Z (all platforms)
+            if event.key == 'ctrl+z' or event.key == 'cmd+z':
+                self.on_undo()
+                return
+            # Check for redo: Cmd+Shift+Z (macOS) or Ctrl+Shift+Z (all platforms)
+            if event.key == 'ctrl+shift+z' or event.key == 'cmd+shift+z':
+                self.on_redo()
+                return
+            
+            # Quit application with 'q' or 'Q' key - handle this FIRST to override matplotlib's default
+            if event.key == 'q' or event.key == 'Q':
+                self.quit_application()
+                return
 
         # Check if the cursor is within the axes bounds
         if hasattr(event, 'xdata') and hasattr(event, 'ydata'):
@@ -3221,10 +3918,6 @@ class SpectrumPlotter(QtWidgets.QWidget):
             self.help_window.show()
             self.help_window.raise_()
             self.help_window.activateWindow()
-
-        # Quit application with 'q' or 'Q' key
-        if event.key == 'q' or event.key == 'Q':
-            self.quit_application()
 
         # Toggle residual panel
         if event.key == 'r':
@@ -3391,7 +4084,9 @@ class SpectrumPlotter(QtWidgets.QWidget):
             if self.is_residual_shown:
                 self.calculate_and_plot_residuals()
             plt.legend()
-            plt.draw()
+            # Force immediate redraw of the canvas
+            self.ax.figure.canvas.draw()
+            QtWidgets.QApplication.processEvents()  # Process Qt events to ensure redraw
             print("Fitting completed for defined regions.")
             # Add continuum fit
             continuum_fit = {
@@ -3408,6 +4103,10 @@ class SpectrumPlotter(QtWidgets.QWidget):
             bounds_str = f"λ: {region_bounds[0]:.2f}-{region_bounds[1]:.2f} Å"
             self.register_item('continuum', f'Continuum (order {self.poly_order})', fit_dict=continuum_fit,
                              line_obj=continuum_line, position=bounds_str, color='magenta')
+            
+            # Record action for undo/redo
+            self.record_action('fit_continuum', f'Fit Continuum (order {self.poly_order})')
+            
             self.continuum_regions = [] # Clear continuum_regions
             self.continuum_mode = False # Exit continuum mode
             self.label_poly_order.hide()
@@ -3432,8 +4131,10 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 position_str = f"λ: {region_bounds[0]:.2f}-{region_bounds[1]:.2f} Å"
                 self.register_item('continuum_region', f'Continuum Region', patch_obj=patch, 
                                  position=position_str, color='magenta', bounds=region_bounds)
+                # Record action for defining a continuum region
+                self.record_action('define_continuum_region', f'Define Continuum Region λ: {region_bounds[0]:.2f}-{region_bounds[1]:.2f} Å')
                 # self.continuum_patches.append(patch) # Store the patch
-                plt.draw()  # Update plot with the new region
+                self.fig.canvas.draw_idle()  # Update plot with the new region
         # Remove continuum region
         if event.key == 'M':
             # Check each continuum fit to see if the mouse is over it
@@ -3445,6 +4146,15 @@ class SpectrumPlotter(QtWidgets.QWidget):
                     if continuum_line:
                         continuum_line.remove()
                         print(f"Removed continuum line {continuum_line} in range: {region_bounds}")
+                    
+                    # Remove from item tracker - find items matching this line
+                    item_ids_to_remove = []
+                    for item_id, item_info in self.item_id_map.items():
+                        if item_info.get('line_obj') == continuum_line or item_info.get('fit_dict') == fit:
+                            item_ids_to_remove.append(item_id)
+                    for item_id in item_ids_to_remove:
+                        self.unregister_item(item_id)
+                    
                     # Remove the fit from the list
                     self.continuum_fits.remove(fit)
                     plt.draw()  # Redraw the plot after removal
@@ -3458,6 +4168,15 @@ class SpectrumPlotter(QtWidgets.QWidget):
                     if patch in self.ax.patches:
                         patch.remove()  # Remove the patch from the plot
                         print(f"Removed continuum patch {patch} in range: {region_bounds}")
+                    
+                    # Remove from item tracker - find items matching this patch
+                    item_ids_to_remove = []
+                    for item_id, item_info in self.item_id_map.items():
+                        if item_info.get('patch_obj') == patch:
+                            item_ids_to_remove.append(item_id)
+                    for item_id in item_ids_to_remove:
+                        self.unregister_item(item_id)
+                    
                     # Remove the entry from the list of patches
                     self.continuum_patches.remove(patch_info)
                     plt.draw()  # Redraw the plot after removal
@@ -3475,18 +4194,34 @@ class SpectrumPlotter(QtWidgets.QWidget):
         if event.key == ' ' and self.listfit_mode:
             if len(self.listfit_bounds) == 0:
                 # Start a new region
-                self.listfit_bounds.append(event.xdata)
+                # If in velocity mode, convert velocity back to wavelength for processing
+                bound_value = event.xdata
+                if self.is_velocity_mode and self.rest_wavelength is not None:
+                    # Convert velocity back to wavelength
+                    bound_value = self.vel_to_wav(event.xdata, self.rest_wavelength, z=self.redshift)
+                
+                self.listfit_bounds.append(bound_value)
                 line = self.ax.axvline(event.xdata, color='green', linestyle='--')
                 self.listfit_bound_lines.append(line)
                 print(f"Listfit bound start: {event.xdata:.2f}. Press space again to set end bound.")
-                plt.draw()
+                # Record action for setting Listfit lower bound
+                self.record_action('set_listfit_bound_1', f'Set Listfit lower bound at λ={bound_value:.2f} Å')
+                self.fig.canvas.draw_idle()
             elif len(self.listfit_bounds) == 1:
                 # Set the end bound
-                self.listfit_bounds.append(event.xdata)
+                # If in velocity mode, convert velocity back to wavelength for processing
+                bound_value = event.xdata
+                if self.is_velocity_mode and self.rest_wavelength is not None:
+                    # Convert velocity back to wavelength
+                    bound_value = self.vel_to_wav(event.xdata, self.rest_wavelength, z=self.redshift)
+                
+                self.listfit_bounds.append(bound_value)
                 line = self.ax.axvline(event.xdata, color='green', linestyle='--')
                 self.listfit_bound_lines.append(line)
                 print(f"Listfit bound end: {event.xdata:.2f}. Opening component selection dialog...")
-                plt.draw()
+                # Record action for setting Listfit upper bound
+                self.record_action('set_listfit_bound_2', f'Set Listfit upper bound at λ={bound_value:.2f} Å')
+                self.fig.canvas.draw_idle()
                 
                 # Show the listfit window
                 self.show_listfit_window()
@@ -3506,11 +4241,22 @@ class SpectrumPlotter(QtWidgets.QWidget):
             line_id = None
             line_wavelength = None
             # Register the bound at the current cursor position
-            self.bounds.append(event.xdata)
-            line = self.ax.axvline(event.xdata, color='red', linestyle='--')  # Plot bound line
+            # If in velocity mode, convert velocity back to wavelength for processing
+            bound_value = event.xdata
+            if self.is_velocity_mode and self.rest_wavelength is not None:
+                # Convert velocity back to wavelength
+                bound_value = self.vel_to_wav(event.xdata, self.rest_wavelength, z=self.redshift)
+            
+            self.bounds.append(bound_value)
+            line = self.ax.axvline(event.xdata, color='red', linestyle='--')  # Plot bound line using displayed coords
             self.bound_lines.append(line)  # Store the line object
             print(f"Bound set at x = {event.xdata}")
-            plt.draw()  # Update plot with the new bound line
+            # Record action for setting a bound
+            if len(self.bounds) == 1:
+                self.record_action('set_gaussian_bound_1', f'Set Gaussian lower bound at λ={bound_value:.2f} Å')
+            elif len(self.bounds) == 2:
+                self.record_action('set_gaussian_bound_2', f'Set Gaussian upper bound at λ={bound_value:.2f} Å')
+            self.fig.canvas.draw_idle()  # Update plot with the new bound line
 
             # If two bounds are selected, fit the Gaussian
             if self.gaussian_mode and len(self.bounds) == 2:
@@ -3543,13 +4289,14 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 if existing_continuum is not None:
                     # Use the existing continuum
                     continuum_subtracted_y = comp_y - existing_continuum
+                    continuum_for_plot = existing_continuum
                     print("Using existing continuum for Gaussian fit.")
 
                 else:
                     # No continuum defined - fit directly to data without continuum subtraction
                     continuum_subtracted_y = comp_y
+                    continuum_for_plot = np.zeros_like(comp_y)
                     print("No existing continuum found; fitting Gaussian directly to data.")
-                    print("No existing continuum found; fitted new continuum.")
 
                 # Fit Gaussian to the continuum-subtracted data
                 if len(comp_x) > 0:
@@ -3598,7 +4345,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
 
                     # Plot the fit and store fit info
                     x_fit = comp_x
-                    y_fit = self.gaussian(x_fit, amp, mean, stddev) + (existing_continuum if existing_continuum is not None else overall_continuum)
+                    y_fit = self.gaussian(x_fit, amp, mean, stddev) + continuum_for_plot
                     residuals = comp_y - y_fit
                     # Calculate chi2 with optional errors
                     if comp_err is not None:
@@ -3606,7 +4353,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
                     else:
                         chi2 = np.sum(residuals ** 2) # Chi2 without errors
                     chi2_nu = chi2 / (len(x_fit) - len(params))# Calculate chi2 d.o.f.
-                    interpolator = interp1d(x_fit, y_fit, kind='cubic')
+                    interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
                     x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                     y_plt = interpolator(x_plt)
                     fit_line, = self.ax.plot(x_plt, y_plt, color='red', linestyle='--')
@@ -3630,6 +4377,10 @@ class SpectrumPlotter(QtWidgets.QWidget):
                     position_str = f"λ: {mean:.2f} Å"
                     self.register_item('gaussian', f'Gaussian', fit_dict=self.gaussian_fits[-1], line_obj=fit_line,
                                      position=position_str, color='red')
+                    
+                    # Record action for undo/redo
+                    self.record_action('fit_gaussian', f'Fit Gaussian at λ={mean:.2f} Å')
+                    
                     print(f"  Fit ID: {self.fit_id}")
                     print(f"  Component ID: {self.component_id}")
                     print(f"  Velocity mode: {self.is_velocity_mode}")
@@ -3644,7 +4395,9 @@ class SpectrumPlotter(QtWidgets.QWidget):
                     print(f"  Line Object: {fit_line}\n")
 
                     self.component_id += 1
-                    plt.draw() 
+                    # Force immediate redraw of the canvas
+                    self.ax.figure.canvas.draw()
+                    QtWidgets.QApplication.processEvents()  # Process Qt events to ensure redraw
                     print(f"Fitted parameters: Amplitude = {amp}+-{amp_err}, Mean = {mean}+-{mean_err}, Std Dev = {stddev}+-{stddev_err}")
                     # Update residual display if shown
                     if self.is_residual_shown:
@@ -3655,6 +4408,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
                     line.remove()
                 self.bound_lines.clear()  # Clear the list of bound lines
                 self.bounds = []
+                self.ax.figure.canvas.draw_idle()  # Redraw to show bound lines removed
                 self.fit_id += 1
 
         # Perform multi-Gaussian fit if Enter is pressed in multi-Gaussian mode
@@ -3673,7 +4427,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
                         line.remove()
                     self.bound_lines.clear()
                     self.bounds.clear()
-                    plt.draw()
+                    self.fig.canvas.draw_idle()
                     return
             
             comp_xs = []
@@ -3740,7 +4494,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
                     else:
                         chi2 = np.sum(residuals ** 2) # Chi2 without errors
                     chi2_nu = chi2 / (len(x_fit) - len(params))# Calculate chi2 d.o.f.
-                    interpolator = interp1d(x_fit, y_fit, kind='cubic')
+                    interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
                     x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                     y_plt = interpolator(x_plt)
                     fit_line, = self.ax.plot(x_plt, y_plt, color='red', linestyle='--')
@@ -3765,6 +4519,11 @@ class SpectrumPlotter(QtWidgets.QWidget):
                     position_str = f"λ: {mean:.2f} Å"
                     self.register_item('gaussian', f'Gaussian', fit_dict=gaussian_fit, line_obj=fit_line,
                                      position=position_str, color='red')
+                    
+                    # Record action for undo/redo (only record once after all components)
+                    if i == len(params) - 3:  # Last component
+                        self.record_action('fit_multi_gaussian', f'Fit {len(bound_pairs)} Gaussians')
+                    
                     print(f"  Fit ID: {self.fit_id}")
                     print(f"  Component ID: {self.component_id}")
                     print(f"  Velocity mode: {self.is_velocity_mode}")
@@ -3780,13 +4539,16 @@ class SpectrumPlotter(QtWidgets.QWidget):
 
                     self.component_id += 1
 
-                plt.draw()
+                # Force immediate redraw of the canvas
+                self.ax.figure.canvas.draw()
+                QtWidgets.QApplication.processEvents()  # Process Qt events to ensure redraw
                 self.fit_id += 1
-
                 # Clear bound lines after fit
                 for line in self.bound_lines:
                     line.remove()
                 self.bound_lines.clear()
+                self.bounds = []
+                self.ax.figure.canvas.draw_idle()  # Redraw to show bound lines removed
                 for i in range(0, len(params), 3):
                     print(f"Simultaneous Gaussian fit parameters:\nGaussian {i//3 + 1}: Amplitude = {amp}+-{amp_err}, Mean = {mean}+-{mean_err}, Std Dev = {stddev}+-{stddev_err}")
 
@@ -3808,11 +4570,22 @@ class SpectrumPlotter(QtWidgets.QWidget):
         if event.key == ' ' and self.voigt_mode:  # Set bounds with space for Voigt fit
             line_id = None
             line_wavelength = None
-            self.bounds.append(event.xdata)
+            # If in velocity mode, convert velocity back to wavelength for processing
+            bound_value = event.xdata
+            if self.is_velocity_mode and self.rest_wavelength is not None:
+                # Convert velocity back to wavelength
+                bound_value = self.vel_to_wav(event.xdata, self.rest_wavelength, z=self.redshift)
+            
+            self.bounds.append(bound_value)
             line = self.ax.axvline(event.xdata, color='#eca829', linestyle='--')  # Plot bound line for Voigt
             self.bound_lines.append(line)  # Store the line object
             print(f"Voigt bound set at x = {event.xdata}")
-            plt.draw()  # Update plot with the new bound line
+            # Record action for setting a Voigt bound
+            if len(self.bounds) == 1:
+                self.record_action('set_voigt_bound_1', f'Set Voigt lower bound at λ={bound_value:.2f} Å')
+            elif len(self.bounds) == 2:
+                self.record_action('set_voigt_bound_2', f'Set Voigt upper bound at λ={bound_value:.2f} Å')
+            self.fig.canvas.draw_idle()  # Update plot with the new bound line
 
             # If two bounds are selected, implement Voigt fitting
             if len(self.bounds) == 2:
@@ -3844,10 +4617,12 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 # Subtract existing continuum if found, otherwise fit directly to data
                 if existing_continuum is not None:
                     continuum_subtracted_y = comp_y - existing_continuum
+                    continuum_for_plot = existing_continuum
                     print("Using existing continuum for Voigt fit.")
                 else:
                     # No continuum defined - fit directly to data
                     continuum_subtracted_y = comp_y
+                    continuum_for_plot = np.zeros_like(comp_y)
                     print("No existing continuum found; fitting Voigt directly to data.")
 
                 left_bound, right_bound = sorted(self.bounds)
@@ -3875,11 +4650,11 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 for line in self.bound_lines:
                     line.remove()
                 self.bound_lines.clear()
+                self.bounds = []
+                self.ax.figure.canvas.draw_idle()  # Redraw to show bound lines removed
                 # Visualize the fit
-                # Check for existing continuum
-                existing_continuum, _, _ = self.get_existing_continuum(left_bound, right_bound)
-                x_fit = np.linspace(left_bound, right_bound, len(existing_continuum))
-                y_fit = result.eval(x=x_fit) + existing_continuum
+                x_fit = np.linspace(left_bound, right_bound, len(continuum_for_plot))
+                y_fit = result.eval(x=x_fit) + continuum_for_plot
                 residuals = comp_y - y_fit
                 # Calculate chi2 with optional errors
                 if comp_err is not None:
@@ -3887,14 +4662,14 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 else:
                     chi2 = np.sum(residuals ** 2) # Chi2 without errors
                 chi2_nu = chi2 / (len(x_fit) - len(result.params)) # Calculate chi2 d.o.f.
-                interpolator = interp1d(x_fit, y_fit, kind='cubic')
+                interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
                 x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                 y_plt = interpolator(x_plt)
                 fit_line, = self.ax.plot(x_plt, y_plt, color='#eca829', linestyle='--')
                 # TEMP - below I present one exploratory method for calculating column densities and other absorption line diagnostics 
                 line_wavelength = 2795 # AA
                 f = 0.5
-                N = self.column_density(existing_continuum, comp_y, f, line_wavelength, comp_x)
+                N = self.column_density(continuum_for_plot, comp_y, f, line_wavelength, comp_x)
                 # Store the fit results
                 fit_results = {
                     'fit_id': self.fit_id,
@@ -3929,6 +4704,10 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 position_str = f"λ: {fit_results.get('center', fit_results.get('mean', 0)):.2f} Å"
                 self.register_item('voigt', f'Voigt', fit_dict=fit_results, line_obj=fit_results.get('line'),
                                  position=position_str, color='orange')
+                
+                # Record action for undo/redo
+                self.record_action('fit_voigt', f'Fit Voigt at λ={fit_results.get("center", fit_results.get("mean", 0)):.2f} Å')
+                
                 print(f"  Fit ID: {self.fit_id}")
                 print(f"  Component ID: {self.component_id}")
                 print(f"  Velocity mode: {self.is_velocity_mode}")
@@ -3946,8 +4725,10 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 print(f"  Line Object: {fit_line}\n")
                 self.fit_id += 1
                 self.component_id += 1
-                self.ax.legend()
-                plt.draw()  # Update the plot with the fitted Voigt profile
+                self.ax.legend(loc='upper right')
+                # Force immediate redraw of the canvas
+                self.ax.figure.canvas.draw()
+                QtWidgets.QApplication.processEvents()  # Process Qt events to ensure redraw
 
                 # Clear bounds for the next fitting operation
                 self.bounds.clear()
@@ -3971,7 +4752,13 @@ class SpectrumPlotter(QtWidgets.QWidget):
             self.component_id = 0
 
         if event.key == ' ' and self.multi_voigt_mode:  # Set bounds with space for Voigt fit
-            self.bounds.append(event.xdata)
+            # If in velocity mode, convert velocity back to wavelength for processing
+            bound_value = event.xdata
+            if self.is_velocity_mode and self.rest_wavelength is not None:
+                # Convert velocity back to wavelength
+                bound_value = self.vel_to_wav(event.xdata, self.rest_wavelength, z=self.redshift)
+            
+            self.bounds.append(bound_value)
             line = self.ax.axvline(event.xdata, color='#eca829', linestyle='--')  # Plot bound line for Voigt
             self.bound_lines.append(line)  # Store the line object
             print(f"Voigt bound set at x = {event.xdata}")
@@ -4100,7 +4887,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 # Generate data for plotting
                 x_fit = np.linspace(left_bound, right_bound, len(existing_continuum))
                 y_fit = self.voigt(x_fit, amp, center, sigma, gamma) + existing_continuum
-                interpolator = interp1d(x_fit, y_fit, kind='cubic')
+                interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
                 # Higher resolution for smooth plotting
                 x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                 y_plt = interpolator(x_plt)
@@ -4183,7 +4970,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
             for line in self.bound_lines:
                 line.remove()
             self.bound_lines.clear()
-            self.ax.legend()
+            self.ax.legend(loc='upper right')
             plt.draw()  # Update the plot with the fitted profiles
 
             # Clear multi-Voigt mode settings
@@ -4210,7 +4997,13 @@ class SpectrumPlotter(QtWidgets.QWidget):
 
         if event.key == ' ' and self.multi_gaussian_mode:  # Set bounds with space for Gaussian fit
             print("self.bounds:", self.bounds)
-            self.bounds.append(event.xdata)
+            # If in velocity mode, convert velocity back to wavelength for processing
+            bound_value = event.xdata
+            if self.is_velocity_mode and self.rest_wavelength is not None:
+                # Convert velocity back to wavelength
+                bound_value = self.vel_to_wav(event.xdata, self.rest_wavelength, z=self.redshift)
+            
+            self.bounds.append(bound_value)
             print("self.bounds:", self.bounds)
             line = self.ax.axvline(event.xdata, color='red', linestyle='--')  # Plot bound line for Gaussian
             self.bound_lines.append(line)  # Store the line object
@@ -4330,7 +5123,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 # Generate data for plotting
                 x_fit = np.linspace(left_bound, right_bound, len(existing_continuum))
                 y_fit = self.gaussian(x_fit, amp, mean, stddev) + existing_continuum
-                interpolator = interp1d(x_fit, y_fit, kind='cubic')
+                interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
                 # Higher resolution for smooth plotting
                 x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                 y_plt = interpolator(x_plt)
@@ -4406,7 +5199,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
             for line in self.bound_lines:
                 line.remove()
             self.bound_lines.clear()
-            self.ax.legend()
+            self.ax.legend(loc='upper right')
             plt.draw()  # Update the plot with the fitted profiles
 
             # Clear multi-Voigt mode settings
@@ -4714,10 +5507,17 @@ class SpectrumPlotter(QtWidgets.QWidget):
             for fit in self.gaussian_fits:
                 left_bound, right_bound = fit['bounds']
                 if left_bound <= x_pos <= right_bound:
-                    fit['line'].remove()
+                    try:
+                        fit['line'].remove()
+                    except (ValueError, AttributeError):
+                        # Line may have already been removed or is invalid
+                        pass
                     # Remove the fill area if it exists
                     if self.ew_fill:
-                        self.ew_fill.remove()
+                        try:
+                            self.ew_fill.remove()
+                        except (ValueError, AttributeError):
+                            pass
                         self.ew_fill = None  # Reset the fill reference
                     # Find and unregister the item from Item Tracker
                     for item_id, item_info in list(self.item_id_map.items()):
@@ -4726,7 +5526,11 @@ class SpectrumPlotter(QtWidgets.QWidget):
                             break
                     self.gaussian_fits.remove(fit)
                     print(f"Removed Gaussian fit within bounds ({left_bound}, {right_bound})")
-                    plt.draw()
+                    self.fig.canvas.draw_idle()
+                    
+                    # Record action for undo/redo
+                    self.record_action('delete_gaussian', f'Remove Gaussian fit')
+                    
                     # Update residual display if shown
                     if self.is_residual_shown:
                         self.calculate_and_plot_residuals()
@@ -4734,10 +5538,17 @@ class SpectrumPlotter(QtWidgets.QWidget):
             for fit in self.voigt_fits:
                 left_bound, right_bound = fit['bounds']
                 if left_bound <= x_pos <= right_bound:
-                    fit['line'].remove()
+                    try:
+                        fit['line'].remove()
+                    except (ValueError, AttributeError):
+                        # Line may have already been removed or is invalid
+                        pass
                     # Remove the fill area if it exists
                     if self.ew_fill:
-                        self.ew_fill.remove()
+                        try:
+                            self.ew_fill.remove()
+                        except (ValueError, AttributeError):
+                            pass
                         self.ew_fill = None  # Reset the fill reference
                     # Find and unregister the item from Item Tracker
                     for item_id, item_info in list(self.item_id_map.items()):
@@ -4746,7 +5557,11 @@ class SpectrumPlotter(QtWidgets.QWidget):
                             break
                     self.voigt_fits.remove(fit)
                     print(f"Removed Voigt fit within bounds ({left_bound}, {right_bound})")
-                    plt.draw()
+                    self.fig.canvas.draw_idle()
+                    
+                    # Record action for undo/redo
+                    self.record_action('delete_voigt', f'Remove Voigt fit')
+                    
                     # Update residual display if shown
                     if self.is_residual_shown:
                         self.calculate_and_plot_residuals()
@@ -4807,10 +5622,10 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 
                 # Revert labels and limits to wavelength mode
                 if self.is_residual_shown:
-                    self.residual_ax.set_xlabel("Wavelength (Å)")
+                    self.residual_ax.set_xlabel(self._get_wavelength_unit_label())
                     self.update_residual_ticks()
                 else:
-                    self.ax.set_xlabel("Wavelength (Å)")
+                    self.ax.set_xlabel(self._get_wavelength_unit_label())
                     
                 # Update ticks and plot
                 self.update_ticks(self.ax)
@@ -4849,47 +5664,40 @@ class SpectrumPlotter(QtWidgets.QWidget):
                     print(f"Bayes fit bounds set: {self.bayes_bounds}")
                     self.prompt_bayes_fit()
 
-        # Save Gaussian fits
-        elif event.key == 'a':
-            if self.gaussian_fits:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"gaussian_fits_{timestamp}.csv"
-                df = pd.DataFrame(self.gaussian_fits)  # Directly convert list of dictionaries to a DataFrame
-                df.drop(columns=['line'], inplace=True, errors='ignore')  # Exclude non-serializable 'line' field
-                df.to_csv(filename, index=False)
-                print(f"Saved Gaussian fits to {filename}")
-            else:
-                print("No Gaussian fits to save.")
-
-        # Save Voigt fits
-        elif event.key == 'A':
-            if self.voigt_fits:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"voigt_fits_{timestamp}.csv"
-                df = pd.DataFrame(self.voigt_fits)
-                df.drop(columns=['line'], inplace=True, errors='ignore')  # Exclude 'line'
-                df.to_csv(filename, index=False)
-                print(f"Saved Voigt fits to {filename}")
-            else:
-                print("No Voigt fits to save.")
-
-        # Save Continuum fits or Listfit polynomials
+        # Save all fits (Gaussian, Voigt, Continuum, and Listfit)
         elif event.key == 'S':
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             saved_something = False
             
-            # Save Continuum fits (if in continuum mode)
+            # Save Gaussian fits
+            if self.gaussian_fits:
+                filename = f"gaussian_fits_{timestamp}.csv"
+                df = pd.DataFrame(self.gaussian_fits)
+                df.drop(columns=['line'], inplace=True, errors='ignore')
+                df.to_csv(filename, index=False)
+                print(f"Saved Gaussian fits to {filename}")
+                saved_something = True
+            
+            # Save Voigt fits
+            if self.voigt_fits:
+                filename = f"voigt_fits_{timestamp}.csv"
+                df = pd.DataFrame(self.voigt_fits)
+                df.drop(columns=['line'], inplace=True, errors='ignore')
+                df.to_csv(filename, index=False)
+                print(f"Saved Voigt fits to {filename}")
+                saved_something = True
+            
+            # Save Continuum fits
             if self.continuum_fits:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 filename = f"continuum_fits_{timestamp}.csv"
                 df = pd.DataFrame(self.continuum_fits)
-                df.drop(columns=['line', 'patches'], inplace=True, errors='ignore')  # Exclude non-serializable fields
+                df.drop(columns=['line', 'patches'], inplace=True, errors='ignore')
                 df.to_csv(filename, index=False)
                 print(f"Saved Continuum fits to {filename}")
                 saved_something = True
             
-            # Save Listfit polynomial coefficients (if there are listfit fits)
+            # Save Listfit polynomial coefficients
             if self.listfit_fits:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 listfit_polys = []
                 for listfit in self.listfit_fits:
                     bounds = listfit.get('bounds')
@@ -4922,7 +5730,9 @@ class SpectrumPlotter(QtWidgets.QWidget):
                     saved_something = True
             
             if not saved_something:
-                print("No Continuum fits or Listfit polynomials to save.")
+                print("No fits to save. Fit some profiles first (Gaussian, Voigt, Continuum, or Listfit).")
+
+        # Keys 'a' and 'A' are now available for future use
 
         elif event.key == 'K':
             file_path, _ = QFileDialog.getOpenFileName(
@@ -4982,7 +5792,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
                         y_plot = self.voigt(x_plot, fit['amp'], fit['center'], fit['sigma'], fit['gamma']) + existing_continuum
                         fit['line'], = self.ax.plot(x_plot, y_plot, color="orange", linestyle='--')
 
-                self.ax.legend()
+                self.ax.legend(loc='upper right')
                 print(f"Successfully loaded {fit_type.capitalize()} fits from {file_path}.")
 
             except Exception as e:
@@ -5029,8 +5839,33 @@ class SpectrumPlotter(QtWidgets.QWidget):
             for marker in self.markers:
                 left_bound, right_bound = getattr(marker, 'bounds')
                 if left_bound <= x_pos <= right_bound:
+                    line_id = getattr(marker, 'line_id', 'Unknown')
+                    
+                    # Remove the marker
                     marker.remove()
                     self.markers.remove(marker)
+                    
+                    # Remove associated label(s)
+                    labels_to_remove = []
+                    for label in self.labels:
+                        if getattr(label, 'marker', None) is marker:
+                            label.remove()
+                            labels_to_remove.append(label)
+                    
+                    for label in labels_to_remove:
+                        self.labels.remove(label)
+                    
+                    # Remove from item tracker
+                    marker_id = f"marker_{self.markers.index(marker) if marker in self.markers else 'removed'}_{line_id}"
+                    # Find and remove from tracker by searching for marker with this line_id
+                    for item_id, item_info in list(self.item_tracker.items.items()):
+                        if item_info.get('type') == 'marker' and line_id in item_info.get('name', ''):
+                            self.item_tracker.remove_item(item_id)
+                            break
+                    
+                    # Record action
+                    self.record_action('remove_marker', f'Remove Marker: {line_id}')
+                    
                     print(f"Removed marker within bounds ({left_bound}, {right_bound})")
                     plt.draw()
                     break
@@ -5039,7 +5874,27 @@ class SpectrumPlotter(QtWidgets.QWidget):
         """Display the listfit component selection window"""
         self.listfit_window = ListfitWindow(self.listfit_bounds)
         self.listfit_window.fit_requested.connect(self.perform_listfit)
+        self.listfit_window.bounds_cleared.connect(self.clear_listfit_bounds)
+        self.listfit_window.components_changed.connect(self._on_listfit_components_changed)
         self.listfit_window.show()
+    
+    def clear_listfit_bounds(self):
+        """Clear listfit bounds and remove bound lines from plot"""
+        for line in self.listfit_bound_lines:
+            try:
+                line.remove()
+            except (ValueError, NotImplementedError):
+                pass
+        self.listfit_bound_lines.clear()
+        self.listfit_bounds = []
+        self.listfit_mode = False
+        plt.draw()
+    
+    def _on_listfit_components_changed(self, components):
+        """Handle listfit components being added/removed - update plot immediately"""
+        self.listfit_components = components
+        self.update_plot()
+
 
     def perform_listfit(self, components):
         """Perform multi-component fitting"""
@@ -5059,18 +5914,60 @@ class SpectrumPlotter(QtWidgets.QWidget):
             print("Error: No data within bounds")
             return
         
+        # Extract data masks to exclude pixels from fit
+        data_masks = [comp for comp in components if comp['type'] == 'data_mask']
+        
+        # Apply data masks - exclude pixels in masked regions from fit
+        fit_mask = np.ones(len(x_fit), dtype=bool)
+        for data_mask in data_masks:
+            min_lambda = data_mask.get('min_lambda')
+            max_lambda = data_mask.get('max_lambda')
+            if min_lambda is not None and max_lambda is not None:
+                # Exclude pixels within this mask region
+                fit_mask &= ~((x_fit >= min_lambda) & (x_fit <= max_lambda))
+        
+        # Apply mask to data
+        x_fit_masked = x_fit[fit_mask]
+        y_fit_masked = y_fit[fit_mask]
+        err_fit_masked = err_fit[fit_mask] if err_fit is not None else None
+        
+        if len(x_fit_masked) == 0:
+            print("Error: All data excluded by data masks")
+            return
+        
         # Build the composite model
-        composite_model = self.build_composite_model(components, x_fit, y_fit, err_fit)
+        composite_model = self.build_composite_model(components, x_fit_masked, y_fit_masked, err_fit_masked)
         
         if composite_model is None:
             print("Error: Could not build composite model")
             return
         
         # Perform the fit with optional weights
-        if err_fit is not None:
-            result = composite_model.fit(y_fit, x=x_fit, weights=1.0/err_fit)
-        else:
-            result = composite_model.fit(y_fit, x=x_fit)
+        try:
+            if err_fit_masked is not None:
+                result = composite_model.fit(y_fit_masked, x=x_fit_masked, weights=1.0/err_fit_masked)
+            else:
+                result = composite_model.fit(y_fit_masked, x=x_fit_masked)
+        except RecursionError as e:
+            error_msg = (
+                "Fit failed due to circular or conflicting constraints!\n\n"
+                "This usually happens when:\n"
+                "  • Parameters have conflicting bounds (e.g., min > max)\n"
+                "  • Constraints form circular dependencies\n"
+                "  • Fixed values conflict with bounds or other constraints\n\n"
+                "Please check your constraint settings:\n"
+                "  1. Verify min < max for all bounds\n"
+                "  2. Check for circular parameter linking\n"
+                "  3. Ensure fixed values don't conflict with bounds"
+            )
+            print(f"Error: {error_msg}")
+            QtWidgets.QMessageBox.critical(self, "Fit Failed - Invalid Constraints", error_msg)
+            return
+        except Exception as e:
+            error_msg = f"Fit failed with error: {str(e)}\n\nPlease check your constraints and try again."
+            print(f"Error: {error_msg}")
+            QtWidgets.QMessageBox.critical(self, "Fit Failed", error_msg)
+            return
         
         # Check if fit succeeded OR if it converged but just failed on error estimation
         fit_converged = result.success or (result.nfree > 0 and result.ndata > result.nfree)
@@ -5090,11 +5987,8 @@ class SpectrumPlotter(QtWidgets.QWidget):
         # Check fit quality and warn if poor
         self._check_listfit_quality(result, y_fit)
         
-        # Filter out mask features before plotting (they're not actual components to plot)
-        components_to_plot = [comp for comp in components if comp['type'] != 'mask_feature']
-        
-        # Plot the components
-        self.plot_listfit_components(result, components_to_plot, x_fit, y_fit, err_fit, left_bound, right_bound)
+        # Plot the components (pass all components so masks can be visualized)
+        self.plot_listfit_components(result, components, x_fit, y_fit, err_fit, left_bound, right_bound)
         
         # Update residual display if shown
         if self.is_residual_shown:
@@ -5110,6 +6004,9 @@ class SpectrumPlotter(QtWidgets.QWidget):
             'err_data': err_fit
         })
         
+        # Record action for undo/redo
+        self.record_action('perform_listfit', f'Perform Listfit ({len(self.listfit_fits)} total fits)')
+        
         # Clear listfit mode
         self.listfit_mode = False
         for line in self.listfit_bound_lines:
@@ -5117,7 +6014,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
         self.listfit_bound_lines.clear()
         self.listfit_bounds = []
         
-        plt.draw()
+        self.fig.canvas.draw_idle()  # Redraw to show listfit results
 
     def build_composite_model(self, components, x_fit, y_fit, err_fit):
         """Build a composite lmfit Model from component list with improved initial guesses"""
@@ -5131,8 +6028,9 @@ class SpectrumPlotter(QtWidgets.QWidget):
         # Create continuum mask for polynomial fitting (avoid line profiles)
         continuum_mask = self._identify_continuum_regions(x_fit, y_fit)
         
-        # Extract mask features (wavelength ranges to exclude from polynomial guess)
-        mask_features = [comp for comp in components if comp['type'] == 'mask_feature']
+        # Extract polynomial guess masks and data masks
+        polynomial_guess_masks = [comp for comp in components if comp['type'] == 'polynomial_guess_mask']
+        data_masks = [comp for comp in components if comp['type'] == 'data_mask']
         
         # Find all peaks upfront for multi-component Gaussian/Voigt fitting
         peaks, properties = find_peaks(np.abs(y_fit), height=np.std(y_fit) * 0.3)
@@ -5146,8 +6044,8 @@ class SpectrumPlotter(QtWidgets.QWidget):
         peak_index_for_component = 0  # Track which peak to use next
         
         for comp in components:
-            # Skip mask features - they're not fitted, only used for polynomial guess
-            if comp['type'] == 'mask_feature':
+            # Skip mask features - they're not fitted, only used for polynomial guess or data exclusion
+            if comp['type'] in ['polynomial_guess_mask', 'data_mask']:
                 continue
             
             if comp['type'] == 'gaussian':
@@ -5166,6 +6064,10 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 gauss_model.set_param_hint(f'{prefix}amp', value=amp_guess)
                 gauss_model.set_param_hint(f'{prefix}mean', value=center_guess)
                 gauss_model.set_param_hint(f'{prefix}stddev', value=sigma_guess, min=1e-6)
+                
+                # Apply constraints if present
+                if 'constraints' in comp:
+                    self._apply_gaussian_constraints(gauss_model, prefix, comp['constraints'])
                 
                 if model is None:
                     model = gauss_model
@@ -5193,6 +6095,10 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 voigt_model.set_param_hint(f'{prefix}sigma', value=sigma_guess, min=1e-6)
                 voigt_model.set_param_hint(f'{prefix}gamma', value=gamma_guess, min=1e-6)
                 
+                # Apply constraints if present
+                if 'constraints' in comp:
+                    self._apply_voigt_constraints(voigt_model, prefix, comp['constraints'])
+                
                 if model is None:
                     model = voigt_model
                 else:
@@ -5207,7 +6113,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 
                 # Use median-filtered data to estimate polynomial (featureless continuum)
                 # Pass mask features to exclude their regions from polynomial guess
-                poly_coeffs = self._estimate_polynomial_coefficients(x_fit, y_fit, order, continuum_mask, mask_features)
+                poly_coeffs = self._estimate_polynomial_coefficients(x_fit, y_fit, order, continuum_mask, polynomial_guess_masks)
                 
                 for i in range(order + 1):
                     param_name = f'{prefix}c{i}'
@@ -5221,7 +6127,7 @@ class SpectrumPlotter(QtWidgets.QWidget):
         
         return model
 
-    def _estimate_polynomial_coefficients(self, x_fit, y_fit, order, continuum_mask, mask_features=None):
+    def _estimate_polynomial_coefficients(self, x_fit, y_fit, order, continuum_mask, polynomial_guess_masks=None):
         """Estimate polynomial coefficients using robust iterative sigma-clipping on median-filtered data
         
         Args:
@@ -5229,14 +6135,14 @@ class SpectrumPlotter(QtWidgets.QWidget):
             y_fit: y data
             order: polynomial order
             continuum_mask: boolean mask of continuum regions
-            mask_features: list of {'min_lambda': x1, 'max_lambda': x2} to exclude from guess
+            polynomial_guess_masks: list of {'min_lambda': x1, 'max_lambda': x2} to exclude from guess
         """
         from scipy.ndimage import median_filter
         
         # Create mask for user-specified wavelength ranges to exclude
         exclude_mask = np.zeros(len(x_fit), dtype=bool)
-        if mask_features:
-            for mask_feat in mask_features:
+        if polynomial_guess_masks:
+            for mask_feat in polynomial_guess_masks:
                 min_lambda = mask_feat.get('min_lambda')
                 max_lambda = mask_feat.get('max_lambda')
                 if min_lambda is not None and max_lambda is not None:
@@ -5395,13 +6301,143 @@ class SpectrumPlotter(QtWidgets.QWidget):
         # Print warnings
         if warnings:
             print("\n" + "="*70)
-            print("⚠️  FIT QUALITY WARNINGS - CONSIDER RE-FITTING ⚠️")
+            print("WARNING: FIT QUALITY WARNINGS - CONSIDER RE-FITTING")
             print("="*70)
             for warning in warnings:
                 print(f"  • {warning}")
             print("="*70)
             print("Tip: Try adjusting initial parameter guesses or component configuration.")
             print("="*70 + "\n")
+    
+    def _apply_gaussian_constraints(self, model, prefix, constraints):
+        """Apply constraints to a Gaussian model"""
+        if not constraints:
+            return
+        
+        # Amplitude bounds or fixed value
+        if constraints.get('amplitude_fixed'):
+            fixed_val = constraints.get('amplitude_fixed_value')
+            if fixed_val:
+                model.set_param_hint(f'{prefix}amp', value=float(fixed_val), vary=False)
+            else:
+                model.set_param_hint(f'{prefix}amp', vary=False)
+        else:
+            amp_min, amp_max = constraints.get('amplitude_bounds', ('', ''))
+            if amp_min:
+                model.set_param_hint(f'{prefix}amp', min=float(amp_min))
+            if amp_max:
+                model.set_param_hint(f'{prefix}amp', max=float(amp_max))
+        
+        # Mean bounds or fixed value
+        if constraints.get('mean_fixed'):
+            fixed_val = constraints.get('mean_fixed_value')
+            if fixed_val:
+                model.set_param_hint(f'{prefix}mean', value=float(fixed_val), vary=False)
+            else:
+                model.set_param_hint(f'{prefix}mean', vary=False)
+        else:
+            mean_min, mean_max = constraints.get('mean_bounds', ('', ''))
+            if mean_min:
+                model.set_param_hint(f'{prefix}mean', min=float(mean_min))
+            if mean_max:
+                model.set_param_hint(f'{prefix}mean', max=float(mean_max))
+        
+        # Sigma bounds or fixed value
+        if constraints.get('sigma_fixed'):
+            fixed_val = constraints.get('sigma_fixed_value')
+            if fixed_val:
+                model.set_param_hint(f'{prefix}stddev', value=float(fixed_val), vary=False)
+            else:
+                model.set_param_hint(f'{prefix}stddev', vary=False)
+        else:
+            sigma_min, sigma_max = constraints.get('sigma_bounds', ('', ''))
+            if sigma_min:
+                model.set_param_hint(f'{prefix}stddev', min=float(sigma_min))
+            if sigma_max:
+                model.set_param_hint(f'{prefix}stddev', max=float(sigma_max))
+        
+        # Apply linked constraints (multiple parameter linking)
+        linked_constraints = constraints.get('linked_constraints', [])
+        for linked in linked_constraints:
+            parameter = linked.get('parameter', 'mean')
+            expression = linked.get('expression', '')
+            if expression:
+                # Map parameter name to parameter key
+                param_map = {'mean': 'mean', 'stddev': 'stddev', 'amp': 'amp', 'sigma': 'sigma'}
+                param_key = param_map.get(parameter, parameter)
+                model.set_param_hint(f'{prefix}{param_key}', expr=expression)
+    
+    def _apply_voigt_constraints(self, model, prefix, constraints):
+        """Apply constraints to a Voigt model"""
+        if not constraints:
+            return
+        
+        # Amplitude bounds or fixed value
+        if constraints.get('amplitude_fixed'):
+            fixed_val = constraints.get('amplitude_fixed_value')
+            if fixed_val:
+                model.set_param_hint(f'{prefix}amp', value=float(fixed_val), vary=False)
+            else:
+                model.set_param_hint(f'{prefix}amp', vary=False)
+        else:
+            amp_min, amp_max = constraints.get('amplitude_bounds', ('', ''))
+            if amp_min:
+                model.set_param_hint(f'{prefix}amp', min=float(amp_min))
+            if amp_max:
+                model.set_param_hint(f'{prefix}amp', max=float(amp_max))
+        
+        # Center bounds or fixed value
+        if constraints.get('center_fixed'):
+            fixed_val = constraints.get('center_fixed_value')
+            if fixed_val:
+                model.set_param_hint(f'{prefix}center', value=float(fixed_val), vary=False)
+            else:
+                model.set_param_hint(f'{prefix}center', vary=False)
+        else:
+            center_min, center_max = constraints.get('center_bounds', ('', ''))
+            if center_min:
+                model.set_param_hint(f'{prefix}center', min=float(center_min))
+            if center_max:
+                model.set_param_hint(f'{prefix}center', max=float(center_max))
+        
+        # Sigma bounds or fixed value
+        if constraints.get('sigma_fixed'):
+            fixed_val = constraints.get('sigma_fixed_value')
+            if fixed_val:
+                model.set_param_hint(f'{prefix}sigma', value=float(fixed_val), vary=False)
+            else:
+                model.set_param_hint(f'{prefix}sigma', vary=False)
+        else:
+            sigma_min, sigma_max = constraints.get('sigma_bounds', ('', ''))
+            if sigma_min:
+                model.set_param_hint(f'{prefix}sigma', min=float(sigma_min))
+            if sigma_max:
+                model.set_param_hint(f'{prefix}sigma', max=float(sigma_max))
+        
+        # Gamma bounds or fixed value
+        if constraints.get('gamma_fixed'):
+            fixed_val = constraints.get('gamma_fixed_value')
+            if fixed_val:
+                model.set_param_hint(f'{prefix}gamma', value=float(fixed_val), vary=False)
+            else:
+                model.set_param_hint(f'{prefix}gamma', vary=False)
+        else:
+            gamma_min, gamma_max = constraints.get('gamma_bounds', ('', ''))
+            if gamma_min:
+                model.set_param_hint(f'{prefix}gamma', min=float(gamma_min))
+            if gamma_max:
+                model.set_param_hint(f'{prefix}gamma', max=float(gamma_max))
+        
+        # Apply linked constraints (multiple parameter linking)
+        linked_constraints = constraints.get('linked_constraints', [])
+        for linked in linked_constraints:
+            parameter = linked.get('parameter', 'center')
+            expression = linked.get('expression', '')
+            if expression:
+                # Map parameter name to parameter key
+                param_map = {'center': 'center', 'sigma': 'sigma', 'amp': 'amp', 'gamma': 'gamma'}
+                param_key = param_map.get(parameter, parameter)
+                model.set_param_hint(f'{prefix}{param_key}', expr=expression)
 
     def _identify_continuum_regions(self, x_fit, y_fit):
         """Identify regions likely to be continuum (not dominated by line profiles)"""
@@ -5494,6 +6530,34 @@ class SpectrumPlotter(QtWidgets.QWidget):
         # Color mapping for components
         colors = {'gaussian': 'red', 'voigt': 'orange', 'polynomial': 'magenta'}
         
+        # Plot mask regions as gray fill patches
+        data_masks = [comp for comp in components if comp['type'] == 'data_mask']
+        polynomial_guess_masks = [comp for comp in components if comp['type'] == 'polynomial_guess_mask']
+        
+        mask_count = 0
+        for mask in data_masks:
+            min_lambda = mask.get('min_lambda')
+            max_lambda = mask.get('max_lambda')
+            if min_lambda is not None and max_lambda is not None:
+                patch = self.ax.axvspan(min_lambda, max_lambda, alpha=0.2, color='gray', zorder=1)
+                # Register with ItemTracker
+                position_str = f"λ: {min_lambda:.2f}-{max_lambda:.2f} Å"
+                self.register_item('data_mask', f'Data Mask {mask_count+1} ({min_lambda:.2f}-{max_lambda:.2f} Å)', 
+                                 patch_obj=patch, position=position_str, color='gray')
+                mask_count += 1
+        
+        poly_mask_count = 0
+        for mask in polynomial_guess_masks:
+            min_lambda = mask.get('min_lambda')
+            max_lambda = mask.get('max_lambda')
+            if min_lambda is not None and max_lambda is not None:
+                patch = self.ax.axvspan(min_lambda, max_lambda, alpha=0.1, color='lightgray', zorder=0.5, linestyle='--', edgecolor='gray', linewidth=1)
+                # Register with ItemTracker
+                position_str = f"λ: {min_lambda:.2f}-{max_lambda:.2f} Å"
+                self.register_item('polynomial_guess_mask', f'Poly Guess Mask {poly_mask_count+1} ({min_lambda:.2f}-{max_lambda:.2f} Å)', 
+                                 patch_obj=patch, position=position_str, color='lightgray')
+                poly_mask_count += 1
+        
         # Plot individual components
         gauss_count = 0
         voigt_count = 0
@@ -5501,6 +6565,11 @@ class SpectrumPlotter(QtWidgets.QWidget):
         
         for comp in components:
             comp_type = comp['type']
+            
+            # Skip mask types - they're already plotted above
+            if comp_type in ['polynomial_guess_mask', 'data_mask']:
+                continue
+            
             color = colors[comp_type]
             params = result.params
             
@@ -5593,22 +6662,31 @@ class SpectrumPlotter(QtWidgets.QWidget):
                 poly_coeffs = poly_coeffs[::-1]
                 y_component = np.polyval(poly_coeffs, x_smooth)
                 line, = self.ax.plot(x_smooth, y_component, color=color, linestyle='--', linewidth=2)
-                # Register with ItemTracker
+                # Register with ItemTracker - store metadata for deletion handling
                 position_str = f"λ: {left_bound:.2f}-{right_bound:.2f} Å"
-                item_id = self.register_item('polynomial', f'Polynomial (order={order})', line_obj=line,
+                poly_fit_dict = {
+                    'listfit_bounds': (left_bound, right_bound),
+                    'poly_index': poly_count,
+                    'order': order
+                }
+                item_id = self.register_item('polynomial', f'Polynomial (order={order})', fit_dict=poly_fit_dict, line_obj=line,
                                            position=position_str, color=color)
                 poly_count += 1
         
-        # Plot total fit on the fine grid
-        y_total_smooth = result.eval(params=result.params, x=x_smooth)
-        total_line, = self.ax.plot(x_smooth, y_total_smooth, color='darkblue', linestyle='-', linewidth=1.5, label='Total Fit', zorder=10)
+        # Plot the total fit result (for visualization only, NOT included in draw_total_line to avoid double-counting)
+        y_total_fit = result.eval(x=x_smooth)
+        line, = self.ax.plot(x_smooth, y_total_fit, label='Total Listfit', color='#003d7a', linestyle='-', linewidth=2)
         
-        # Register total fit with ItemTracker
+        # Register Total Listfit with ItemTracker
         position_str = f"λ: {left_bound:.2f}-{right_bound:.2f} Å"
-        self.register_item('listfit_total', 'Listfit Total', line_obj=total_line, 
-                          position=position_str, color='darkblue')
+        total_fit_dict = {
+            'listfit_bounds': (left_bound, right_bound),
+            'is_total_fit': True
+        }
+        self.register_item('listfit_total', f'Total Listfit', fit_dict=total_fit_dict, line_obj=line,
+                          position=position_str, color='#003d7a')
         
-        self.ax.legend()
+        self.ax.legend(loc='upper right')
 
 
 

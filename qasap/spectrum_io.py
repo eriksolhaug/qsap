@@ -315,24 +315,29 @@ class SpectrumIO:
         if wav is None or flux is None:
             raise ValueError("ASCII reader requires at least wave & flux columns.")
         
-        # Apply wavelength unit conversion
-        if wave_unit != 1.0:
-            wav = wav * wave_unit
+        # Determine wavelength unit string (do NOT convert values, keep in original units)
+        if isinstance(wave_unit, str):
+            wave_unit_lower = wave_unit.lower()
+            if wave_unit_lower == "nanometer":
+                wave_unit_str = "nm"
+            elif wave_unit_lower == "micron":
+                wave_unit_str = "µm"
+            else:  # "angstrom" or default
+                wave_unit_str = "Å"
+        else:
+            # Legacy numeric format - assume Angstroms if 1.0
+            wave_unit_str = "Å"
         
-        # Legacy unit string conversion (backward compatibility)
+        # Legacy unit string conversion (backward compatibility) - still don't convert values
         if units:
             u = str(units).lower()
             if u in ("nm", "nanometer", "nanometers"):
-                wav = wav * 10.0  # nm -> Å
+                wave_unit_str = "nm"
             elif u in ("um", "micron", "microns", "µm", "μm"):
-                wav = wav * 1e4  # µm -> Å
+                wave_unit_str = "µm"
         
         if err is not None:
             err = np.asarray(err)
-        # else: err stays None - no automatic error creation
-        
-        wave_unit_str = {"a": "Å", "angstrom": "Å", "nm": "nm", "um": "µm", "μm": "µm"}.get(
-            (str(units).lower() if units else "a"), "Å")
         
         meta = {
             "source": "ascii",
