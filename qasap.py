@@ -26,14 +26,13 @@ def main():
     """Main entry point for QASAP"""
     
     parser = argparse.ArgumentParser(
-        description='QASAP v0.8 - Spectrum Analysis Package',
+        description='QASAP v0.11 - Spectrum Analysis Package',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python qasap.py spectrum.fits                    # Auto-detect format
   python qasap.py spectrum.fits --detect          # Show detected formats
   python qasap.py spectrum.fits --fmt fits:image1d # Force format
-  python qasap.py 2d_alfosc.fits --alfosc --bin 10 --output 1d.fits
   python qasap.py spectrum.fits --lsf 15.5        # Apply LSF (15.5 km/s)
         """
     )
@@ -120,6 +119,14 @@ Examples:
             
             # Load the spectrum with selected format
             wav, spec, err, meta = SpectrumIO.read_spectrum(args.fits_file, fmt=fmt, options=options)
+            
+            # Apply scaling factor if provided
+            if "scaling_factor" in options:
+                scaling_factor = options["scaling_factor"]
+                if scaling_factor != 1.0:
+                    spec = spec * scaling_factor
+                    if err is not None:
+                        err = err * abs(scaling_factor)
             
             print(f"Loaded {len(wav)} wavelength points")
             print(f"Wavelength: {wav[0]:.2f} - {wav[-1]:.2f} Å")

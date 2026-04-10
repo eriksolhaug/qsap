@@ -161,6 +161,31 @@ class FormatPickerDialog(QtWidgets.QDialog):
         # NOW connect the signal AFTER frame is created
         self.format_list.itemSelectionChanged.connect(self._on_format_selected)
         
+        # Scaling Factor Group
+        scaling_group = QtWidgets.QGroupBox("Preprocessing (optional)")
+        scaling_layout = QtWidgets.QGridLayout()
+        
+        scaling_label = QtWidgets.QLabel("Scaling Factor:")
+        scaling_layout.addWidget(scaling_label, 0, 0)
+        
+        self.scaling_input = QtWidgets.QLineEdit()
+        self.scaling_input.setPlaceholderText("1.0 (no scaling)")
+        self.scaling_input.setText("1.0")
+        self.scaling_input.setMaximumWidth(100)
+        scaling_layout.addWidget(self.scaling_input, 0, 1)
+        
+        scaling_info = QtWidgets.QLabel(
+            "Multiply all spectrum y-values by this factor.\n"
+            "Useful for spectra with very small values (e.g., 1e-17).\n"
+            "Set to 1.0 for no scaling."
+        )
+        scaling_info.setStyleSheet("color: #666; font-size: 10px;")
+        scaling_layout.addWidget(scaling_info, 1, 0, 1, 2)
+        
+        scaling_layout.addItem(QtWidgets.QSpacerItem(0, 0), 2, 0, 1, 2)
+        scaling_group.setLayout(scaling_layout)
+        layout.addWidget(scaling_group)
+        
         # Buttons
         button_layout = QtWidgets.QHBoxLayout()
         button_layout.addStretch()
@@ -271,6 +296,19 @@ class FormatPickerDialog(QtWidgets.QDialog):
         candidate = self.candidates[current_idx]
         fmt = candidate["key"]
         options = dict(candidate.get("options", {}))
+        
+        # Handle scaling factor
+        scaling_text = self.scaling_input.text().strip()
+        if scaling_text and scaling_text != "1.0":  # Only process if different from default
+            try:
+                scaling_factor = float(scaling_text)
+                if scaling_factor <= 0:
+                    QtWidgets.QMessageBox.warning(self, "Error", "Scaling factor must be positive")
+                    return
+                options["scaling_factor"] = scaling_factor
+            except ValueError:
+                QtWidgets.QMessageBox.warning(self, "Error", "Scaling factor must be a number (e.g., 1.0, 1e17)")
+                return
         
         # Handle ASCII options if needed
         if fmt.startswith("ascii:"):

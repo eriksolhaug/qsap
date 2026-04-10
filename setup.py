@@ -8,7 +8,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="qasap",
-    version="0.10",
+    version="0.11",
     author="Erik Solhaug",
     description="Quick Analysis of Spectra and Profiles - Interactive spectral analysis tool",
     long_description=long_description,

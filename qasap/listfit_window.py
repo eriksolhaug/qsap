@@ -920,23 +920,32 @@ class ListfitWindow(QtWidgets.QWidget):
     
     def remove_component(self, comp_type):
         """Remove last component of given type"""
-        for i in range(len(self.components) - 1, -1, -1):
-            if self.components[i]['type'] == comp_type:
-                self.components.pop(i)
-                self.component_list.removeRow(i)
-                if comp_type == 'gaussian':
-                    self.gaussian_count = max(0, self.gaussian_count - 1)
-                elif comp_type == 'voigt':
-                    self.voigt_count = max(0, self.voigt_count - 1)
-                elif comp_type == 'polynomial':
-                    self.polynomial_count = max(0, self.polynomial_count - 1)
-                elif comp_type == 'polynomial_guess_mask':
-                    self.polynomial_guess_mask_count = max(0, self.polynomial_guess_mask_count - 1)
-                elif comp_type == 'data_mask':
-                    self.data_mask_count = max(0, self.data_mask_count - 1)
-                # Emit signal to update the plot
-                self.components_changed.emit(self.components)
-                break
+        try:
+            for i in range(len(self.components) - 1, -1, -1):
+                if self.components[i]['type'] == comp_type:
+                    self.components.pop(i)
+                    # Remove the row at the correct index (table rows match component list indices)
+                    # Safety check: ensure row index is valid
+                    if i >= 0 and i < self.component_list.rowCount():
+                        self.component_list.removeRow(i)
+                    
+                    if comp_type == 'gaussian':
+                        self.gaussian_count = max(0, self.gaussian_count - 1)
+                    elif comp_type == 'voigt':
+                        self.voigt_count = max(0, self.voigt_count - 1)
+                    elif comp_type == 'polynomial':
+                        self.polynomial_count = max(0, self.polynomial_count - 1)
+                    elif comp_type == 'polynomial_guess_mask':
+                        self.polynomial_guess_mask_count = max(0, self.polynomial_guess_mask_count - 1)
+                    elif comp_type == 'data_mask':
+                        self.data_mask_count = max(0, self.data_mask_count - 1)
+                    # Emit signal to update the plot
+                    self.components_changed.emit(self.components)
+                    break
+        except Exception as e:
+            print(f"Error removing {comp_type} component: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _add_component_to_table(self, label, component):
         """Add a component row to the table"""

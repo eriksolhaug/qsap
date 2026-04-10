@@ -34,9 +34,8 @@ Fitting Modes:
 
 Measurement & Analysis:
   v                    - Calculate equivalent width of fitted line
-  a                    - Save Gaussian fit info to file
-  A                    - Save Voigt fit info to file
-  S                    - Save continuum fit info to file
+  S                    - Save all fits (Gaussian, Voigt, Continuum, Listfit) to files
+  a                    - Load saved fits from file (or use Load Fit button)
   ;                    - Show/toggle total line for Single Mode fitted lines
   w                    - Remove fitted profile under cursor
   ,                    - Add a line tag to fitted profile under cursor
@@ -683,6 +682,12 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.open_button.resize(143, 30)
         self.open_button.clicked.connect(self.open_spectrum_file)
         
+        # Create a "Load Fit..." button to load saved fits
+        self.load_fit_button = QPushButton("Load Fit...", self)
+        self.load_fit_button.move(270, 120)
+        self.load_fit_button.resize(130, 30)
+        self.load_fit_button.clicked.connect(self.load_fit_file)
+        
         # Create a separator line
         self.separator_line = QtWidgets.QFrame(self)
         self.separator_line.setGeometry(20, 155, 380, 2)
@@ -707,7 +712,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.redo_button.clicked.connect(self.on_redo)
         
         # Expand window height to accommodate new layout
-        self.setGeometry(100, 100, 440, 220)
+        self.setGeometry(100, 100, 550, 220)
 
         # Create a separator line between Quit and Poly Order (hidden by default)
         self.separator_line_poly = QtWidgets.QFrame(self)
@@ -844,6 +849,15 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # Load the spectrum
             wav, spec, err, meta = SpectrumIO.read_spectrum(file_path, fmt=fmt, options=options)
             
+            # Apply scaling factor if provided
+            if "scaling_factor" in options:
+                scaling_factor = options["scaling_factor"]
+                if scaling_factor != 1.0:
+                    spec = spec * scaling_factor
+                    if err is not None:
+                        err = err * abs(scaling_factor)
+                    print(f"Applied scaling factor: {scaling_factor}")
+            
             # Load the data
             self.load_spectrum_data(wav, spec, err, meta, file_path)
             
@@ -857,6 +871,358 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             print(f"Error loading spectrum: {e}")
             import traceback
             traceback.print_exc()
+
+    def load_fit_file(self):
+        """Load previously saved fits from consolidated CSV file"""
+        from PyQt5.QtWidgets import QFileDialog
+        import pandas as pd
+        
+        dialog = QFileDialog(
+            self,
+            "Load Fit File",
+            "",
+            "QASAP Fit Files (qasap_fits_*.csv gaussian_fits_*.csv voigt_fits_*.csv continuum_fits_*.csv listfit_polynomials_*.csv);;CSV Files (*.csv);;All Files (*)"
+        )
+        dialog.setFileMode(QFileDialog.ExistingFile)
+        
+        if dialog.exec_() != QFileDialog.Accepted:
+            return
+        
+        file_path = dialog.selectedFiles()[0]
+        
+        try:
+            basename = os.path.basename(file_path)
+            df = pd.read_csv(file_path)
+            
+            # Check if this is a consolidated file (has 'type' column)
+            if 'type' in df.columns:
+                # New consolidated format
+                self._load_consolidated_fits_from_dataframe(df)
+                print(f"Loaded {len(df)} fits from consolidated file {file_path}")
+            # Legacy support: auto-detect from old format filenames
+            elif 'gaussian_fits' in basename:
+                self._load_gaussian_fits_from_dataframe(df)
+                print(f"Loaded {len(df)} Gaussian fits from {file_path}")
+            elif 'voigt_fits' in basename:
+                self._load_voigt_fits_from_dataframe(df)
+                print(f"Loaded {len(df)} Voigt fits from {file_path}")
+            elif 'continuum_fits' in basename:
+                self._load_continuum_fits_from_dataframe(df)
+                print(f"Loaded {len(df)} continuum fits from {file_path}")
+            elif 'listfit_polynomials' in basename:
+                self._load_listfit_polynomials_from_dataframe(df)
+                print(f"Loaded listfit polynomials from {file_path}")
+            else:
+                # Try to detect by column names
+                self._load_by_column_detection(df)
+            
+            # Update plot and redraw all loaded fits
+            self.plot_spectrum()
+            self._redraw_loaded_fits()
+            self.fig.canvas.draw_idle()
+            
+        except Exception as e:
+            print(f"Error loading fit file: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _redraw_loaded_fits(self):
+        """Redraw all loaded fit lines on the plot and register with tracker"""
+        # Redraw Gaussian fits
+        for idx, fit in enumerate(self.gaussian_fits):
+            if fit.get('line') is None:  # Only if line hasn't been created yet
+                try:
+                    x_plot = np.linspace(fit['bounds'][0], fit['bounds'][1], 100)
+                    _, a, b = self.get_existing_continuum(fit['bounds'][0], fit['bounds'][1])
+                    if a is not None and b is not None:
+                        existing_continuum = self.continuum_model(x_plot, a, b)
+                    else:
+                        existing_continuum = np.zeros_like(x_plot)
+                    y_plot = self.gaussian(x_plot, fit['amp'], fit['mean'], fit['stddev']) + existing_continuum
+                    fit['line'], = self.ax.plot(x_plot, y_plot, color="red", linestyle='--')
+                    
+                    # Register with item tracker - use saved name if available
+                    name = fit.get('_tracker_name') or f"Gaussian (μ={fit['mean']:.1f}, σ={fit['stddev']:.1f})"
+                    self.register_item('gaussian', name, fit_dict=fit, line_obj=fit['line'], 
+                                     color='red', bounds=fit['bounds'])
+                except Exception as e:
+                    print(f"Error redrawing Gaussian fit: {e}")
+        
+        # Redraw Voigt fits
+        for idx, fit in enumerate(self.voigt_fits):
+            if fit.get('line') is None:
+                try:
+                    x_plot = np.linspace(fit['bounds'][0], fit['bounds'][1], 100)
+                    _, a, b = self.get_existing_continuum(fit['bounds'][0], fit['bounds'][1])
+                    if a is not None and b is not None:
+                        existing_continuum = self.continuum_model(x_plot, a, b)
+                    else:
+                        existing_continuum = np.zeros_like(x_plot)
+                    y_plot = self.voigt(x_plot, fit['amp'], fit['center'], fit['sigma'], fit['gamma']) + existing_continuum
+                    fit['line'], = self.ax.plot(x_plot, y_plot, color="orange", linestyle='--')
+                    
+                    # Register with item tracker - use saved name if available
+                    name = fit.get('_tracker_name') or f"Voigt (c={fit['center']:.1f}, σ={fit['sigma']:.1f}, γ={fit['gamma']:.1f})"
+                    self.register_item('voigt', name, fit_dict=fit, line_obj=fit['line'],
+                                     color='orange', bounds=fit['bounds'])
+                except Exception as e:
+                    print(f"Error redrawing Voigt fit: {e}")
+        
+        # Redraw Continuum fits
+        for idx, fit in enumerate(self.continuum_fits):
+            if fit.get('line') is None:
+                try:
+                    x_plot = np.linspace(fit['bounds'][0], fit['bounds'][1], 100)
+                    y_plot = fit['a'] * x_plot + fit['b']
+                    fit['line'], = self.ax.plot(x_plot, y_plot, color="magenta", linestyle='--')
+                    
+                    # Register with item tracker - use saved name if available
+                    name = fit.get('_tracker_name') or f"Continuum (a={fit['a']:.2e}, b={fit['b']:.2f})"
+                    self.register_item('continuum', name, fit_dict=fit, line_obj=fit['line'],
+                                     color='magenta', bounds=fit['bounds'])
+                except Exception as e:
+                    print(f"Error redrawing continuum fit: {e}")
+        
+        # Redraw Listfit composites
+        for idx, listfit in enumerate(self.listfit_fits):
+            try:
+                bounds = listfit.get('bounds', (None, None))
+                # Handle invalid bounds
+                if bounds[0] is None or bounds[1] is None or np.isnan(bounds[0]) or np.isnan(bounds[1]):
+                    bounds = (self.wav.min(), self.wav.max())
+                
+                param_values = listfit.get('param_values', {})
+                
+                # If we have parameters, rebuild and evaluate the model
+                if param_values:
+                    x_plot = np.linspace(bounds[0], bounds[1], 200)
+                    
+                    # Rebuild the composite model from components
+                    components = listfit.get('components', [])
+                    composite = None
+                    param_counter = {}  # Track parameter indices for naming
+                    
+                    for comp in components:
+                        comp_type = comp.get('type', 'polynomial')
+                        
+                        if comp_type == 'polynomial':
+                            order = comp.get('order', 1)
+                            # Create polynomial model
+                            from lmfit.models import PolynomialModel
+                            poly_model = PolynomialModel(order)
+                            
+                            # Set parameters to saved values - try different naming conventions
+                            params_set = False
+                            for i in range(order + 1):
+                                # Try different parameter name formats
+                                possible_names = [
+                                    f'poly_c{i}',
+                                    f'p0_c{i}',
+                                    f'c{i}',
+                                    f'p_c{i}'
+                                ]
+                                for name in possible_names:
+                                    if name in param_values:
+                                        poly_model.set_param_hint(f'c{i}', value=param_values[name])
+                                        params_set = True
+                                        break
+                            
+                            if composite is None:
+                                composite = poly_model
+                            else:
+                                composite = composite + poly_model
+                        
+                        elif comp_type == 'gaussian':
+                            from lmfit.models import GaussianModel
+                            g_idx = param_counter.get('gaussian', 0)
+                            param_counter['gaussian'] = g_idx + 1
+                            
+                            prefix = f'g{g_idx}_'
+                            g_model = GaussianModel(prefix=prefix)
+                            
+                            # Set Gaussian parameters from saved values
+                            if f'{prefix}amplitude' in param_values:
+                                g_model.set_param_hint(f'{prefix}amplitude', value=param_values[f'{prefix}amplitude'])
+                            if f'{prefix}center' in param_values:
+                                g_model.set_param_hint(f'{prefix}center', value=param_values[f'{prefix}center'])
+                            if f'{prefix}sigma' in param_values:
+                                g_model.set_param_hint(f'{prefix}sigma', value=param_values[f'{prefix}sigma'])
+                            
+                            if composite is None:
+                                composite = g_model
+                            else:
+                                composite = composite + g_model
+                        
+                        elif comp_type == 'voigt':
+                            from lmfit.models import VoigtModel
+                            v_idx = param_counter.get('voigt', 0)
+                            param_counter['voigt'] = v_idx + 1
+                            
+                            prefix = f'v{v_idx}_'
+                            v_model = VoigtModel(prefix=prefix)
+                            
+                            # Set Voigt parameters
+                            if f'{prefix}amplitude' in param_values:
+                                v_model.set_param_hint(f'{prefix}amplitude', value=param_values[f'{prefix}amplitude'])
+                            if f'{prefix}center' in param_values:
+                                v_model.set_param_hint(f'{prefix}center', value=param_values[f'{prefix}center'])
+                            if f'{prefix}sigma' in param_values:
+                                v_model.set_param_hint(f'{prefix}sigma', value=param_values[f'{prefix}sigma'])
+                            if f'{prefix}gamma' in param_values:
+                                v_model.set_param_hint(f'{prefix}gamma', value=param_values[f'{prefix}gamma'])
+                            
+                            if composite is None:
+                                composite = v_model
+                            else:
+                                composite = composite + v_model
+                    
+                    # Evaluate the reconstructed model
+                    if composite is not None:
+                        # Create parameters dict with all saved values
+                        eval_params = composite.make_params()
+                        for param_name, param_value in param_values.items():
+                            # Try to match parameter names
+                            if param_name in eval_params:
+                                eval_params[param_name].value = param_value
+                        
+                        y_plot = composite.eval(eval_params, x=x_plot)
+                        # Use the standard listfit color: #003d7a (dark blue)
+                        listfit_line, = self.ax.plot(x_plot, y_plot, label='Total Listfit', color='#003d7a', linestyle='-', linewidth=2)
+                        listfit['line'] = listfit_line
+                        
+                        # Register with item tracker - use saved name if available
+                        n_components = len(listfit.get('components', []))
+                        chi2 = listfit.get('quality_metrics', {}).get('chisqr', 0)
+                        name = listfit.get('_tracker_name') or f"Total Listfit ({n_components} components, χ²={chi2:.2f})"
+                        self.register_item('listfit_total', name, fit_dict=listfit, line_obj=listfit_line,
+                                         color='#003d7a', bounds=bounds)
+            except Exception as e:
+                print(f"Error redrawing listfit composite: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    def _load_consolidated_fits_from_dataframe(self, df):
+        """Load fits from consolidated DataFrame with 'type' column"""
+        gaussian_count = 0
+        voigt_count = 0
+        continuum_count = 0
+        listfit_count = 0
+        
+        for idx, row in df.iterrows():
+            fit_type = row.get('type')
+            fit_dict = row.to_dict()
+            # Extract and remove tracker_name before cleaning NaN
+            tracker_name = fit_dict.pop('tracker_name', None) if 'tracker_name' in fit_dict else None
+            # Remove NaN and type column
+            fit_dict = {k: v for k, v in fit_dict.items() if pd.notna(v) and k != 'type'}
+            
+            # Reconstruct bounds tuple from min/max if present
+            if 'bounds_min' in fit_dict and 'bounds_max' in fit_dict:
+                fit_dict['bounds'] = (fit_dict.pop('bounds_min'), fit_dict.pop('bounds_max'))
+            
+            if fit_type == 'gaussian':
+                self.gaussian_fits.append(fit_dict)
+                gaussian_count += 1
+            elif fit_type == 'voigt':
+                self.voigt_fits.append(fit_dict)
+                voigt_count += 1
+            elif fit_type == 'continuum':
+                self.continuum_fits.append(fit_dict)
+                continuum_count += 1
+            elif fit_type == 'listfit':
+                self._load_single_listfit_entry(fit_dict)
+                listfit_count += 1
+            
+            # Store tracker name in fit_dict for use during redraw
+            fit_dict['_tracker_name'] = tracker_name
+        
+        print(f"  - Gaussian: {gaussian_count}")
+        print(f"  - Voigt: {voigt_count}")
+        print(f"  - Continuum: {continuum_count}")
+        print(f"  - Listfit: {listfit_count}")
+    
+    def _load_single_listfit_entry(self, fit_dict):
+        """Load a single listfit entry from consolidated format"""
+        from lmfit import CompositeModel
+        
+        # Reconstruct listfit structure
+        listfit_entry = {
+            'bounds': (fit_dict.get('bounds_min'), fit_dict.get('bounds_max')),
+            'components': self._parse_string_repr(fit_dict.get('components', '[]')),
+            'initial_guesses': self._parse_string_repr(fit_dict.get('initial_guesses', '{}')),
+            'constraints': self._parse_string_repr(fit_dict.get('constraints', '{}')),
+        }
+        
+        # Store parameter values (for later evaluation)
+        param_values = {k.replace('param_', ''): v for k, v in fit_dict.items() if k.startswith('param_')}
+        listfit_entry['param_values'] = param_values
+        
+        # Store quality metrics
+        listfit_entry['quality_metrics'] = {
+            'chisqr': fit_dict.get('chi_squared'),
+            'redchi': fit_dict.get('redchi'),
+            'aic': fit_dict.get('aic'),
+            'bic': fit_dict.get('bic'),
+        }
+        
+        self.listfit_fits.append(listfit_entry)
+    
+    def _parse_string_repr(self, s):
+        """Safely parse string representation of list/dict"""
+        if not s or s == 'nan' or s != s:  # Check for NaN
+            return [] if s == '[]' else {}
+        try:
+            import ast
+            return ast.literal_eval(str(s))
+        except (ValueError, SyntaxError):
+            return [] if isinstance(s, str) and s.startswith('[') else {}
+    
+    def _load_by_column_detection(self, df):
+        """Detect fit type by analyzing DataFrame columns (legacy support)"""
+        # Check what columns are present to infer fit type
+        if {'amp', 'mean', 'stddev'}.issubset(df.columns):
+            self._load_gaussian_fits_from_dataframe(df)
+            print(f"Auto-detected Gaussian fits: {len(df)} records")
+        elif {'a', 'b'}.issubset(df.columns):
+            self._load_continuum_fits_from_dataframe(df)
+            print(f"Auto-detected continuum fits: {len(df)} records")
+        elif {'sigma', 'gamma'}.issubset(df.columns):
+            self._load_voigt_fits_from_dataframe(df)
+            print(f"Auto-detected Voigt fits: {len(df)} records")
+        else:
+            print(f"Could not auto-detect fit type. Columns: {list(df.columns)}")
+
+    
+    def _load_gaussian_fits_from_dataframe(self, df):
+        """Load Gaussian fits from DataFrame"""
+        for idx, row in df.iterrows():
+            fit_dict = row.to_dict()
+            # Handle NaN values
+            fit_dict = {k: v for k, v in fit_dict.items() if pd.notna(v)}
+            self.gaussian_fits.append(fit_dict)
+    
+    def _load_voigt_fits_from_dataframe(self, df):
+        """Load Voigt fits from DataFrame"""
+        for idx, row in df.iterrows():
+            fit_dict = row.to_dict()
+            fit_dict = {k: v for k, v in fit_dict.items() if pd.notna(v)}
+            self.voigt_fits.append(fit_dict)
+    
+    def _load_continuum_fits_from_dataframe(self, df):
+        """Load continuum fits from DataFrame"""
+        for idx, row in df.iterrows():
+            fit_dict = row.to_dict()
+            fit_dict = {k: v for k, v in fit_dict.items() if pd.notna(v)}
+            self.continuum_fits.append(fit_dict)
+    
+    def _load_listfit_polynomials_from_dataframe(self, df):
+        """Load listfit polynomials from DataFrame (simplified - stores as metadata)"""
+        print("[INFO] Listfit polynomial loading from CSV is limited. Consider saving full listfit results for complete reload.")
+        # For now, just load the polynomial data
+        for idx, row in df.iterrows():
+            poly_dict = row.to_dict()
+            poly_dict = {k: v for k, v in poly_dict.items() if pd.notna(v)}
+            print(f"  Polynomial: bounds=[{poly_dict.get('bounds_min')}, {poly_dict.get('bounds_max')}], order={poly_dict.get('polynomial_order')}")
 
     def load_spectrum_data(self, wav, spec, err, meta, fits_file):
         """Load spectrum data into the plotter."""
@@ -1114,7 +1480,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Define initial plot limits
         if len(self.wav) > 0 and len(self.spec) > 0:
             xlim = (self.wav.min(), self.wav.max())
-            ylim = (self.spec.min(), self.spec.max())
+            # Handle NaN values in spectrum
+            valid_spec = self.spec[~np.isnan(self.spec)]
+            if len(valid_spec) > 0:
+                ylim = (valid_spec.min(), valid_spec.max())
+            else:
+                # All spectrum values are NaN - use default range
+                ylim = (-1, 1)
         else:
             xlim = (0, 1)
             ylim = (0, 1)
@@ -5664,75 +6036,116 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     print(f"Bayes fit bounds set: {self.bayes_bounds}")
                     self.prompt_bayes_fit()
 
-        # Save all fits (Gaussian, Voigt, Continuum, and Listfit)
+        # Save all fits to a single consolidated file
         elif event.key == 'S':
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            saved_something = False
+            all_fits = []
             
-            # Save Gaussian fits
-            if self.gaussian_fits:
-                filename = f"gaussian_fits_{timestamp}.csv"
-                df = pd.DataFrame(self.gaussian_fits)
-                df.drop(columns=['line'], inplace=True, errors='ignore')
-                df.to_csv(filename, index=False)
-                print(f"Saved Gaussian fits to {filename}")
-                saved_something = True
+            # Collect Gaussian fits
+            for fit in self.gaussian_fits:
+                fit_entry = {'type': 'gaussian'}
+                fit_entry.update(fit)
+                # Find and save the tracker name for this fit
+                for item_id, item_info in self.item_id_map.items():
+                    if item_info.get('fit_dict') is fit:
+                        fit_entry['tracker_name'] = item_info.get('name', '')
+                        break
+                # Handle tuple bounds - convert to min/max
+                if 'bounds' in fit_entry and isinstance(fit_entry['bounds'], (tuple, list)):
+                    bounds = fit_entry.pop('bounds')
+                    fit_entry['bounds_min'] = bounds[0]
+                    fit_entry['bounds_max'] = bounds[1]
+                all_fits.append(fit_entry)
             
-            # Save Voigt fits
-            if self.voigt_fits:
-                filename = f"voigt_fits_{timestamp}.csv"
-                df = pd.DataFrame(self.voigt_fits)
-                df.drop(columns=['line'], inplace=True, errors='ignore')
-                df.to_csv(filename, index=False)
-                print(f"Saved Voigt fits to {filename}")
-                saved_something = True
+            # Collect Voigt fits
+            for fit in self.voigt_fits:
+                fit_entry = {'type': 'voigt'}
+                fit_entry.update(fit)
+                # Find and save the tracker name for this fit
+                for item_id, item_info in self.item_id_map.items():
+                    if item_info.get('fit_dict') is fit:
+                        fit_entry['tracker_name'] = item_info.get('name', '')
+                        break
+                # Handle tuple bounds - convert to min/max
+                if 'bounds' in fit_entry and isinstance(fit_entry['bounds'], (tuple, list)):
+                    bounds = fit_entry.pop('bounds')
+                    fit_entry['bounds_min'] = bounds[0]
+                    fit_entry['bounds_max'] = bounds[1]
+                all_fits.append(fit_entry)
             
-            # Save Continuum fits
-            if self.continuum_fits:
-                filename = f"continuum_fits_{timestamp}.csv"
-                df = pd.DataFrame(self.continuum_fits)
-                df.drop(columns=['line', 'patches'], inplace=True, errors='ignore')
-                df.to_csv(filename, index=False)
-                print(f"Saved Continuum fits to {filename}")
-                saved_something = True
+            # Collect Continuum fits
+            for fit in self.continuum_fits:
+                fit_entry = {'type': 'continuum'}
+                fit_entry.update(fit)
+                # Find and save the tracker name for this fit
+                for item_id, item_info in self.item_id_map.items():
+                    if item_info.get('fit_dict') is fit:
+                        fit_entry['tracker_name'] = item_info.get('name', '')
+                        break
+                # Handle tuple bounds - convert to min/max
+                if 'bounds' in fit_entry and isinstance(fit_entry['bounds'], (tuple, list)):
+                    bounds = fit_entry.pop('bounds')
+                    fit_entry['bounds_min'] = bounds[0]
+                    fit_entry['bounds_max'] = bounds[1]
+                all_fits.append(fit_entry)
             
-            # Save Listfit polynomial coefficients
-            if self.listfit_fits:
-                listfit_polys = []
-                for listfit in self.listfit_fits:
-                    bounds = listfit.get('bounds')
-                    components = listfit.get('components', [])
-                    # Extract polynomial components
-                    for comp in components:
-                        if comp['type'] == 'polynomial':
-                            order = comp.get('order', 1)
-                            result = listfit.get('result')
-                            if result:
-                                # Collect polynomial coefficients
-                                prefix = f"p{len([c for c in components[:components.index(comp)] if c['type'] == 'polynomial'])}_"
-                                poly_entry = {
-                                    'bounds_min': bounds[0],
-                                    'bounds_max': bounds[1],
-                                    'polynomial_order': order,
-                                }
-                                # Add coefficients
-                                for i in range(order + 1):
-                                    param_name = f'{prefix}c{i}'
-                                    if param_name in result.params:
-                                        poly_entry[f'c{i}'] = result.params[param_name].value
-                                listfit_polys.append(poly_entry)
+            # Collect Listfit data
+            for listfit in self.listfit_fits:
+                bounds = listfit.get('bounds', (None, None))
+                components = listfit.get('components', [])
+                result = listfit.get('result')
+                initial_guesses = listfit.get('initial_guesses', {})
+                constraints = listfit.get('constraints', {})
                 
-                if listfit_polys:
-                    filename = f"listfit_polynomials_{timestamp}.csv"
-                    df = pd.DataFrame(listfit_polys)
-                    df.to_csv(filename, index=False)
-                    print(f"Saved Listfit polynomial coefficients to {filename}")
-                    saved_something = True
+                fit_entry = {
+                    'type': 'listfit',
+                    'bounds_min': bounds[0],
+                    'bounds_max': bounds[1],
+                    'components': str(components),  # Store as string representation
+                    'initial_guesses': str(initial_guesses),
+                    'constraints': str(constraints),
+                    'chi_squared': result.chisqr if result else None,
+                    'redchi': result.redchi if result else None,
+                    'aic': result.aic if result else None,
+                    'bic': result.bic if result else None,
+                }
+                
+                # Find and save the tracker name for this listfit
+                for item_id, item_info in self.item_id_map.items():
+                    if item_info.get('fit_dict') is listfit:
+                        fit_entry['tracker_name'] = item_info.get('name', '')
+                        break
+                
+                # Add all result parameters - including polynomial coefficients
+                if result:
+                    for param_name, param in result.params.items():
+                        fit_entry[f'param_{param_name}'] = param.value
+                    # Debug output to verify parameters are being captured
+                    param_names = [p for p in result.params.keys()]
+                    if param_names:
+                        print(f"[DEBUG] Listfit parameters saved: {', '.join(param_names[:5])}{'...' if len(param_names) > 5 else ''}")
+                
+                all_fits.append(fit_entry)
             
-            if not saved_something:
-                print("No fits to save. Fit some profiles first (Gaussian, Voigt, Continuum, or Listfit).")
+            if all_fits:
+                # Create DataFrame and save
+                df = pd.DataFrame(all_fits)
+                # Drop non-serializable columns
+                df.drop(columns=['line', 'patches'], inplace=True, errors='ignore')
+                
+                filename = f"qasap_fits_{timestamp}.csv"
+                df.to_csv(filename, index=False)
+                print(f"Saved {len(all_fits)} fits to {filename}")
+                print(f"  - Gaussian: {sum(1 for f in all_fits if f['type'] == 'gaussian')}")
+                print(f"  - Voigt: {sum(1 for f in all_fits if f['type'] == 'voigt')}")
+                print(f"  - Polynomial: {sum(1 for f in all_fits if f['type'] == 'continuum')}")
+                print(f"  - Listfit: {sum(1 for f in all_fits if f['type'] == 'listfit')}")
+            else:
+                print("No fits to save. Fit some profiles first (Gaussian, Voigt, Polynomial, or Listfit).")
 
-        # Keys 'a' and 'A' are now available for future use
+        # Load fit file with 'a' key
+        elif event.key == 'a':
+            self.load_fit_file()
 
         elif event.key == 'K':
             file_path, _ = QFileDialog.getOpenFileName(
@@ -5892,8 +6305,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
     
     def _on_listfit_components_changed(self, components):
         """Handle listfit components being added/removed - update plot immediately"""
-        self.listfit_components = components
-        self.update_plot()
+        try:
+            self.listfit_components = components
+            # Redraw the canvas to reflect component changes
+            self.fig.canvas.draw_idle()
+        except Exception as e:
+            print(f"Error updating listfit components: {e}")
+            import traceback
+            traceback.print_exc()
 
 
     def perform_listfit(self, components):
@@ -5982,7 +6401,12 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             print("This is often due to numerical precision limits. The fit parameters are still valid.")
         
         print("Listfit completed successfully!")
-        print(result.fit_report())
+        
+        # Print custom fit report if no error spectrum
+        if err_fit is None:
+            self._print_listfit_report_no_errors(result)
+        else:
+            print(result.fit_report())
         
         # Check fit quality and warn if poor
         self._check_listfit_quality(result, y_fit)
@@ -5994,6 +6418,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         if self.is_residual_shown:
             self.calculate_and_plot_residuals()
         
+        # Extract initial guesses and constraints for storage
+        initial_guesses = self._extract_listfit_initial_guesses(result, components)
+        constraints_info = self._extract_listfit_constraints(components)
+        
         # Store the fit
         self.listfit_fits.append({
             'bounds': (left_bound, right_bound),
@@ -6001,7 +6429,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             'result': result,
             'x_data': x_fit,
             'y_data': y_fit,
-            'err_data': err_fit
+            'err_data': err_fit,
+            'initial_guesses': initial_guesses,
+            'constraints': constraints_info
         })
         
         # Record action for undo/redo
@@ -6017,7 +6447,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.fig.canvas.draw_idle()  # Redraw to show listfit results
 
     def build_composite_model(self, components, x_fit, y_fit, err_fit):
-        """Build a composite lmfit Model from component list with improved initial guesses"""
+        """Build a composite lmfit Model from component list with improved initial guesses for blended profiles"""
         from scipy.signal import find_peaks
         
         model = None
@@ -6032,14 +6462,69 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         polynomial_guess_masks = [comp for comp in components if comp['type'] == 'polynomial_guess_mask']
         data_masks = [comp for comp in components if comp['type'] == 'data_mask']
         
-        # Find all peaks upfront for multi-component Gaussian/Voigt fitting
-        peaks, properties = find_peaks(np.abs(y_fit), height=np.std(y_fit) * 0.3)
+        # **NEW: Two-stage fitting for better continuum estimates**
+        # Stage 1: Fit polynomial alone to get good initial guesses
+        polynomial_fits = {}  # Cache fitted polynomial parameters
+        poly_components = [comp for comp in components if comp['type'] == 'polynomial']
         
-        # Sort peaks by prominence (strength) - use height from find_peaks
-        if len(peaks) > 0:
-            # Sort descending by peak height
-            sorted_indices = np.argsort(-properties['peak_heights'])
-            peaks = peaks[sorted_indices]
+        if poly_components:
+            print("[DEBUG] Stage 1: Pre-fitting polynomial continuum to get better initial guesses...")
+            for comp in poly_components:
+                order = comp.get('order', 1)
+                prefix = f'p{poly_count}_'
+                
+                # Estimate and fit polynomial on continuum regions
+                poly_coeffs = self._estimate_polynomial_coefficients(x_fit, y_fit, order, continuum_mask, polynomial_guess_masks)
+                poly_coeffs_reversed = poly_coeffs[::-1]
+                
+                try:
+                    # Create a temporary polynomial model and fit it
+                    poly_model = PolynomialModel(degree=order, prefix=prefix, independent_vars=['x'])
+                    for i in range(order + 1):
+                        param_name = f'{prefix}c{i}'
+                        poly_model.set_param_hint(param_name, value=poly_coeffs_reversed[i])
+                    
+                    # Fit polynomial only (to get better starting guesses)
+                    result_poly = poly_model.fit(y_fit, x=x_fit)
+                    
+                    # Cache the fitted parameters
+                    polynomial_fits[prefix] = result_poly.params
+                    print(f"[DEBUG] Polynomial {prefix} pre-fit complete. Chi² reduced = {result_poly.redchi:.3e}")
+                except Exception as e:
+                    print(f"[DEBUG] Warning: Pre-fit of polynomial {prefix} failed: {e}")
+                    polynomial_fits[prefix] = None
+                
+                poly_count += 1
+            
+            # Reset poly_count for actual model building
+            poly_count = 0
+        
+        # Find all peaks upfront for multi-component Gaussian/Voigt fitting
+        # For multiple Gaussians/Voigts, use region-based peak detection to handle blended profiles
+        
+        # Count how many Gaussians and Voigts we need to fit
+        num_gaussians = len([c for c in components if c['type'] == 'gaussian'])
+        num_voigts = len([c for c in components if c['type'] == 'voigt'])
+        num_line_components = num_gaussians + num_voigts
+        
+        y_abs = np.abs(y_fit)
+        signal_mean = np.mean(y_abs)
+        signal_std = np.std(y_abs)
+        
+        # Strategy for peak detection based on number of components
+        if num_line_components > 1:
+            # Multiple components: divide wavelength range into sub-regions
+            # and find the strongest peak in each region
+            peaks = self._find_peaks_for_multiple_components(x_fit, y_fit, num_line_components)
+        else:
+            # Single component: use global peak detection
+            height_threshold = max(signal_mean * 0.1, signal_std * 0.2)
+            peaks, properties = find_peaks(y_abs, height=height_threshold, distance=2)
+            
+            # Sort by height if we found peaks
+            if len(peaks) > 0:
+                sorted_indices = np.argsort(-properties['peak_heights'])
+                peaks = peaks[sorted_indices]
         
         peak_index_for_component = 0  # Track which peak to use next
         
@@ -6061,11 +6546,15 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 
                 prefix = f'g{gauss_count}_'
                 gauss_model = Model(self.gaussian, prefix=prefix, independent_vars=['x'])
+                
+                # Set initial guesses FIRST with the detected peak positions
                 gauss_model.set_param_hint(f'{prefix}amp', value=amp_guess)
                 gauss_model.set_param_hint(f'{prefix}mean', value=center_guess)
                 gauss_model.set_param_hint(f'{prefix}stddev', value=sigma_guess, min=1e-6)
                 
-                # Apply constraints if present
+                # Apply constraints AFTER initial guesses
+                # Constraints may override the initial guess (e.g., for fixed values or linked parameters)
+                # but they won't restrict the initial value unnecessarily
                 if 'constraints' in comp:
                     self._apply_gaussian_constraints(gauss_model, prefix, comp['constraints'])
                 
@@ -6090,12 +6579,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 
                 prefix = f'v{voigt_count}_'
                 voigt_model = Model(self.voigt, prefix=prefix, independent_vars=['x'])
+                
+                # Set initial guesses FIRST with the detected peak positions
                 voigt_model.set_param_hint(f'{prefix}amp', value=amp_guess)
                 voigt_model.set_param_hint(f'{prefix}center', value=center_guess)
                 voigt_model.set_param_hint(f'{prefix}sigma', value=sigma_guess, min=1e-6)
                 voigt_model.set_param_hint(f'{prefix}gamma', value=gamma_guess, min=1e-6)
                 
-                # Apply constraints if present
+                # Apply constraints AFTER initial guesses
                 if 'constraints' in comp:
                     self._apply_voigt_constraints(voigt_model, prefix, comp['constraints'])
                 
@@ -6111,13 +6602,29 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 # Create polynomial model using lmfit's built-in PolynomialModel
                 poly_model = PolynomialModel(degree=order, prefix=prefix, independent_vars=['x'])
                 
-                # Use median-filtered data to estimate polynomial (featureless continuum)
-                # Pass mask features to exclude their regions from polynomial guess
-                poly_coeffs = self._estimate_polynomial_coefficients(x_fit, y_fit, order, continuum_mask, polynomial_guess_masks)
-                
-                for i in range(order + 1):
-                    param_name = f'{prefix}c{i}'
-                    poly_model.set_param_hint(param_name, value=poly_coeffs[i])
+                # **Use pre-fitted polynomial parameters if available (Stage 1 results)**
+                if prefix in polynomial_fits and polynomial_fits[prefix] is not None:
+                    print(f"[DEBUG] Using pre-fitted parameters for polynomial {prefix}")
+                    # Use the fitted parameters from Stage 1
+                    for i in range(order + 1):
+                        param_name = f'{prefix}c{i}'
+                        if param_name in polynomial_fits[prefix]:
+                            fitted_value = polynomial_fits[prefix][param_name].value
+                            poly_model.set_param_hint(param_name, value=fitted_value)
+                            print(f"[DEBUG]   {param_name} = {fitted_value}")
+                else:
+                    # Fallback to coefficient estimation if pre-fit failed
+                    print(f"[DEBUG] Using estimated coefficients for polynomial {prefix} (no pre-fit available)")
+                    poly_coeffs = self._estimate_polynomial_coefficients(x_fit, y_fit, order, continuum_mask, polynomial_guess_masks)
+                    
+                    # np.polyfit returns coefficients from highest to lowest degree (x^n, ..., x^0)
+                    # but lmfit expects them from lowest to highest (c0=x^0, c1=x^1, ..., cn=x^n)
+                    # So we need to reverse them
+                    poly_coeffs_reversed = poly_coeffs[::-1]
+                    
+                    for i in range(order + 1):
+                        param_name = f'{prefix}c{i}'
+                        poly_model.set_param_hint(param_name, value=poly_coeffs_reversed[i])
                 
                 if model is None:
                     model = poly_model
@@ -6256,6 +6763,49 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         except:
             return None
 
+    def _extract_listfit_initial_guesses(self, result, components):
+        """Extract initial guesses from lmfit result and components"""
+        guesses = {}
+        for param_name, param in result.params.items():
+            if param.init_value is not None:
+                guesses[param_name] = param.init_value
+        return guesses
+    
+    def _extract_listfit_constraints(self, components):
+        """Extract constraint information from components"""
+        constraints = {}
+        for comp in components:
+            if comp['type'] in ['gaussian', 'voigt']:
+                comp_id = comp.get('id', '')
+                if 'constraints' in comp:
+                    constraints[f"{comp['type']}_{comp_id}"] = comp['constraints']
+        return constraints
+    
+    def _print_listfit_report_no_errors(self, result):
+        """Print custom fit report when no error spectrum is available.
+        
+        Without error bars, chi-squared is not properly defined.
+        Instead, we report the Sum of Squared Residuals (SSR).
+        """
+        report = result.fit_report()
+        
+        # Replace chi-square references with SSR (Sum of Squared Residuals)
+        report = report.replace('chi-square', 'sum of squared residuals (SSR)')
+        report = report.replace('reduced chi-square', 'mean squared residual')
+        
+        # Add explanation
+        explanation = (
+            "\n## NOTE: No error spectrum provided ##\n"
+            "The fit quality metrics are reported as:\n"
+            "  • Sum of Squared Residuals (SSR) = Σ(data - model)²\n"
+            "  • Mean Squared Residual = SSR / (N - n_params)\n"
+            "These are NOT true chi-squared values (which require error bars).\n"
+            "Lower values indicate better fit quality.\n"
+        )
+        
+        print(report)
+        print(explanation)
+
     def _check_listfit_quality(self, result, y_fit):
         """Check the quality of the Listfit and warn user if fit is poor"""
         warnings = []
@@ -6285,13 +6835,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         except:
             pass
         
-        # Criterion 3: Check for suspicious parameter values (very large or very small)
+        # Criterion 3: Check for suspicious parameter values (very large)
         # These might indicate the optimizer went to extreme values
         extreme_value = False
         for param_name, param in result.params.items():
             if param.value is not None:
-                # Check if parameter value is extremely large or small
-                if abs(param.value) > 1e6 or (abs(param.value) < 1e-6 and abs(param.value) > 0):
+                # Check if parameter value is extremely large
+                if abs(param.value) > 1e6:
                     extreme_value = True
                     break
         
@@ -6439,6 +6989,78 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 param_key = param_map.get(parameter, parameter)
                 model.set_param_hint(f'{prefix}{param_key}', expr=expression)
 
+    def _clamp_to_bounds(self, value, bounds):
+        """Clamp a value to be within specified bounds.
+        
+        Args:
+            value: The value to clamp
+            bounds: Tuple of (min_str, max_str) where strings are empty if not specified
+                   (from constraints like amplitude_bounds, mean_bounds, etc.)
+        
+        Returns:
+            Clamped value
+        """
+        min_str, max_str = bounds
+        
+        if not min_str and not max_str:
+            return value  # No bounds, return as-is
+        
+        try:
+            if min_str:
+                min_val = float(min_str)
+                value = max(value, min_val)
+            if max_str:
+                max_val = float(max_str)
+                value = min(value, max_val)
+        except (ValueError, TypeError):
+            pass  # If conversion fails, just return value as-is
+        
+        return value
+
+    def _find_peaks_for_multiple_components(self, x_fit, y_fit, num_components):
+        """Find peaks for multiple blended components by dividing wavelength range.
+        
+        For heavily blended profiles, divide the x-range into sub-regions
+        and find the strongest peak in each region. This ensures each component
+        gets a different starting wavelength.
+        
+        Args:
+            x_fit: wavelength array
+            y_fit: flux array
+            num_components: number of Gaussians/Voigts to fit
+        
+        Returns:
+            Array of peak indices, one per component (or fewer if not enough found)
+        """
+        from scipy.signal import find_peaks
+        
+        y_abs = np.abs(y_fit)
+        peaks = []
+        
+        if num_components <= 1:
+            return np.array(peaks)
+        
+        # Divide the wavelength range into num_components regions
+        region_size = len(x_fit) / num_components
+        
+        for region_idx in range(num_components):
+            # Define this region's bounds
+            region_start = int(region_idx * region_size)
+            region_end = int((region_idx + 1) * region_size)
+            if region_idx == num_components - 1:
+                region_end = len(x_fit)  # Ensure last region goes to the end
+            
+            # Get data in this region
+            region_y = y_abs[region_start:region_end]
+            
+            if len(region_y) > 0:
+                # Find the strongest point in this region (could be a peak or part of blended profile)
+                strongest_idx_in_region = np.argmax(region_y)
+                peak_idx = region_start + strongest_idx_in_region
+                peaks.append(peak_idx)
+        
+        return np.array(peaks)
+
     def _identify_continuum_regions(self, x_fit, y_fit):
         """Identify regions likely to be continuum (not dominated by line profiles)"""
         from scipy.signal import find_peaks
@@ -6472,7 +7094,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         return continuum_mask
 
     def _estimate_gaussian_params(self, x_fit, y_fit, peak_idx=None):
-        """Estimate Gaussian parameters using peak detection with FWHM (same as single Gaussian mode)
+        """Estimate Gaussian parameters using peak detection with FWHM
         
         Args:
             x_fit: x data
