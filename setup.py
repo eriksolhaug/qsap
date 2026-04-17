@@ -6,9 +6,12 @@ with open("README.md", "r", encoding="utf-8") as fh:
 with open("requirements.txt", "r", encoding="utf-8") as fh:
     requirements = [line.strip() for line in fh if line.strip()]
 
+with open("version.txt", "r", encoding="utf-8") as fh:
+    version = fh.read().strip()
+
 setup(
     name="qasap",
-    version="0.11",
+    version=version,
     author="Erik Solhaug",
     description="Quick Analysis of Spectra and Profiles - Interactive spectral analysis tool",
     long_description=long_description,

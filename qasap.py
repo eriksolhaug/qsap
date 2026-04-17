@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """
 QASAP - Quick & Advanced Spectrum Analysis Package
-Version 0.10
 
 Interactive spectral analysis tool with intelligent file format detection.
 Modular architecture with spectrum I/O and analysis functions.
+Version is read from version.txt for easy updates between releases.
 
 Author: Erik Solhaug
 License: MIT
@@ -13,6 +13,7 @@ License: MIT
 import argparse
 import sys
 import numpy as np
+from pathlib import Path
 from PyQt5 import QtWidgets
 
 # Import modular components from qasap package ONLY (no v0.5 dependencies)
@@ -20,6 +21,14 @@ from qasap.spectrum_io import SpectrumIO
 from qasap.spectrum_analysis import SpectrumAnalysis
 from qasap.ui_components import SpectrumPlotter, SpectrumPlotterApp
 from qasap.format_picker_dialog import FormatPickerDialog
+
+# Get version from version.txt
+def _get_version():
+    version_file = Path(__file__).parent / 'version.txt'
+    try:
+        return version_file.read_text().strip()
+    except Exception:
+        return "x.xx"  # fallback
 
 
 def main():
@@ -51,7 +60,7 @@ Examples:
                         help='Line Spread Function: FWHM in km/s or path to LSF file')
     
     parser.add_argument('--version', action='version',
-                        version='QASAP v0.10')
+                        version=f'QASAP v{_get_version()}')
     
     args = parser.parse_args()
     

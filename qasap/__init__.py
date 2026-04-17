@@ -1,9 +1,19 @@
 """
 QASAP - Quick & Advanced Spectrum Analysis Package
-Version: 0.10
+Version is read from version.txt for centralized version management.
 """
 
-__version__ = "0.10"
+from pathlib import Path
+
+# Read version from version.txt
+def _get_version():
+    version_file = Path(__file__).parent.parent / 'version.txt'
+    try:
+        return version_file.read_text().strip()
+    except Exception:
+        return "0.11"  # fallback
+
+__version__ = _get_version()
 __author__ = "Erik Solhaug"
 
 from .spectrum_io import SpectrumIO

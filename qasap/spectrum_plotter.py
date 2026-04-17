@@ -1560,7 +1560,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.update_ticks(self.ax)
 
         # Set the custom window title
-        self.fig.canvas.manager.set_window_title("QASAP - Quick Analysis of Spectra and Profiles (v0.11)")
+        from qasap import __version__
+        self.fig.canvas.manager.set_window_title(f"QASAP - Quick Analysis of Spectra and Profiles (v{__version__})")
 
         self.ax.legend(loc='upper right')
 
