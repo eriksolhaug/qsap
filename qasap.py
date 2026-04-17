@@ -12,15 +12,10 @@ License: MIT
 
 import argparse
 import sys
-import numpy as np
 from pathlib import Path
-from PyQt5 import QtWidgets
 
-# Import modular components from qasap package ONLY (no v0.5 dependencies)
-from qasap.spectrum_io import SpectrumIO
-from qasap.spectrum_analysis import SpectrumAnalysis
-from qasap.ui_components import SpectrumPlotter, SpectrumPlotterApp
-from qasap.format_picker_dialog import FormatPickerDialog
+# Minimal imports only - defer heavy dependencies until needed
+# This keeps startup fast for --help, --version, and --detect
 
 # Get version from version.txt
 def _get_version():
@@ -63,6 +58,16 @@ Examples:
                         version=f'QASAP v{_get_version()}')
     
     args = parser.parse_args()
+    
+    # === DEFERRED IMPORTS (lazy load heavy dependencies) ===
+    # These are only imported after argument parsing, so --help and --version are fast
+    import numpy as np
+    from PyQt5 import QtWidgets
+    from qasap.spectrum_io import SpectrumIO
+    from qasap.spectrum_analysis import SpectrumAnalysis
+    from qasap.ui_components import SpectrumPlotter, SpectrumPlotterApp
+    from qasap.format_picker_dialog import FormatPickerDialog
+    # === END DEFERRED IMPORTS ===
     
     # Handle format detection mode
     if args.detect:

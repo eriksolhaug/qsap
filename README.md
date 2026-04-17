@@ -32,20 +32,22 @@ Interactive Python tool for 1D spectral analysis with file format detection. QAS
 
 ### Download
 
-```bash
-git clone https://github.com/eriksolhaug/qasap.git
-```
-
-To **download a specific tagged version** (e.g., v0.9), instead run:
+To **download a specific tagged version** (e.g., v0.11), instead run:
 
 ```bash
 # Clone only the tag (shallow clone, fastest)
-git clone --depth 1 --branch v0.9 https://github.com/eriksolhaug/qasap.git
+git clone --depth 1 --branch v0.11 https://github.com/eriksolhaug/qasap.git
 
 # Or clone the whole repo and checkout the tag
 git clone https://github.com/eriksolhaug/qasap.git
 cd qasap
-git checkout v0.9
+git checkout v0.11
+```
+
+You can download main branch as it is. However, **this is not recommended** as the main branch is actively undergoing development:
+
+```bash
+git clone https://github.com/eriksolhaug/qasap.git
 ```
 
 ### Conda Environment Setup

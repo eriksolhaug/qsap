@@ -2,6 +2,10 @@
 *.key
 qasap_v0.5/*.key
 
+# Working documents (not for repository)
+FORPAPER.md
+CONSOLIDATION*.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

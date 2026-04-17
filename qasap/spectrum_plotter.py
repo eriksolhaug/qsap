@@ -1883,6 +1883,44 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
 
         return left_bound, right_bound
 
+    def _calculate_max_sigma(self, left_bound, right_bound, mean, epsilon=0.05):
+        """
+        Calculate maximum sigma for Gaussian to prevent unphysically broad (flat-top) profiles.
+        
+        Ensures the Gaussian value reaches < epsilon * amplitude at the boundaries.
+        
+        Parameters
+        ----------
+        left_bound : float
+            Left boundary of fitting region
+        right_bound : float
+            Right boundary of fitting region
+        mean : float
+            Center (mean) of the Gaussian
+        epsilon : float
+            Threshold fraction (default 0.05 = 5%)
+            At boundary: G(x) < epsilon * |A|
+            
+        Returns
+        -------
+        sigma_max : float
+            Maximum allowed standard deviation
+            
+        Notes
+        -----
+        Derived from: sigma_max = d / sqrt(-2*ln(epsilon))
+        where d = min distance from mean to boundary
+        This constraint is scale-invariant and works across all flux magnitudes.
+        """
+        # Distance to nearest boundary
+        dist_to_boundary = min(abs(mean - left_bound), abs(mean - right_bound))
+        
+        # Maximum sigma that keeps Gaussian at epsilon*A at boundary
+        # sigma_max = d / sqrt(-2 * ln(epsilon))
+        sigma_max = dist_to_boundary / np.sqrt(-2 * np.log(epsilon))
+        
+        return sigma_max
+
     # Code for EW from Gaussian
     def calculate_equivalent_width(self, profile_function, continuum_params, x_bounds):
         c_in_km_per_s = 2.9979246e5
@@ -4707,11 +4745,17 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
 
                     # --- END NEW GUESS METHOD --- #
                     
-                    # curve_fit with optional sigma (errors)
+                    # Calculate maximum sigma to prevent unphysical broad Gaussians
+                    sigma_max = self._calculate_max_sigma(left_bound, right_bound, mean_guess, epsilon=0.05)
+                    
+                    # Cap the initial stddev guess to stay within bounds (use 50% of max for safety)
+                    initial_guess[2] = min(stddev_guess, sigma_max * 0.5)
+                    
+                    # curve_fit with optional sigma (errors) and constrained sigma bounds
                     if comp_err is not None:
-                        params, pcov = curve_fit(self.gaussian, comp_x, continuum_subtracted_y, sigma=comp_err, p0=initial_guess, bounds=([-np.inf, -np.inf, 0], [np.inf, np.inf, np.inf]))
+                        params, pcov = curve_fit(self.gaussian, comp_x, continuum_subtracted_y, sigma=comp_err, p0=initial_guess, bounds=([-np.inf, -np.inf, 0], [np.inf, np.inf, sigma_max]))
                     else:
-                        params, pcov = curve_fit(self.gaussian, comp_x, continuum_subtracted_y, p0=initial_guess, bounds=([-np.inf, -np.inf, 0], [np.inf, np.inf, np.inf]))
+                        params, pcov = curve_fit(self.gaussian, comp_x, continuum_subtracted_y, p0=initial_guess, bounds=([-np.inf, -np.inf, 0], [np.inf, np.inf, sigma_max]))
                     amp, mean, stddev = params
                     perr = np.sqrt(np.diag(pcov))
                     amp_err, mean_err, stddev_err = perr
@@ -4813,6 +4857,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
 
             # Prepare data for fitting multiple Gaussians, applying continuum subtraction
             initial_guesses = []
+            sigma_maxes = []  # Store sigma_max for each component
             for left_bound, right_bound in bound_pairs:
                 comp_x = self.x_data[(self.x_data >= left_bound) & (self.x_data <= right_bound)]
                 comp_y = self.spec[(self.x_data >= left_bound) & (self.x_data <= right_bound)]
@@ -4844,7 +4889,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     comp_errs.extend(comp_err)
                 continuum_subtracted_ys.extend(continuum_subtracted_y)
                 # Add initial guesses for Gaussian fitting
-                initial_guesses.extend([max(continuum_subtracted_y) - min(continuum_subtracted_y), np.mean(comp_x), np.std(comp_x)]) # NOT SHARED SIGMA
+                mean_guess = np.mean(comp_x)
+                # Calculate max sigma for this component FIRST
+                sigma_max = self._calculate_max_sigma(left_bound, right_bound, mean_guess, epsilon=0.05)
+                sigma_maxes.append(sigma_max)
+                # Cap initial sigma guess to stay within bounds (use 50% of max for safety)
+                sigma_guess = min(np.std(comp_x), sigma_max * 0.5)
+                initial_guesses.extend([max(continuum_subtracted_y) - min(continuum_subtracted_y), mean_guess, sigma_guess]) # NOT SHARED SIGMA
 
             # Fit multiple Gaussians
             if len(comp_xs) > 0:
@@ -4852,7 +4903,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 continuum_subtracted_ys = np.array(continuum_subtracted_ys)
                 # Use sigma if errors available, otherwise None
                 sigma_param = np.array(comp_errs) if comp_errs else None
-                params, pcov = curve_fit(self.multi_gaussian, comp_xs, continuum_subtracted_ys, sigma=sigma_param, p0=initial_guesses) # NOT SHARED SIGMA
+                
+                # Build bounds with sigma constraints for each component
+                num_components = len(bound_pairs)
+                lower_bounds = [-np.inf] * (num_components * 3)
+                upper_bounds = [np.inf] * (num_components * 3)
+                for i, sigma_max in enumerate(sigma_maxes):
+                    lower_bounds[i * 3 + 2] = 0  # sigma >= 0
+                    upper_bounds[i * 3 + 2] = sigma_max  # sigma <= sigma_max
+                
+                params, pcov = curve_fit(self.multi_gaussian, comp_xs, continuum_subtracted_ys, sigma=sigma_param, p0=initial_guesses, bounds=(lower_bounds, upper_bounds)) # NOT SHARED SIGMA
                 perr = np.sqrt(np.diag(pcov))
                 for i in range(0, len(params), 3):
                     amp, mean, stddev = params[i:i+3]
@@ -4861,12 +4921,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     y_fit = self.gaussian(x_fit, amp, mean, stddev) + continuum_ys[i // 3]
                     continuum_sub_data = comp_ys[i // 3] - continuum_ys[i // 3]
                     residuals = continuum_sub_data - self.gaussian(x_fit, amp, mean, stddev)
-                    # Calculate chi2 with optional errors
-                    if comp_errs:
-                        chi2 = np.sum((residuals ** 2) / comp_errs[i // 3]) # Calculate chi2
-                    else:
-                        chi2 = np.sum(residuals ** 2) # Chi2 without errors
-                    chi2_nu = chi2 / (len(x_fit) - len(params))# Calculate chi2 d.o.f.
+                    # Calculate chi2 (simpler without errors since they're concatenated)
+                    chi2 = np.sum(residuals ** 2)  # Chi2 without decomposed errors
+                    chi2_nu = chi2 / (len(x_fit) - 3)  # 3 params per component
                     interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
                     x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                     y_plt = interpolator(x_plt)
@@ -5001,14 +5058,18 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 left_bound, right_bound = sorted(self.bounds)
 
                 # Initial parameters for the Voigt profile fitting
+                # Calculate max sigma to prevent unphysical broad profiles
+                center_guess = np.mean(comp_x)
+                sigma_max = self._calculate_max_sigma(left_bound, right_bound, center_guess, epsilon=0.05)
+                
                 initial_params = Parameters()
                 if np.mean(continuum_subtracted_y) > 0:
                     initial_params.add('amp', value=max(continuum_subtracted_y) - min(continuum_subtracted_y))
                 else:
                     initial_params.add('amp', value=min(continuum_subtracted_y) - max(continuum_subtracted_y))
-                initial_params.add('center', value=np.mean(comp_x))
-                initial_params.add('sigma', value=np.std(comp_x)/10, min=0)  # Constrain sigma to be >= 0
-                initial_params.add('gamma', value=np.std(comp_x)/10, min=0)  # Constrain gamma to be >= 0
+                initial_params.add('center', value=center_guess)
+                initial_params.add('sigma', value=np.std(comp_x)/10, min=0, max=sigma_max)  # Constrain sigma with upper bound
+                initial_params.add('gamma', value=np.std(comp_x)/10, min=0, max=sigma_max)  # Constrain gamma similarly
 
                 # Create the Voigt model and perform the fit
                 voigt_model = Model(self.voigt)
@@ -5221,8 +5282,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     initial_params.add(f'{prefix}center', expr=f"p1_center + {prefix}delta")
                     initial_params.add(f'{prefix}z_comp', expr=f"p1_z_comp")  # Express in terms of centroid of transition wavelength
                 if idx == 0:
-                    initial_params.add(f'{prefix}sigma', value=np.std(comp_x) / 10, min=0.0)
-                    initial_params.add(f'{prefix}gamma', value=np.std(comp_x) / 10, min=0.0)
+                    initial_params.add(f'{prefix}sigma', value=np.std(comp_x) / 10, min=0.0, max=self._calculate_max_sigma(left_bound, right_bound, np.mean(comp_x), epsilon=0.05))
+                    initial_params.add(f'{prefix}gamma', value=np.std(comp_x) / 10, min=0.0, max=self._calculate_max_sigma(left_bound, right_bound, np.mean(comp_x), epsilon=0.05))
                 else:
                     initial_params.add(f'{prefix}sigma', expr='p1_sigma')
                     initial_params.add(f'{prefix}gamma', expr='p1_gamma')
