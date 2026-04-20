@@ -628,8 +628,12 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         if window_obj is None:
             return
         
+        # Handle QDockWidget specially - use toggleViewAction() to restore as docked, not floating
+        if isinstance(window_obj, QtWidgets.QDockWidget):
+            # Use the dock widget's built-in toggle action to restore properly
+            window_obj.toggleViewAction().trigger()
         # Handle matplotlib canvas specially
-        if hasattr(window_obj, 'figure'):
+        elif hasattr(window_obj, 'figure'):
             # It's a matplotlib canvas
             if window_obj.isVisible():
                 window_obj.hide()
