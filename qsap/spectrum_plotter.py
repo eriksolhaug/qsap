@@ -472,7 +472,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     "gaussian": {"color": "red", "linestyle": "--", "linewidth": 1.5},
                     "voigt": {"color": "orange", "linestyle": "--", "linewidth": 1.5},
                     "continuum_line": {"color": "magenta", "linestyle": "--", "linewidth": 1.5},
-                    "continuum_region": {"color": "magenta", "alpha": 0.3, "hatch": "//"},
+                    "continuum_region": {"color": "magenta", "alpha": 0.3},
                     "total_line": {"color": "#003d7a", "linestyle": "-", "linewidth": 2}
                 },
                 "spectrum": {
@@ -658,135 +658,128 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.update_view_menu()
 
     def init_controlpanel(self):
-        # Set main window title and geometry
-        from qsap.ui_utils import get_qsap_icon
-        self.setWindowTitle("QSAP - Control Panel")
-        self.setWindowIcon(get_qsap_icon())
-        self.setGeometry(100, 100, 440, 230)
-
-        # Create redshift input field
-        self.label_redshift = QLabel("Redshift:", self)
-        self.label_redshift.move(20, 30)
-        self.input_redshift = QLineEdit(self)
-        self.input_redshift.move(105, 25)
-        self.input_redshift.resize(100, 30)
-        self.input_redshift.setText(str(self.redshift))  # Set initial redshift value
-
-        # Create fine-tuning buttons for the redshift
-        self.button_redshift_decrease_01 = QPushButton("↓ 0.1", self)
-        self.button_redshift_decrease_01.move(210, 40)
-        self.button_redshift_decrease_01.resize(65, 30)
-        self.button_redshift_decrease_01.clicked.connect(lambda: self.adjust_redshift(-0.1))
-
-        self.button_redshift_decrease_001 = QPushButton("↓ 0.01", self)
-        self.button_redshift_decrease_001.move(275, 40)
-        self.button_redshift_decrease_001.resize(65, 30)
-        self.button_redshift_decrease_001.clicked.connect(lambda: self.adjust_redshift(-0.01))
-
-        self.button_redshift_decrease_0001 = QPushButton("↓ 0.001", self)
-        self.button_redshift_decrease_0001.move(345, 40)
-        self.button_redshift_decrease_0001.resize(75, 30)
-        self.button_redshift_decrease_0001.clicked.connect(lambda: self.adjust_redshift(-0.001))
-
-        self.button_redshift_increase_01 = QPushButton("↑ 0.1", self)
-        self.button_redshift_increase_01.move(210, 10)
-        self.button_redshift_increase_01.resize(65, 30)
-        self.button_redshift_increase_01.clicked.connect(lambda: self.adjust_redshift(0.1))
-
-        self.button_redshift_increase_001 = QPushButton("↑ 0.01", self)
-        self.button_redshift_increase_001.move(275, 10)
-        self.button_redshift_increase_001.resize(65, 30)
-        self.button_redshift_increase_001.clicked.connect(lambda: self.adjust_redshift(0.01))
-
-        self.button_redshift_increase_0001 = QPushButton("↑ 0.001", self)
-        self.button_redshift_increase_0001.move(345, 10)
-        self.button_redshift_increase_0001.resize(75, 30)
+        # Create a container widget for control panel
+        control_panel_container = QtWidgets.QWidget()
+        control_panel_layout = QVBoxLayout()
+        control_panel_layout.setContentsMargins(10, 10, 10, 10)
+        control_panel_layout.setSpacing(5)
+        
+        # Redshift section
+        redshift_group = QtWidgets.QGroupBox("Redshift")
+        redshift_layout = QHBoxLayout()
+        
+        self.label_redshift = QLabel("Value:")
+        self.input_redshift = QLineEdit()
+        self.input_redshift.setText(str(self.redshift))
+        self.input_redshift.setMaximumWidth(80)
+        
+        # Redshift adjustment buttons
+        self.button_redshift_increase_0001 = QPushButton("↑ 0.001")
+        self.button_redshift_increase_0001.setMaximumWidth(75)
         self.button_redshift_increase_0001.clicked.connect(lambda: self.adjust_redshift(0.001))
-
-        # Create zoom factor input field
-        self.label_zoom = QLabel("Zoom Factor:", self)
-        self.label_zoom.move(20, 80)
-        self.input_zoom = QLineEdit(self)
-        self.input_zoom.move(105, 75)
-        self.input_zoom.resize(100, 30)
-        self.input_zoom.setText(str(self.zoom_factor))  # Set initial zoom factor
-        zoom_validator = QDoubleValidator(0.001, 0.4, 3, self)  # (min, max, decimals)
-        self.input_zoom.setValidator(zoom_validator)
-
-        # Connect pressing "Enter" in the input field to apply changes
+        
+        self.button_redshift_increase_001 = QPushButton("↑ 0.01")
+        self.button_redshift_increase_001.setMaximumWidth(75)
+        self.button_redshift_increase_001.clicked.connect(lambda: self.adjust_redshift(0.01))
+        
+        self.button_redshift_increase_01 = QPushButton("↑ 0.1")
+        self.button_redshift_increase_01.setMaximumWidth(75)
+        self.button_redshift_increase_01.clicked.connect(lambda: self.adjust_redshift(0.1))
+        
+        self.button_redshift_decrease_0001 = QPushButton("↓ 0.001")
+        self.button_redshift_decrease_0001.setMaximumWidth(75)
+        self.button_redshift_decrease_0001.clicked.connect(lambda: self.adjust_redshift(-0.001))
+        
+        self.button_redshift_decrease_001 = QPushButton("↓ 0.01")
+        self.button_redshift_decrease_001.setMaximumWidth(75)
+        self.button_redshift_decrease_001.clicked.connect(lambda: self.adjust_redshift(-0.01))
+        
+        self.button_redshift_decrease_01 = QPushButton("↓ 0.1")
+        self.button_redshift_decrease_01.setMaximumWidth(75)
+        self.button_redshift_decrease_01.clicked.connect(lambda: self.adjust_redshift(-0.1))
+        
+        redshift_layout.addWidget(self.label_redshift)
+        redshift_layout.addWidget(self.input_redshift)
+        redshift_layout.addWidget(self.button_redshift_increase_0001)
+        redshift_layout.addWidget(self.button_redshift_increase_001)
+        redshift_layout.addWidget(self.button_redshift_increase_01)
+        redshift_layout.addWidget(self.button_redshift_decrease_0001)
+        redshift_layout.addWidget(self.button_redshift_decrease_001)
+        redshift_layout.addWidget(self.button_redshift_decrease_01)
+        redshift_group.setLayout(redshift_layout)
+        
         self.input_redshift.returnPressed.connect(self.apply_changes)
-        self.input_zoom.returnPressed.connect(self.apply_changes)
-
-        # Create an "Apply" button
-        self.apply_button = QPushButton("Enter", self)
-        self.apply_button.move(20, 120)
-        self.apply_button.resize(75, 30)
+        
+        # Action buttons
+        button_layout = QHBoxLayout()
+        
+        self.apply_button = QPushButton("Apply")
         self.apply_button.clicked.connect(self.apply_changes)
         
-        # Create a "Load Spectrum..." button to load a new spectrum
-        self.open_button = QPushButton("Load Spectrum...", self)
-        self.open_button.move(120, 120)
-        self.open_button.resize(143, 30)
+        self.open_button = QPushButton("Load Spectrum...")
         self.open_button.clicked.connect(self.open_spectrum_file)
         
-        # Create a "Load Fit..." button to load saved fits
-        self.load_fit_button = QPushButton("Load Fit...", self)
-        self.load_fit_button.move(270, 120)
-        self.load_fit_button.resize(130, 30)
+        self.load_fit_button = QPushButton("Load Fit...")
         self.load_fit_button.clicked.connect(self.load_fit_file)
         
-        # Create a separator line
-        self.separator_line = QtWidgets.QFrame(self)
-        self.separator_line.setGeometry(20, 155, 380, 2)
-        self.separator_line.setFrameShape(QtWidgets.QFrame.HLine)
-        self.separator_line.setFrameShadow(QtWidgets.QFrame.Sunken)
+        button_layout.addWidget(self.apply_button)
+        button_layout.addWidget(self.open_button)
+        button_layout.addWidget(self.load_fit_button)
         
-        # Create a "Quit" button (positioned below Enter with spacing)
-        self.quit_button = QPushButton("Quit", self)
-        self.quit_button.move(20, 165)
-        self.quit_button.clicked.connect(self.quit_application)
+        # Undo/Redo buttons
+        undo_redo_layout = QHBoxLayout()
         
-        # Create "Undo" button (to the right of Quit with spacing)
-        self.undo_button = QPushButton("← Undo", self)
-        self.undo_button.move(120, 165)
-        self.undo_button.resize(75, 30)
+        self.undo_button = QPushButton("← Undo")
         self.undo_button.clicked.connect(self.on_undo)
         
-        # Create "Redo" button (to the right of Undo)
-        self.redo_button = QPushButton("Redo →", self)
-        self.redo_button.move(220, 165)
-        self.redo_button.resize(75, 30)
+        self.redo_button = QPushButton("Redo →")
         self.redo_button.clicked.connect(self.on_redo)
         
-        # Expand window height to accommodate new layout
-        self.setGeometry(100, 100, 550, 220)
-
-        # Create a separator line between Quit and Poly Order (hidden by default)
-        self.separator_line_poly = QtWidgets.QFrame(self)
-        self.separator_line_poly.setGeometry(20, 200, 380, 2)
-        self.separator_line_poly.setFrameShape(QtWidgets.QFrame.HLine)
-        self.separator_line_poly.setFrameShadow(QtWidgets.QFrame.Sunken)
-        self.separator_line_poly.hide()
-
-        # Create polynomial order field (for continuum fitting, hidden by default)
-        self.label_poly_order = QLabel("Poly Order:", self)
-        self.label_poly_order.move(20, 210)
-        self.label_poly_order.hide()
-        self.input_poly_order = QLineEdit(self)
-        self.input_poly_order.move(105, 205)
-        self.input_poly_order.resize(100, 30)
-        self.input_poly_order.setText("1")  # Default to first-order polynomial
-        self.input_poly_order.hide()
+        self.quit_button = QPushButton("Quit")
+        self.quit_button.clicked.connect(self.quit_application)
+        
+        undo_redo_layout.addWidget(self.undo_button)
+        undo_redo_layout.addWidget(self.redo_button)
+        undo_redo_layout.addWidget(self.quit_button)
+        
+        # Polynomial order (hidden by default)
+        poly_layout = QHBoxLayout()
+        self.label_poly_order = QLabel("Poly Order:")
+        self.input_poly_order = QLineEdit()
+        self.input_poly_order.setText("1")
+        self.input_poly_order.setMaximumWidth(60)
         poly_validator = QIntValidator(0, 10, self)
         self.input_poly_order.setValidator(poly_validator)
+        poly_layout.addWidget(self.label_poly_order)
+        poly_layout.addWidget(self.input_poly_order)
+        poly_layout.addStretch()
         
-        self.poly_order = 1  # Store the current polynomial order
+        poly_group_widget = QtWidgets.QWidget()
+        poly_group_widget.setLayout(poly_layout)
+        poly_group_widget.hide()
+        self.poly_order_widget = poly_group_widget
+        self.poly_order = 1
         
-        # Expand window height to accommodate poly order field when shown
-        self.setGeometry(100, 100, 440, 250)
-
-        # Show the window
-        self.show()
+        # Add all sections to main layout
+        control_panel_layout.addWidget(redshift_group)
+        control_panel_layout.addLayout(button_layout)
+        control_panel_layout.addLayout(undo_redo_layout)
+        control_panel_layout.addWidget(self.poly_order_widget)
+        control_panel_layout.addStretch()
+        
+        control_panel_container.setLayout(control_panel_layout)
+        
+        # Create dock widget for control panel at top left
+        self.control_panel_dock = QtWidgets.QDockWidget("Control Panel", self)
+        self.control_panel_dock.setAllowedAreas(QtCore.Qt.TopDockWidgetArea | QtCore.Qt.LeftDockWidgetArea)
+        self.control_panel_dock.setWidget(control_panel_container)
+        self.addDockWidget(QtCore.Qt.TopDockWidgetArea, self.control_panel_dock)
+        
+        # Set window properties
+        from qsap.ui_utils import get_qsap_icon
+        self.setWindowTitle("QSAP")
+        self.setWindowIcon(get_qsap_icon())
+        self.setGeometry(100, 100, 1200, 700)
 
     def adjust_redshift(self, delta):
         """Adjust redshift by a specified delta value and update the input field."""
@@ -1633,8 +1626,12 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.item_tracker.item_individually_deselected.connect(self.on_item_individually_deselected_from_tracker)
         self.item_tracker.item_deselected.connect(self.on_item_deselected_from_tracker)
         self.item_tracker.estimate_redshift.connect(self.on_estimate_redshift_from_tracker)
-        self.item_tracker.setGeometry(1100, 700, 650, 350)  # Position on the right side
-        self.item_tracker.show()
+        
+        # Create dock widget for item tracker at top right
+        self.item_tracker_dock = QtWidgets.QDockWidget("Item Tracker", self)
+        self.item_tracker_dock.setAllowedAreas(QtCore.Qt.TopDockWidgetArea | QtCore.Qt.RightDockWidgetArea)
+        self.item_tracker_dock.setWidget(self.item_tracker)
+        self.addDockWidget(QtCore.Qt.TopDockWidgetArea, self.item_tracker_dock)
 
         # Connect Fit Information window signals
         self.fit_information_window.item_selected.connect(self.on_fit_info_item_selected)
@@ -2379,7 +2376,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     vel_end = self.wav_to_vel(wav_end_angstrom, self.rest_wavelength, z=self.redshift)
                 patch_data['patch'].remove()
                 continuum_region_cfg = self.colors['profiles']['continuum_region']
-                new_patch = self.ax.axvspan(vel_start, vel_end, color=continuum_region_cfg['color'], alpha=continuum_region_cfg['alpha'], hatch=continuum_region_cfg['hatch'])
+                new_patch = self.ax.axvspan(vel_start, vel_end, color=continuum_region_cfg['color'], alpha=continuum_region_cfg['alpha'])
                 patch_data['patch'] = new_patch
 
         # Convert Gaussian fits to velocity space
@@ -2453,7 +2450,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     wav_start, wav_end = patch_data['bounds']
                 patch_data['patch'].remove()
                 continuum_region_cfg = self.colors['profiles']['continuum_region']
-                new_patch = self.ax.axvspan(wav_start, wav_end, color=continuum_region_cfg['color'], alpha=continuum_region_cfg['alpha'], hatch=continuum_region_cfg['hatch'])
+                new_patch = self.ax.axvspan(wav_start, wav_end, color=continuum_region_cfg['color'], alpha=continuum_region_cfg['alpha'])
                 patch_data['patch'] = new_patch
 
         # Convert Gaussian fits back to wavelength space
