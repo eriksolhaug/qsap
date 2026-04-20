@@ -157,7 +157,9 @@ class OutputPanel(QtWidgets.QWidget):
         # Create text display area
         self.text_edit = QtWidgets.QPlainTextEdit()
         self.text_edit.setReadOnly(True)
-        self.text_edit.setMaximumHeight(100)  # Set reasonable height
+        # Set size policy to expand to fill available space
+        self.text_edit.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.text_edit.setMinimumHeight(100)  # Set minimum height instead of maximum
         self.text_edit.setStyleSheet("""
             QPlainTextEdit {
                 background-color: #f5f5f5;
@@ -170,6 +172,8 @@ class OutputPanel(QtWidgets.QWidget):
         
         layout.addWidget(self.text_edit)
         self.setLayout(layout)
+        # Set the OutputPanel itself to expand
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
     
     def append_text(self, text):
         """Append text to the output panel."""
