@@ -1,5 +1,5 @@
 """
-ActionHistory - Undo/Redo system for QASAP
+ActionHistory - Undo/Redo system for QSAP
 Tracks all major actions and allows navigation through history
 """
 

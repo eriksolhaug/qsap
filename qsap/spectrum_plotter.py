@@ -1,4 +1,4 @@
-# qasap Spectrum Plotter --- v0.11
+# qsap Spectrum Plotter --- v0.12
 """
 Main spectrum plotter widget for interactive spectral analysis
 
@@ -68,7 +68,7 @@ Display Options (Line Lists):
 
 File Storage:
   All saved screenshots, redshifts, and profile info are stored in the directory
-  where QASAP was launched from.
+  where QSAP was launched from.
 """
 
 import argparse
@@ -98,7 +98,7 @@ from PyQt5.QtWidgets import QFileDialog
 from datetime import datetime
 import ast
 import re
-from qasap.spectrum_io import SpectrumIO
+from qsap.spectrum_io import SpectrumIO
 
 # Suppress numexpr pandas UserWarning
 warnings.filterwarnings('ignore', category=UserWarning, module='pandas.core.computation.expressions')
@@ -192,9 +192,9 @@ class HelpWindow(QtWidgets.QDialog):
     """Help window displaying all keyboard shortcuts."""
     def __init__(self, parent=None):
         super().__init__(parent)
-        from qasap.ui_utils import get_qasap_icon
-        self.setWindowTitle("QASAP - Keyboard Shortcuts Help")
-        self.setWindowIcon(get_qasap_icon())
+        from qsap.ui_utils import get_qsap_icon
+        self.setWindowTitle("QSAP - Keyboard Shortcuts Help")
+        self.setWindowIcon(get_qsap_icon())
         self.setGeometry(200, 200, 800, 600)
         
         layout = QVBoxLayout()
@@ -213,7 +213,7 @@ class HelpWindow(QtWidgets.QDialog):
         self.setLayout(layout)
     
     def get_help_text(self):
-        return """# QASAP Keyboard Shortcuts
+        return """# QSAP Keyboard Shortcuts
 
 ## Navigation & View Controls
 - **[** / **]** - Pan left/right through spectrum
@@ -266,13 +266,13 @@ class HelpWindow(QtWidgets.QDialog):
 - **Z** - Toggle Fit Information window (shows detailed parameters for all fitted profiles)
 
 ## Application Control
-- **q** or **Q** - Quit QASAP
+- **q** or **Q** - Quit QSAP
 
 ## Help
 - **?** - Show this help window
 
 ## File Storage
-All saved screenshots, redshifts, and profile info are stored in the directory where QASAP was launched from.
+All saved screenshots, redshifts, and profile info are stored in the directory where QSAP was launched from.
 """
     
     def keyPressEvent(self, event):
@@ -450,16 +450,45 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Active line lists tracking (resources_dir and line_list_selector already initialized earlier)
         self.active_line_lists = []  # {linelist: LineList, color: str}
         self.current_linelist_lines = []  # Store plotted linelist lines for removal
+        
+        # Load color configuration
+        self.colors = self._load_color_config()
+
+    def _load_color_config(self):
+        """Load color configuration from config_colors.json"""
+        import json
+        config_path = Path(__file__).parent / 'config_colors.json'
+        try:
+            with open(config_path, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            # Fallback to hardcoded defaults if config file not found
+            return {
+                "profiles": {
+                    "gaussian": {"color": "red", "linestyle": "--", "linewidth": 1.5},
+                    "voigt": {"color": "orange", "linestyle": "--", "linewidth": 1.5},
+                    "continuum_line": {"color": "magenta", "linestyle": "--", "linewidth": 1.5},
+                    "continuum_region": {"color": "magenta", "alpha": 0.3, "hatch": "//"},
+                    "total_line": {"color": "#003d7a", "linestyle": "-", "linewidth": 2}
+                },
+                "spectrum": {
+                    "data": {"color": "black", "linestyle": "-"},
+                    "error": {"color": "red", "linestyle": "--", "alpha": 0.4}
+                },
+                "residual": {"color": "royalblue", "linestyle": "-"},
+                "preview": {"color": "lime", "linestyle": "-", "linewidth": 2},
+                "reference_lines": {"color": "gray", "linestyle": "--", "linewidth": 1}
+            }
 
     def create_menu_bar(self):
-        """Create the menu bar with Qasap, File, Edit, and View menus"""
+        """Create the menu bar with QSAP, File, Edit, and View menus"""
         menubar = self.menuBar()
         
-        # Create Qasap menu (application menu on macOS)
-        self.qasap_menu = menubar.addMenu("Qasap")
+        # Create QSAP menu (application menu on macOS)
+        self.qsap_menu = menubar.addMenu("QSAP")
         
-        # Add Quit action to Qasap menu
-        quit_action = self.qasap_menu.addAction("Quit QASAP")
+        # Add Quit action to QSAP menu
+        quit_action = self.qsap_menu.addAction("Quit QSAP")
         quit_action.setShortcut("Cmd+Q")
         quit_action.triggered.connect(self.quit_application)
         
@@ -544,6 +573,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 is_visible = self.listfit_window.isVisible()
                 windows.append(("Listfit", self.listfit_window, is_visible))
         
+        # Add Right Dock Widget (Fitting Options)
+        if hasattr(self, 'right_dock_widget') and self.right_dock_widget is not None:
+            is_visible = self.right_dock_widget.isVisible()
+            windows.append(("Fitting Menu", self.right_dock_widget, is_visible))
+        
+        # Add Bottom Dock Widget (Terminal/Output)
+        if hasattr(self, 'bottom_dock_widget') and self.bottom_dock_widget is not None:
+            is_visible = self.bottom_dock_widget.isVisible()
+            windows.append(("Terminal", self.bottom_dock_widget, is_visible))
+        
         # Add each window as a checkable menu item with visual indicator
         for window_name, window_obj, is_visible in windows:
             action = self.view_menu.addAction(window_name)
@@ -561,19 +600,19 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
     def _create_help_window(self):
         """Create the Help window if it doesn't exist"""
         try:
-            from qasap.help_window import HelpWindow
+            from qsap.help_window import HelpWindow
             self.help_window = HelpWindow()
         except Exception as e:
-            print(f"Could not create Help window: {e}")
+            pass  # Silently skip if help_window module not available
     
     def _create_line_list_selector(self):
         """Create the Line List Selector if it doesn't exist"""
         try:
-            from qasap.line_list_selector import LineListSelector
+            from qsap.line_list_selector import LineListSelector
             self.line_list_selector = LineListSelector(self.resources_dir)
             self.line_list_selector.line_lists_changed.connect(self.on_line_lists_changed)
         except Exception as e:
-            print(f"Could not create Line List Selector: {e}")
+            pass  # Silently skip if line_list_selector module not available
     
     def _create_listfit_window(self):
         """Create the Listfit window if it doesn't exist"""
@@ -612,9 +651,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
 
     def init_controlpanel(self):
         # Set main window title and geometry
-        from qasap.ui_utils import get_qasap_icon
-        self.setWindowTitle("QASAP - Control Panel")
-        self.setWindowIcon(get_qasap_icon())
+        from qsap.ui_utils import get_qsap_icon
+        self.setWindowTitle("QSAP - Control Panel")
+        self.setWindowIcon(get_qsap_icon())
         self.setGeometry(100, 100, 440, 230)
 
         # Create redshift input field
@@ -793,7 +832,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
     def open_spectrum_file(self):
         """Open a file dialog to select and load a new spectrum file."""
         from PyQt5.QtWidgets import QFileDialog, QMessageBox
-        from qasap.format_picker_dialog import FormatPickerDialog
+        from qsap.format_picker_dialog import FormatPickerDialog
         
         dialog = QFileDialog(
             self,
@@ -881,7 +920,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self,
             "Load Fit File",
             "",
-            "QASAP Fit Files (qasap_fits_*.csv gaussian_fits_*.csv voigt_fits_*.csv continuum_fits_*.csv listfit_polynomials_*.csv);;CSV Files (*.csv);;All Files (*)"
+            "QSAP Fit Files (qsap_fits_*.csv gaussian_fits_*.csv voigt_fits_*.csv continuum_fits_*.csv listfit_polynomials_*.csv);;CSV Files (*.csv);;All Files (*)"
         )
         dialog.setFileMode(QFileDialog.ExistingFile)
         
@@ -939,12 +978,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     else:
                         existing_continuum = np.zeros_like(x_plot)
                     y_plot = self.gaussian(x_plot, fit['amp'], fit['mean'], fit['stddev']) + existing_continuum
-                    fit['line'], = self.ax.plot(x_plot, y_plot, color="red", linestyle='--')
+                    gaussian_color = self.colors['profiles']['gaussian']
+                    fit['line'], = self.ax.plot(x_plot, y_plot, color=gaussian_color['color'], linestyle=gaussian_color['linestyle'])
                     
                     # Register with item tracker - use saved name if available
                     name = fit.get('_tracker_name') or f"Gaussian (μ={fit['mean']:.1f}, σ={fit['stddev']:.1f})"
                     self.register_item('gaussian', name, fit_dict=fit, line_obj=fit['line'], 
-                                     color='red', bounds=fit['bounds'])
+                                     color=gaussian_color['color'], bounds=fit['bounds'])
                 except Exception as e:
                     print(f"Error redrawing Gaussian fit: {e}")
         
@@ -959,12 +999,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     else:
                         existing_continuum = np.zeros_like(x_plot)
                     y_plot = self.voigt(x_plot, fit['amp'], fit['center'], fit['sigma'], fit['gamma']) + existing_continuum
-                    fit['line'], = self.ax.plot(x_plot, y_plot, color="orange", linestyle='--')
+                    voigt_color = self.colors['profiles']['voigt']
+                    fit['line'], = self.ax.plot(x_plot, y_plot, color=voigt_color['color'], linestyle=voigt_color['linestyle'])
                     
                     # Register with item tracker - use saved name if available
                     name = fit.get('_tracker_name') or f"Voigt (c={fit['center']:.1f}, σ={fit['sigma']:.1f}, γ={fit['gamma']:.1f})"
                     self.register_item('voigt', name, fit_dict=fit, line_obj=fit['line'],
-                                     color='orange', bounds=fit['bounds'])
+                                     color=voigt_color['color'], bounds=fit['bounds'])
                 except Exception as e:
                     print(f"Error redrawing Voigt fit: {e}")
         
@@ -974,12 +1015,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 try:
                     x_plot = np.linspace(fit['bounds'][0], fit['bounds'][1], 100)
                     y_plot = fit['a'] * x_plot + fit['b']
-                    fit['line'], = self.ax.plot(x_plot, y_plot, color="magenta", linestyle='--')
+                    continuum_color = self.colors['profiles']['continuum_line']
+                    fit['line'], = self.ax.plot(x_plot, y_plot, color=continuum_color['color'], linestyle=continuum_color['linestyle'])
                     
                     # Register with item tracker - use saved name if available
                     name = fit.get('_tracker_name') or f"Continuum (a={fit['a']:.2e}, b={fit['b']:.2f})"
                     self.register_item('continuum', name, fit_dict=fit, line_obj=fit['line'],
-                                     color='magenta', bounds=fit['bounds'])
+                                     color=continuum_color['color'], bounds=fit['bounds'])
                 except Exception as e:
                     print(f"Error redrawing continuum fit: {e}")
         
@@ -1086,8 +1128,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                                 eval_params[param_name].value = param_value
                         
                         y_plot = composite.eval(eval_params, x=x_plot)
-                        # Use the standard listfit color: #003d7a (dark blue)
-                        listfit_line, = self.ax.plot(x_plot, y_plot, label='Total Listfit', color='#003d7a', linestyle='-', linewidth=2)
+                        # Use the standard listfit color from config
+                        total_color = self.colors['profiles']['total_line']
+                        listfit_line, = self.ax.plot(x_plot, y_plot, label='Total Listfit', color=total_color['color'], linestyle=total_color['linestyle'], linewidth=total_color['linewidth'])
                         listfit['line'] = listfit_line
                         
                         # Register with item tracker - use saved name if available
@@ -1095,7 +1138,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         chi2 = listfit.get('quality_metrics', {}).get('chisqr', 0)
                         name = listfit.get('_tracker_name') or f"Total Listfit ({n_components} components, χ²={chi2:.2f})"
                         self.register_item('listfit_total', name, fit_dict=listfit, line_obj=listfit_line,
-                                         color='#003d7a', bounds=bounds)
+                                         color=total_color['color'], bounds=bounds)
             except Exception as e:
                 print(f"Error redrawing listfit composite: {e}")
                 import traceback
@@ -1238,7 +1281,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 filename = os.path.basename(self.initial_spectrum_file)
                 self.record_action('load_spectrum', f'Load Spectrum: {filename}')
             else:
-                self.record_action('open_qasap', 'Open qasap')
+                self.record_action('open_qsap', 'Open qsap')
             self.is_first_load = False
         else:
             # Record subsequent spectrum loads from GUI
@@ -1346,7 +1389,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         return f"Wavelength ({self.wavelength_unit})"
 
     def quit_application(self):
-        """Quit the QASAP application"""
+        """Quit the QSAP application"""
         QtWidgets.QApplication.quit()
 
     def clear_plot_and_reset(self):
@@ -1386,7 +1429,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         if self.fits_file:
             title = Path(self.fits_file).name
         else:
-            title = "QASAP - Load a Spectrum to Begin"
+            title = "QSAP - Load a Spectrum to Begin"
 
         # File handling based on flag - only read from file if not already loaded via GUI
         if self.fits_file and not self.data_loaded_from_gui:
@@ -1530,13 +1573,15 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.ax.clear()
         
         # Plot the spectrum
-        self.step_spec, = self.ax.step(self.x_data, self.spec, label='Data', color='black', where='mid')
-        self.line_spec, = self.ax.plot(self.x_data, self.spec, color='black', visible=False)
+        data_cfg = self.colors['spectrum']['data']
+        error_cfg = self.colors['spectrum']['error']
+        self.step_spec, = self.ax.step(self.x_data, self.spec, label='Data', color=data_cfg['color'], where='mid')
+        self.line_spec, = self.ax.plot(self.x_data, self.spec, color=data_cfg['color'], visible=False)
         
         # Only plot error if errors exist
         if self.err is not None:
-            self.step_error, = self.ax.step(self.x_data, self.err, color='red', linestyle='--', alpha=0.4, label='Error', where='mid')
-            self.line_error, = self.ax.plot(self.x_data, self.err, color='red', linestyle='--', alpha=0.4, visible=False)
+            self.step_error, = self.ax.step(self.x_data, self.err, color=error_cfg['color'], linestyle=error_cfg['linestyle'], alpha=error_cfg['alpha'], label='Error', where='mid')
+            self.line_error, = self.ax.plot(self.x_data, self.err, color=error_cfg['color'], linestyle=error_cfg['linestyle'], alpha=error_cfg['alpha'], visible=False)
             self.error_line = self.step_error if self.is_step_plot else self.line_error
         else:
             self.step_error = None
@@ -1544,7 +1589,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.error_line = None
         
         self.spectrum_line = self.step_spec if self.is_step_plot else self.line_spec
-        self.ax.plot(self.x_data, [0] * len(self.x_data), color='gray', linestyle='--', linewidth=1) # Add horizontal line at y=0
+        ref_cfg = self.colors['reference_lines']
+        self.ax.plot(self.x_data, [0] * len(self.x_data), color=ref_cfg['color'], linestyle=ref_cfg['linestyle'], linewidth=ref_cfg['linewidth']) # Add horizontal line at y=0
         self.ax.set_xlabel(self._get_wavelength_unit_label())
         self.ax.set_ylabel(r'Flux (arbitrary units)') # Use arbitrary units instead
         # self.ax.set_ylabel(r'Flux (erg s$^{-1}$ cm$^{-2}$ Å$^{-1}$)')
@@ -1560,8 +1606,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.update_ticks(self.ax)
 
         # Set the custom window title
-        from qasap import __version__
-        self.fig.canvas.manager.set_window_title(f"QASAP - Quick Analysis of Spectra and Profiles (v{__version__})")
+        from qsap import __version__
+        self.fig.canvas.manager.set_window_title(f"QSAP - Quick Spectrum Analysis Program (v{__version__})")
 
         self.ax.legend(loc='upper right')
 
@@ -1590,10 +1636,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Set icon for the matplotlib figure window
         if hasattr(self.fig, 'canvas') and hasattr(self.fig.canvas, 'manager'):
             if hasattr(self.fig.canvas.manager, 'window'):
-                logo_path = Path(__file__).parent.parent / 'logo' / 'qasap_logo.png'
+                logo_path = Path(__file__).parent.parent / 'logo' / 'qsap_logo.png'
                 if logo_path.exists():
                     self.fig.canvas.manager.window.setWindowIcon(QIcon(str(logo_path)))
-                self.fig.canvas.manager.window.setWindowTitle("QASAP - Spectrum Viewer")
+                self.fig.canvas.manager.window.setWindowTitle("QSAP - Spectrum Viewer")
 
         # Update the View menu now that the spectrum plotter figure has been created
         self.update_view_menu()
@@ -1605,7 +1651,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             
             if hasattr(self.fig.canvas, 'manager') and hasattr(self.fig.canvas.manager, 'window'):
                 mpl_window = self.fig.canvas.manager.window
-                mpl_window.setWindowTitle("QASAP - Spectrum Viewer")
+                mpl_window.setWindowTitle("QSAP - Spectrum Viewer")
                 
                 # Integrate output panel with matplotlib window
                 import time
@@ -1623,15 +1669,84 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 # Add matplotlib canvas to top (with more space)
                 wrapper_layout.addWidget(original_canvas, stretch=1)
                 
-                # Add output panel to bottom
-                wrapper_layout.addWidget(self.output_panel, stretch=0)
-                
                 # Set wrapper as central widget
                 wrapper_widget.setLayout(wrapper_layout)
                 mpl_window.setCentralWidget(wrapper_widget)
+                
+                # Add output panel as a bottom dock widget
+                self.setup_bottom_dock(mpl_window)
+                
+                # Add right dock widget for controls
+                self.setup_right_dock(mpl_window)
+                
+                # Refresh the View menu to include the new dock widget
+                self.update_view_menu()
 
         self.fig.canvas.setFocus() # Removed this because it was not needed
         self.fig.canvas.draw() # Removed this because it was not needed
+
+    def setup_right_dock(self, mpl_window):
+        """Create and setup the right dock widget for controls"""
+        # Create dock widget
+        dock_widget = QtWidgets.QDockWidget("Options", mpl_window)
+        dock_widget.setAllowedAreas(QtCore.Qt.RightDockWidgetArea | QtCore.Qt.LeftDockWidgetArea)
+        
+        # Create placeholder content for the dock
+        dock_content = QtWidgets.QWidget()
+        dock_layout = QtWidgets.QVBoxLayout()
+        
+        # Add placeholder label
+        placeholder_label = QtWidgets.QLabel("Fitting Options Panel")
+        placeholder_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+        dock_layout.addWidget(placeholder_label)
+        
+        # Add some spacing
+        dock_layout.addSpacing(20)
+        
+        # Add placeholder text
+        placeholder_text = QtWidgets.QLabel(
+            "This panel will contain:\n"
+            "• Fitting mode buttons\n"
+            "• Configuration options\n"
+            "• Parameter controls\n\n"
+            "(Functionality coming soon...)"
+        )
+        placeholder_text.setStyleSheet("color: gray; font-size: 10px;")
+        placeholder_text.setWordWrap(True)
+        dock_layout.addWidget(placeholder_text)
+        
+        # Add stretch to push content to top
+        dock_layout.addStretch()
+        
+        dock_content.setLayout(dock_layout)
+        dock_widget.setWidget(dock_content)
+        
+        # Set minimum width for the dock
+        dock_widget.setMinimumWidth(200)
+        
+        # Add dock widget to the right side
+        mpl_window.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock_widget)
+        
+        # Store reference for potential future updates
+        self.right_dock_widget = dock_widget
+
+    def setup_bottom_dock(self, mpl_window):
+        """Create and setup the bottom dock widget for output terminal"""
+        # Create dock widget
+        dock_widget = QtWidgets.QDockWidget("Terminal", mpl_window)
+        dock_widget.setAllowedAreas(QtCore.Qt.BottomDockWidgetArea | QtCore.Qt.TopDockWidgetArea)
+        
+        # Set the output panel as the dock widget's content
+        dock_widget.setWidget(self.output_panel)
+        
+        # Set minimum height for the dock
+        dock_widget.setMinimumHeight(100)
+        
+        # Add dock widget to the bottom
+        mpl_window.addDockWidget(QtCore.Qt.BottomDockWidgetArea, dock_widget)
+        
+        # Store reference for potential future updates
+        self.bottom_dock_widget = dock_widget
 
     def read_lines(self):
         # Read spectral lines from file
@@ -1689,7 +1804,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.lsf_kernel_x = np.linspace(-4 * sigma, 4 * sigma, kernel_size)
             self.lsf_kernel_y = np.exp(-0.5 * (self.lsf_kernel_x / sigma)**2)
             self.lsf_kernel_y /= np.sum(self.lsf_kernel_y)  # Normalize to sum to 1
-            print(f"Using Gaussian LSF with FWHM {lsf_width} km/s.")
+            # print(f"Using Gaussian LSF with FWHM {lsf_width} km/s.")
         
         except ValueError:
             # Otherwise, assume `lsf` is a file path
@@ -1964,8 +2079,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Clear previous lines before plotting new ones
         self.residual_ax.clear()
         # Update plot
-        self.residual_line, = self.residual_ax.step(self.x_data, self.residuals, color='royalblue', where='mid')
-        self.residual_ax.plot(self.x_data, [0] * len(self.x_data), color='gray', linestyle='--', linewidth=1) # Add horizontal line at y=0
+        residual_cfg = self.colors['residual']
+        ref_cfg = self.colors['reference_lines']
+        self.residual_line, = self.residual_ax.step(self.x_data, self.residuals, color=residual_cfg['color'], where='mid')
+        self.residual_ax.plot(self.x_data, [0] * len(self.x_data), color=ref_cfg['color'], linestyle=ref_cfg['linestyle'], linewidth=ref_cfg['linewidth']) # Add horizontal line at y=0
         # Restore labels after clear
         if self.is_velocity_mode:
             self.residual_ax.set_xlabel(r"Velocity (km s$^{-1}$)")
@@ -2235,7 +2352,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.line_error.set_xdata(self.x_data)
         self.line_spec.set_xdata(self.x_data)
         self.ax.set_xlabel(r"Velocity (km s$^{-1}$)")
-        self.ax.plot(self.x_data, [0] * len(self.x_data), color='gray', linestyle='--', linewidth=1)
+        ref_cfg = self.colors['reference_lines']
+        self.ax.plot(self.x_data, [0] * len(self.x_data), color=ref_cfg['color'], linestyle=ref_cfg['linestyle'], linewidth=ref_cfg['linewidth'])
 
         # Update continuum fits to velocity space
         for fit in self.continuum_fits:
@@ -2252,7 +2370,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     vel_start = self.wav_to_vel(wav_start_angstrom, self.rest_wavelength, z=self.redshift)
                     vel_end = self.wav_to_vel(wav_end_angstrom, self.rest_wavelength, z=self.redshift)
                 patch_data['patch'].remove()
-                new_patch = self.ax.axvspan(vel_start, vel_end, color='magenta', alpha=0.3, hatch='//')
+                continuum_region_cfg = self.colors['profiles']['continuum_region']
+                new_patch = self.ax.axvspan(vel_start, vel_end, color=continuum_region_cfg['color'], alpha=continuum_region_cfg['alpha'], hatch=continuum_region_cfg['hatch'])
                 patch_data['patch'] = new_patch
 
         # Convert Gaussian fits to velocity space
@@ -2305,7 +2424,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         
         # Set x-axis labels back to wavelength
         self.ax.set_xlabel(self._get_wavelength_unit_label())
-        self.ax.plot(self.x_data, [0] * len(self.x_data), color='gray', linestyle='--', linewidth=1)
+        ref_cfg = self.colors['reference_lines']
+        self.ax.plot(self.x_data, [0] * len(self.x_data), color=ref_cfg['color'], linestyle=ref_cfg['linestyle'], linewidth=ref_cfg['linewidth'])
 
         # Convert continuum fits back to wavelength space
         for fit in self.continuum_fits:
@@ -2324,7 +2444,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     # These bounds are already in display unit
                     wav_start, wav_end = patch_data['bounds']
                 patch_data['patch'].remove()
-                new_patch = self.ax.axvspan(wav_start, wav_end, color='magenta', alpha=0.3, hatch='//')
+                continuum_region_cfg = self.colors['profiles']['continuum_region']
+                new_patch = self.ax.axvspan(wav_start, wav_end, color=continuum_region_cfg['color'], alpha=continuum_region_cfg['alpha'], hatch=continuum_region_cfg['hatch'])
                 patch_data['patch'] = new_patch
 
         # Convert Gaussian fits back to wavelength space
@@ -2684,12 +2805,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             
         if hasattr(self, 'current_gaussian_plot') and self.current_gaussian_plot:
             self.current_gaussian_plot.remove() # Remove any previous plot of the selected gaussian
-        self.current_gaussian_plot = self.ax.plot(x, plot_data, color='lime', linestyle='-', linewidth=2)[0]  # Store the first element (line object)
+        preview_cfg = self.colors['preview']
+        self.current_gaussian_plot = self.ax.plot(x, plot_data, color=preview_cfg['color'], linestyle=preview_cfg['linestyle'], linewidth=preview_cfg['linewidth'])[0]  # Store the first element (line object)
         
         # Highlight the original fit line in neon green for redshift mode
         if 'line' in fit and fit['line']:
-            fit['line'].set_color('lime')
-            fit['line'].set_linewidth(2.5)
+            fit['line'].set_color(preview_cfg['color'])
+            fit['line'].set_linewidth(preview_cfg['linewidth'] + 0.5)
             self.redshift_selected_line = fit['line']
         
         plt.draw()  # Refresh the plot
@@ -2717,12 +2839,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             
         if hasattr(self, 'current_voigt_plot') and self.current_voigt_plot:
             self.current_voigt_plot.remove()
-        self.current_voigt_plot = self.ax.plot(x, plot_data, color='lime', linestyle='-', linewidth=2)[0]
+        preview_cfg = self.colors['preview']
+        self.current_voigt_plot = self.ax.plot(x, plot_data, color=preview_cfg['color'], linestyle=preview_cfg['linestyle'], linewidth=preview_cfg['linewidth'])[0]
         
         # Highlight the original fit line in neon green for redshift mode
         if 'line' in fit and fit['line']:
-            fit['line'].set_color('lime')
-            fit['line'].set_linewidth(2.5)
+            fit['line'].set_color(preview_cfg['color'])
+            fit['line'].set_linewidth(preview_cfg['linewidth'] + 0.5)
             self.redshift_selected_line = fit['line']
         
         plt.draw()  # Refresh the plot to show the updated Voigt profile
@@ -3240,14 +3363,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         y_pos = y_min + 0.925 * (y_max - y_min)
         
         # Determine the marker color based on profile type
-        marker_color = '#eca829' if profile_type == 'Voigt' else 'red'
+        marker_cfg = self.colors['markers']['voigt'] if profile_type == 'Voigt' else self.colors['markers']['gaussian']
+        marker_color = marker_cfg['color']
+        marker_lw = marker_cfg.get('linewidth', 2)
         
         # Draw a vertical line as a marker at the specified position
         marker, = self.ax.plot(
             [center_or_mean, center_or_mean],
             [y_pos, y_pos + 0.05 * (y_max - y_min)],
             color=marker_color,
-            lw=2
+            lw=marker_lw
         )
         # Attach the bounds to the marker as a custom attribute
         setattr(marker, 'bounds', bounds)
@@ -4039,48 +4164,52 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             for patch_info in self.continuum_patches:
                 bounds = patch_info.get('bounds')
                 if bounds:
-                    # Recreate the axvspan patch with magenta color and hatching (same as original)
-                    patch = self.ax.axvspan(bounds[0], bounds[1], color='magenta', alpha=0.3, hatch='//')
+                    # Recreate the axvspan patch with continuum_region color and hatching (same as original)
+                    continuum_region_cfg = self.colors['profiles']['continuum_region']
+                    patch = self.ax.axvspan(bounds[0], bounds[1], color=continuum_region_cfg['color'], alpha=continuum_region_cfg['alpha'], hatch=continuum_region_cfg['hatch'])
                     # Store the patch object back in the patch_info dict
                     patch_info['patch'] = patch
                     # Register the region patch with ItemTracker
                     position_str = f"λ: {bounds[0]:.2f}-{bounds[1]:.2f} Å"
                     self.register_item('continuum_region', f'Continuum Region', patch_obj=patch, 
-                                     position=position_str, color='magenta', bounds=bounds)
+                                     position=position_str, color=continuum_region_cfg['color'], bounds=bounds)
             
             # Re-plot all continuum fits
             for fit in self.continuum_fits:
                 if 'line' in fit and fit['line'] is not None:
+                    continuum_cfg = self.colors['profiles']['continuum_line']
                     self.ax.plot(fit['line'].get_xdata(), fit['line'].get_ydata(), 
-                               color='magenta', linestyle='--', linewidth=1.5, label='Continuum')
+                               color=continuum_cfg['color'], linestyle=continuum_cfg['linestyle'], linewidth=1.5, label='Continuum')
                     # Re-register with tracker
                     bounds = fit.get('bounds')
                     bounds_str = f"λ: {bounds[0]:.2f}-{bounds[1]:.2f} Å" if bounds else "Continuum"
                     self.register_item('continuum', f'Continuum (order {fit.get("poly_order", 1)})', 
                                      fit_dict=fit, line_obj=fit['line'], 
-                                     position=bounds_str, color='magenta')
+                                     position=bounds_str, color=continuum_cfg['color'])
             
             # Re-plot all Gaussian fits
             for fit in self.gaussian_fits:
                 if 'line' in fit and fit['line'] is not None:
+                    gaussian_cfg = self.colors['profiles']['gaussian']
                     self.ax.plot(fit['line'].get_xdata(), fit['line'].get_ydata(), 
-                               color='red', linestyle='--', linewidth=1.5, label='Gaussian')
+                               color=gaussian_cfg['color'], linestyle=gaussian_cfg['linestyle'], linewidth=gaussian_cfg['linewidth'], label='Gaussian')
                     # Re-register with tracker
                     mean = fit.get('mean', 0)
                     position_str = f"λ: {mean:.2f} Å"
                     self.register_item('gaussian', 'Gaussian', fit_dict=fit, 
-                                     line_obj=fit['line'], position=position_str, color='red')
+                                     line_obj=fit['line'], position=position_str, color=gaussian_cfg['color'])
             
             # Re-plot all Voigt fits
             for fit in self.voigt_fits:
                 if 'line' in fit and fit['line'] is not None:
+                    voigt_cfg = self.colors['profiles']['voigt']
                     self.ax.plot(fit['line'].get_xdata(), fit['line'].get_ydata(), 
-                               color='orange', linestyle='--', linewidth=1.5, label='Voigt')
+                               color=voigt_cfg['color'], linestyle=voigt_cfg['linestyle'], linewidth=voigt_cfg['linewidth'], label='Voigt')
                     # Re-register with tracker
                     center = fit.get('center', fit.get('mean', 0))
                     position_str = f"λ: {center:.2f} Å"
                     self.register_item('voigt', 'Voigt', fit_dict=fit, 
-                                     line_obj=fit['line'], position=position_str, color='orange')
+                                     line_obj=fit['line'], position=position_str, color=voigt_cfg['color'])
             
             # Re-plot total line if it was shown
             if self.show_total_line and (self.gaussian_fits or self.voigt_fits or self.continuum_fits or self.listfit_fits):
@@ -4491,10 +4620,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # Create wavelength array between region bounds for plotting
             x_plot = np.linspace(region_bounds[0], region_bounds[1], 500)
             continuum_full = np.polyval(coeffs, x_plot)
-            continuum_line, = self.ax.plot(x_plot, continuum_full, color='magenta', linestyle='--', alpha=0.8)
+            continuum_cfg = self.colors['profiles']['continuum_line']
+            continuum_line, = self.ax.plot(x_plot, continuum_full, color=continuum_cfg['color'], linestyle=continuum_cfg['linestyle'], alpha=0.8)
             if self.is_residual_shown:
                 self.calculate_and_plot_residuals()
-            plt.legend()
+            plt.legend(loc='upper right')
             # Force immediate redraw of the canvas
             self.ax.figure.canvas.draw()
             QtWidgets.QApplication.processEvents()  # Process Qt events to ensure redraw
@@ -4512,8 +4642,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.continuum_fits.append(continuum_fit)
             # Register with ItemTracker
             bounds_str = f"λ: {region_bounds[0]:.2f}-{region_bounds[1]:.2f} Å"
+            continuum_cfg = self.colors['profiles']['continuum_line']
             self.register_item('continuum', f'Continuum (order {self.poly_order})', fit_dict=continuum_fit,
-                             line_obj=continuum_line, position=bounds_str, color='magenta')
+                             line_obj=continuum_line, position=bounds_str, color=continuum_cfg['color'])
             
             # Record action for undo/redo
             self.record_action('fit_continuum', f'Fit Continuum (order {self.poly_order})')
@@ -4535,13 +4666,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 self.continuum_regions[-1] = (self.continuum_regions[-1][0], event.xdata)  # Update end point
                 print(f"Region end defined at: {event.xdata:.2f}. Press space to define another region or enter to finalize.")
                 # Plot the region as a shaded patch
-                patch = self.ax.axvspan(self.continuum_regions[-1][0], event.xdata, color='magenta', alpha=0.3, hatch='//')
+                continuum_region_cfg = self.colors['profiles']['continuum_region']
+                patch = self.ax.axvspan(self.continuum_regions[-1][0], event.xdata, color=continuum_region_cfg['color'], alpha=continuum_region_cfg['alpha'], hatch=continuum_region_cfg['hatch'])
                 region_bounds = (self.continuum_regions[-1][0], event.xdata)
                 self.continuum_patches.append({'patch': patch, 'bounds': region_bounds}) # Store the patch
                 # Register the region patch with ItemTracker
                 position_str = f"λ: {region_bounds[0]:.2f}-{region_bounds[1]:.2f} Å"
                 self.register_item('continuum_region', f'Continuum Region', patch_obj=patch, 
-                                 position=position_str, color='magenta', bounds=region_bounds)
+                                 position=position_str, color=continuum_region_cfg['color'], bounds=region_bounds)
                 # Record action for defining a continuum region
                 self.record_action('define_continuum_region', f'Define Continuum Region λ: {region_bounds[0]:.2f}-{region_bounds[1]:.2f} Å')
                 # self.continuum_patches.append(patch) # Store the patch
@@ -4659,7 +4791,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 bound_value = self.vel_to_wav(event.xdata, self.rest_wavelength, z=self.redshift)
             
             self.bounds.append(bound_value)
-            line = self.ax.axvline(event.xdata, color='red', linestyle='--')  # Plot bound line using displayed coords
+            gaussian_cfg = self.colors['profiles']['gaussian']
+            line = self.ax.axvline(event.xdata, color=gaussian_cfg['color'], linestyle='--')  # Plot bound line using displayed coords
             self.bound_lines.append(line)  # Store the line object
             print(f"Bound set at x = {event.xdata}")
             # Record action for setting a bound
@@ -4773,7 +4906,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
                     x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                     y_plt = interpolator(x_plt)
-                    fit_line, = self.ax.plot(x_plt, y_plt, color='red', linestyle='--')
+                    gaussian_cfg = self.colors['profiles']['gaussian']
+                    fit_line, = self.ax.plot(x_plt, y_plt, color=gaussian_cfg['color'], linestyle=gaussian_cfg['linestyle'])
                     # Store each component’s parameters
                     self.gaussian_fits.append({
                     'fit_id': self.fit_id,
@@ -4792,8 +4926,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     })
                     # Register with ItemTracker
                     position_str = f"λ: {mean:.2f} Å"
+                    gaussian_cfg = self.colors['profiles']['gaussian']
                     self.register_item('gaussian', f'Gaussian', fit_dict=self.gaussian_fits[-1], line_obj=fit_line,
-                                     position=position_str, color='red')
+                                     position=position_str, color=gaussian_cfg['color'])
                     
                     # Record action for undo/redo
                     self.record_action('fit_gaussian', f'Fit Gaussian at λ={mean:.2f} Å')
@@ -4927,7 +5062,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
                     x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                     y_plt = interpolator(x_plt)
-                    fit_line, = self.ax.plot(x_plt, y_plt, color='red', linestyle='--')
+                    gaussian_cfg = self.colors['profiles']['gaussian']
+                    fit_line, = self.ax.plot(x_plt, y_plt, color=gaussian_cfg['color'], linestyle=gaussian_cfg['linestyle'])
                     left_bound, right_bound = bound_pairs[i // 3]
                     gaussian_fit = {
                     'fit_id': self.fit_id,
@@ -4947,8 +5083,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     self.gaussian_fits.append(gaussian_fit)
                     # Register with ItemTracker
                     position_str = f"λ: {mean:.2f} Å"
+                    gaussian_cfg = self.colors['profiles']['gaussian']
                     self.register_item('gaussian', f'Gaussian', fit_dict=gaussian_fit, line_obj=fit_line,
-                                     position=position_str, color='red')
+                                     position=position_str, color=gaussian_cfg['color'])
                     
                     # Record action for undo/redo (only record once after all components)
                     if i == len(params) - 3:  # Last component
@@ -5007,7 +5144,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 bound_value = self.vel_to_wav(event.xdata, self.rest_wavelength, z=self.redshift)
             
             self.bounds.append(bound_value)
-            line = self.ax.axvline(event.xdata, color='#eca829', linestyle='--')  # Plot bound line for Voigt
+            voigt_cfg = self.colors['profiles']['voigt']
+            line = self.ax.axvline(event.xdata, color=voigt_cfg['color'], linestyle='--')  # Plot bound line for Voigt
             self.bound_lines.append(line)  # Store the line object
             print(f"Voigt bound set at x = {event.xdata}")
             # Record action for setting a Voigt bound
@@ -5099,7 +5237,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
                 x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                 y_plt = interpolator(x_plt)
-                fit_line, = self.ax.plot(x_plt, y_plt, color='#eca829', linestyle='--')
+                voigt_cfg = self.colors['profiles']['voigt']
+                fit_line, = self.ax.plot(x_plt, y_plt, color=voigt_cfg['color'], linestyle=voigt_cfg['linestyle'])
                 # TEMP - below I present one exploratory method for calculating column densities and other absorption line diagnostics 
                 line_wavelength = 2795 # AA
                 f = 0.5
@@ -5193,7 +5332,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 bound_value = self.vel_to_wav(event.xdata, self.rest_wavelength, z=self.redshift)
             
             self.bounds.append(bound_value)
-            line = self.ax.axvline(event.xdata, color='#eca829', linestyle='--')  # Plot bound line for Voigt
+            voigt_cfg = self.colors['profiles']['voigt']
+            line = self.ax.axvline(event.xdata, color=voigt_cfg['color'], linestyle='--')  # Plot bound line for Voigt
             self.bound_lines.append(line)  # Store the line object
             print(f"Voigt bound set at x = {event.xdata}")
             plt.draw()  # Update plot with the new bound line
@@ -5325,7 +5465,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 # Higher resolution for smooth plotting
                 x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                 y_plt = interpolator(x_plt)
-                fit_line, = self.ax.plot(x_plt, y_plt, color='#eca829', linestyle='--')
+                voigt_cfg = self.colors['profiles']['voigt']
+                fit_line, = self.ax.plot(x_plt, y_plt, color=voigt_cfg['color'], linestyle=voigt_cfg['linestyle'])
                 # Get `line_id` and `line_wavelength` from `self.voigt_comps` for this component
                 line_id = self.voigt_comps[idx].get('line_id') if idx < len(self.voigt_comps) else None
                 line_wavelength = self.voigt_comps[idx].get('line_wavelength') if idx < len(self.voigt_comps) else None
@@ -5439,7 +5580,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             
             self.bounds.append(bound_value)
             print("self.bounds:", self.bounds)
-            line = self.ax.axvline(event.xdata, color='red', linestyle='--')  # Plot bound line for Gaussian
+            gaussian_cfg = self.colors['profiles']['gaussian']
+            line = self.ax.axvline(event.xdata, color=gaussian_cfg['color'], linestyle='--')  # Plot bound line for Gaussian
             self.bound_lines.append(line)  # Store the line object
             print(f"Gaussian bound set at x = {event.xdata}")
             plt.draw()  # Update plot with the new bound line
@@ -5561,7 +5703,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 # Higher resolution for smooth plotting
                 x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                 y_plt = interpolator(x_plt)
-                fit_line, = self.ax.plot(x_plt, y_plt, color='red', linestyle='--')
+                gaussian_cfg = self.colors['profiles']['gaussian']
+                fit_line, = self.ax.plot(x_plt, y_plt, color=gaussian_cfg['color'], linestyle=gaussian_cfg['linestyle'])
                 # Get `line_id` and `line_wavelength` from `self.gaussian_comps` for this component
                 line_id = self.gaussian_comps[idx].get('line_id') if idx < len(self.gaussian_comps) else None
                 line_wavelength = self.gaussian_comps[idx].get('line_wavelength') if idx < len(self.gaussian_comps) else None
@@ -5899,7 +6042,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 else:
                     filtered_handles, filtered_labels = [], []
 
-                self.ax.legend(filtered_handles, filtered_labels)
+                self.ax.legend(filtered_handles, filtered_labels, loc='upper right')
                 self.ax.figure.canvas.draw()
 
         # Enter Gaussian fit mode
@@ -6195,7 +6338,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 # Drop non-serializable columns
                 df.drop(columns=['line', 'patches'], inplace=True, errors='ignore')
                 
-                filename = f"qasap_fits_{timestamp}.csv"
+                filename = f"qsap_fits_{timestamp}.csv"
                 df.to_csv(filename, index=False)
                 print(f"Saved {len(all_fits)} fits to {filename}")
                 print(f"  - Gaussian: {sum(1 for f in all_fits if f['type'] == 'gaussian')}")
@@ -6242,7 +6385,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         # Reconstruct the continuum lines
                         x_plot = np.linspace(fit['bounds'][0], fit['bounds'][1], 100)
                         y_plot = fit['a'] * x_plot + fit['b']
-                        fit['line'], = self.ax.plot(x_plot, y_plot, color="magenta", linestyle='--')
+                        continuum_cfg = self.colors['profiles']['continuum_line']
+                        fit['line'], = self.ax.plot(x_plot, y_plot, color=continuum_cfg['color'], linestyle=continuum_cfg['linestyle'])
 
                 elif fit_type == 'gaussian':
                     print(df.to_dict(orient='records'))
@@ -6254,7 +6398,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         _, a, b = self.get_existing_continuum(fit['bounds'][0], fit['bounds'][1])
                         existing_continuum = self.continuum_model(x_plot, a, b)
                         y_plot = self.gaussian(x_plot, fit['amp'], fit['mean'], fit['stddev']) + existing_continuum
-                        fit['line'], = self.ax.plot(x_plot, y_plot, color="red", linestyle='--')
+                        gaussian_cfg = self.colors['profiles']['gaussian']
+                        fit['line'], = self.ax.plot(x_plot, y_plot, color=gaussian_cfg['color'], linestyle=gaussian_cfg['linestyle'])
 
                 elif fit_type == 'voigt':
                     self.voigt_fits = df.to_dict(orient='records')
@@ -6265,7 +6410,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         _, a, b = self.get_existing_continuum(fit['bounds'][0], fit['bounds'][1])
                         existing_continuum = self.continuum_model(x_plot, a, b)
                         y_plot = self.voigt(x_plot, fit['amp'], fit['center'], fit['sigma'], fit['gamma']) + existing_continuum
-                        fit['line'], = self.ax.plot(x_plot, y_plot, color="orange", linestyle='--')
+                        voigt_cfg = self.colors['profiles']['voigt']
+                        fit['line'], = self.ax.plot(x_plot, y_plot, color=voigt_cfg['color'], linestyle=voigt_cfg['linestyle'])
 
                 self.ax.legend(loc='upper right')
                 print(f"Successfully loaded {fit_type.capitalize()} fits from {file_path}.")
@@ -6307,6 +6453,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 self.line_list_window.show()
                 self.line_list_window.raise_()
                 self.line_list_window.activateWindow()
+                plt.draw()
             
         elif event.key == '<':
             # Find the marker and label nearest to the cursor to remove
@@ -7212,7 +7359,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         x_smooth = np.linspace(x_fit.min(), x_fit.max(), len(x_fit) * 50)
         
         # Color mapping for components
-        colors = {'gaussian': 'red', 'voigt': 'orange', 'polynomial': 'magenta'}
+        # Get colors from config
+        gaussian_cfg = self.colors['profiles']['gaussian']
+        voigt_cfg = self.colors['profiles']['voigt']
+        continuum_cfg = self.colors['profiles']['continuum_line']
+        colors = {'gaussian': gaussian_cfg['color'], 'voigt': voigt_cfg['color'], 'polynomial': continuum_cfg['color']}
         
         # Plot mask regions as gray fill patches
         data_masks = [comp for comp in components if comp['type'] == 'data_mask']
@@ -7269,7 +7420,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 g_stddev_err = params[f'{prefix}stddev'].stderr if params[f'{prefix}stddev'].stderr is not None else 0.0
                 
                 y_component = self.gaussian(x_smooth, g_amp, g_mean, g_stddev)
-                line, = self.ax.plot(x_smooth, y_component, color=color, linestyle='--', linewidth=2)
+                line, = self.ax.plot(x_smooth, y_component, color=color, linestyle=gaussian_cfg['linestyle'], linewidth=gaussian_cfg['linewidth'])
                 
                 # Add to gaussian_fits for redshift mode
                 gaussian_fit = {
@@ -7309,7 +7460,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 v_gamma_err = params[f'{prefix}gamma'].stderr if params[f'{prefix}gamma'].stderr is not None else 0.0
                 
                 y_component = self.voigt(x_smooth, v_amp, v_center, v_sigma, v_gamma)
-                line, = self.ax.plot(x_smooth, y_component, color=color, linestyle='--', linewidth=2)
+                line, = self.ax.plot(x_smooth, y_component, color=color, linestyle=voigt_cfg['linestyle'], linewidth=voigt_cfg['linewidth'])
                 
                 # Add to voigt_fits for redshift mode
                 voigt_fit = {
@@ -7345,7 +7496,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 # Reverse coefficients for np.polyval (expects highest order first)
                 poly_coeffs = poly_coeffs[::-1]
                 y_component = np.polyval(poly_coeffs, x_smooth)
-                line, = self.ax.plot(x_smooth, y_component, color=color, linestyle='--', linewidth=2)
+                line, = self.ax.plot(x_smooth, y_component, color=color, linestyle=continuum_cfg['linestyle'], linewidth=continuum_cfg['linewidth'])
                 # Register with ItemTracker - store metadata for deletion handling
                 position_str = f"λ: {left_bound:.2f}-{right_bound:.2f} Å"
                 poly_fit_dict = {
@@ -7359,7 +7510,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         
         # Plot the total fit result (for visualization only, NOT included in draw_total_line to avoid double-counting)
         y_total_fit = result.eval(x=x_smooth)
-        line, = self.ax.plot(x_smooth, y_total_fit, label='Total Listfit', color='#003d7a', linestyle='-', linewidth=2)
+        total_color = self.colors['profiles']['total_line']
+        line, = self.ax.plot(x_smooth, y_total_fit, label='Total Listfit', color=total_color['color'], linestyle=total_color['linestyle'], linewidth=total_color['linewidth'])
         
         # Register Total Listfit with ItemTracker
         position_str = f"λ: {left_bound:.2f}-{right_bound:.2f} Å"
@@ -7368,7 +7520,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             'is_total_fit': True
         }
         self.register_item('listfit_total', f'Total Listfit', fit_dict=total_fit_dict, line_obj=line,
-                          position=position_str, color='#003d7a')
+                          position=position_str, color=total_color['color'])
         
         self.ax.legend(loc='upper right')
 

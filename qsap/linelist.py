@@ -1,5 +1,5 @@
 """
-Line list management for QASAP
+Line list management for QSAP
 """
 
 from dataclasses import dataclass

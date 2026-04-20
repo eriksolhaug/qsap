@@ -8,7 +8,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QIcon
 from typing import List, Optional
 from .linelist import LineList, Line
-from qasap.ui_utils import get_qasap_icon
+from qsap.ui_utils import get_qsap_icon
 
 
 class LineListWindow(QtWidgets.QWidget):
@@ -51,9 +51,9 @@ class LineListWindow(QtWidgets.QWidget):
 
     def init_ui(self):
         """Initialize the user interface with dual panels."""
-        self.setWindowTitle("QASAP - Line List")
+        self.setWindowTitle("QSAP - Line List")
         # Load and set window icon
-        self.setWindowIcon(get_qasap_icon())
+        self.setWindowIcon(get_qsap_icon())
         self.setGeometry(100, 100, 700, 500)
 
         # Main layout - horizontal split
@@ -161,7 +161,7 @@ class LineListWindow(QtWidgets.QWidget):
 
 def main():
     # Parse command-line arguments
-    parser = argparse.ArgumentParser(description='QASAP - Quick Analysis of Spectra and Profiles (v0.1)')
+    parser = argparse.ArgumentParser(description='QSAP - Quick Spectrum Analysis Program (v0.1)')
     parser.add_argument('fits_file', type=str, nargs='?', help='Path to the spectrum (FITS) file')
     parser.add_argument('--redshift', type=float, default=0.0, help='Initial redshift value (default: 0.0)')
     parser.add_argument('--zoom_factor', type=float, default=0.1, help='Initial zoom factor (default: 0.1)')

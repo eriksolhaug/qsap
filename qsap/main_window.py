@@ -1,14 +1,14 @@
 """
-MainWindow - QMainWindow wrapper for QASAP that provides menu bar integration
+MainWindow - QMainWindow wrapper for QSAP that provides menu bar integration
 """
 
 from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtCore import Qt
-from qasap.ui_utils import get_qasap_icon
+from qsap.ui_utils import get_qsap_icon
 
 
-class QASAPMainWindow(QtWidgets.QMainWindow):
-    """Main window for QASAP with integrated menu bar"""
+class QSAPMainWindow(QtWidgets.QMainWindow):
+    """Main window for QSAP with integrated menu bar"""
     
     def __init__(self, spectrum_plotter):
         super().__init__()
@@ -20,8 +20,8 @@ class QASAPMainWindow(QtWidgets.QMainWindow):
         self.tracked_windows = {}
         
         # Set window properties
-        self.setWindowTitle("QASAP - Menu Bar")
-        self.setWindowIcon(get_qasap_icon())
+        self.setWindowTitle("QSAP - Menu Bar")
+        self.setWindowIcon(get_qsap_icon())
         self.setGeometry(50, 50, 200, 100)
         
         # Create a simple widget for the main window (just to have something in it)

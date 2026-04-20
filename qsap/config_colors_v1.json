@@ -1,0 +1,54 @@
+{
+  "profiles": {
+    "gaussian": {
+      "color": "red",
+      "linestyle": "--",
+      "linewidth": 1.5
+    },
+    "voigt": {
+      "color": "orange",
+      "linestyle": "--",
+      "linewidth": 1.5
+    },
+    "continuum_line": {
+      "color": "magenta",
+      "linestyle": "--",
+      "linewidth": 1.5
+    },
+    "continuum_region": {
+      "color": "magenta",
+      "alpha": 0.3,
+      "hatch": "//"
+    },
+    "total_line": {
+      "color": "#003d7a",
+      "linestyle": "-",
+      "linewidth": 2
+    }
+  },
+  "spectrum": {
+    "data": {
+      "color": "black",
+      "linestyle": "-"
+    },
+    "error": {
+      "color": "red",
+      "linestyle": "--",
+      "alpha": 0.4
+    }
+  },
+  "residual": {
+    "color": "royalblue",
+    "linestyle": "-"
+  },
+  "preview": {
+    "color": "lime",
+    "linestyle": "-",
+    "linewidth": 2
+  },
+  "reference_lines": {
+    "color": "gray",
+    "linestyle": "--",
+    "linewidth": 1
+  }
+}

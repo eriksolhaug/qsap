@@ -4,7 +4,7 @@ FitInformationWindow - Display detailed information about all fitted profiles
 
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import Qt, pyqtSignal
-from qasap.ui_utils import get_qasap_icon
+from qsap.ui_utils import get_qsap_icon
 
 
 class FitInformationWindow(QtWidgets.QWidget):
@@ -23,8 +23,8 @@ class FitInformationWindow(QtWidgets.QWidget):
     
     def init_ui(self):
         """Initialize UI"""
-        self.setWindowTitle("QASAP - Fit Information")
-        self.setWindowIcon(get_qasap_icon())
+        self.setWindowTitle("QSAP - Fit Information")
+        self.setWindowIcon(get_qsap_icon())
         self.setGeometry(100, 100, 2000, 600)  # Wider window to show all information
         
         layout = QtWidgets.QVBoxLayout()

@@ -1,0 +1,64 @@
+{
+  "profiles": {
+    "gaussian": {
+      "color": "#F0B67F",
+      "linestyle": "--",
+      "linewidth": 1.5
+    },
+    "voigt": {
+      "color": "#D6D1B1",
+      "linestyle": "--",
+      "linewidth": 1.5
+    },
+    "continuum_line": {
+      "color": "#6279B8",
+      "linestyle": "--",
+      "linewidth": 1.5
+    },
+    "continuum_region": {
+      "color": "#8EA4D2",
+      "alpha": 0.3,
+      "hatch": "//"
+    },
+    "total_line": {
+      "color": "#496F5D",
+      "linestyle": "-",
+      "linewidth": 2
+    }
+  },
+  "spectrum": {
+    "data": {
+      "color": "black",
+      "linestyle": "-"
+    },
+    "error": {
+      "color": "red",
+      "linestyle": "--",
+      "alpha": 0.4
+    }
+  },
+  "residual": {
+    "color": "#6279B8",
+    "linestyle": "-"
+  },
+  "preview": {
+    "color": "lime",
+    "linestyle": "-",
+    "linewidth": 2
+  },
+  "reference_lines": {
+    "color": "gray",
+    "linestyle": "--",
+    "linewidth": 1
+  },
+  "markers": {
+    "gaussian": {
+      "color": "#F0B67F",
+      "linewidth": 2
+    },
+    "voigt": {
+      "color": "#D6D1B1",
+      "linewidth": 2
+    }
+  }
+}

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-QASAP - Quick & Advanced Spectrum Analysis Package
+QSAP - Quick Spectrum Analysis Program
 
 Interactive spectral analysis tool with intelligent file format detection.
 Modular architecture with spectrum I/O and analysis functions.
@@ -27,17 +27,17 @@ def _get_version():
 
 
 def main():
-    """Main entry point for QASAP"""
+    """Main entry point for QSAP"""
     
     parser = argparse.ArgumentParser(
-        description='QASAP v0.11 - Spectrum Analysis Package',
+        description=f'QSAP v{_get_version()} - Quick Spectrum Analysis Program',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python qasap.py spectrum.fits                    # Auto-detect format
-  python qasap.py spectrum.fits --detect          # Show detected formats
-  python qasap.py spectrum.fits --fmt fits:image1d # Force format
-  python qasap.py spectrum.fits --lsf 15.5        # Apply LSF (15.5 km/s)
+  python qsap.py spectrum.fits                    # Auto-detect format
+  python qsap.py spectrum.fits --detect          # Show detected formats
+  python qsap.py spectrum.fits --fmt fits:image1d # Force format
+  python qsap.py spectrum.fits --lsf 15.5        # Apply LSF (15.5 km/s)
         """
     )
     
@@ -55,7 +55,7 @@ Examples:
                         help='Line Spread Function: FWHM in km/s or path to LSF file')
     
     parser.add_argument('--version', action='version',
-                        version=f'QASAP v{_get_version()}')
+                        version=f'QSAP v{_get_version()}')
     
     args = parser.parse_args()
     
@@ -63,10 +63,10 @@ Examples:
     # These are only imported after argument parsing, so --help and --version are fast
     import numpy as np
     from PyQt5 import QtWidgets
-    from qasap.spectrum_io import SpectrumIO
-    from qasap.spectrum_analysis import SpectrumAnalysis
-    from qasap.ui_components import SpectrumPlotter, SpectrumPlotterApp
-    from qasap.format_picker_dialog import FormatPickerDialog
+    from qsap.spectrum_io import SpectrumIO
+    from qsap.spectrum_analysis import SpectrumAnalysis
+    from qsap.ui_components import SpectrumPlotter, SpectrumPlotterApp
+    from qsap.format_picker_dialog import FormatPickerDialog
     # === END DEFERRED IMPORTS ===
     
     # Handle format detection mode
@@ -88,8 +88,8 @@ Examples:
         app = QtWidgets.QApplication.instance()
     
     # Set application icon (shows in Dock on macOS)
-    from qasap.ui_utils import get_qasap_icon
-    app.setWindowIcon(get_qasap_icon())
+    from qsap.ui_utils import get_qsap_icon
+    app.setWindowIcon(get_qsap_icon())
     
     # Load spectrum if provided
     wav = None
@@ -185,8 +185,27 @@ Examples:
             traceback.print_exc()
             sys.exit(1)
     else:
-        print("No spectrum file specified. Starting QASAP with empty plotter.")
-        print("Use the 'Open' button in the control panel to load a spectrum.\n")
+        # Display welcome message with ASCII art
+        version = _get_version()
+        title_line = f"   WELCOME TO QSAP  v{version}"
+        subtitle_line = "Quick Spectrum Analysis Program"
+        welcome_art = f"""
+╔══════════════════════════════════════════════════════════════╗
+║                                                              ║
+║    ==== {title_line:^62} ====      ║
+║                                                              ║
+║         {subtitle_line:^62}         ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+
+▯▯▯▯▯▯▯▯▯▯▯  No spectrum file specified  ▯▯▯▯▯▯▯▯▯▯▯
+
+Starting QSAP with empty plotter.
+Use the 'Open' button in the control panel to load a spectrum.
+
+═══════════════════════════════════════════════════════════════
+"""
+        print(welcome_art)
     
     # Launch interactive GUI plotter (now a QMainWindow with menu bar)
     plotter = SpectrumPlotter(

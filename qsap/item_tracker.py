@@ -6,7 +6,7 @@ from pathlib import Path
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QIcon
-from qasap.ui_utils import get_qasap_icon
+from qsap.ui_utils import get_qsap_icon
 
 
 class ColorBoxDelegate(QtWidgets.QStyledItemDelegate):
@@ -38,9 +38,9 @@ class ItemTracker(QtWidgets.QWidget):
     
     def init_ui(self):
         """Initialize UI"""
-        self.setWindowTitle("QASAP - Item Tracker")
+        self.setWindowTitle("QSAP - Item Tracker")
         # Load and set window icon
-        self.setWindowIcon(get_qasap_icon())
+        self.setWindowIcon(get_qsap_icon())
         self.setGeometry(100, 700, 600, 350)
         
         layout = QtWidgets.QVBoxLayout()

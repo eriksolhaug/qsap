@@ -8,7 +8,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QIntValidator, QDoubleValidator, QIcon, QColor
 import numpy as np
 from scipy.optimize import curve_fit
-from qasap.ui_utils import get_qasap_icon
+from qsap.ui_utils import get_qsap_icon
 
 
 class ConstraintEditorDialog(QtWidgets.QDialog):
@@ -647,9 +647,9 @@ class ListfitWindow(QtWidgets.QWidget):
     
     def init_ui(self):
         """Initialize UI"""
-        self.setWindowTitle("QASAP - List Fit")
+        self.setWindowTitle("QSAP - List Fit")
         # Load and set window icon
-        self.setWindowIcon(get_qasap_icon())
+        self.setWindowIcon(get_qsap_icon())
         self.setGeometry(500, 100, 700, 500)
         
         layout = QtWidgets.QHBoxLayout()
