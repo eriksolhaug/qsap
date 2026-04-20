@@ -1,8 +1,8 @@
-# <img src="logo/qasap_logo.png" alt="QASAP Logo" width="80">&nbsp;&nbsp;QASAP: Quick Analysis of Spectra and Profiles
+# <img src="logo/qsap_logo.png" alt="QSAP Logo" width="80">&nbsp;&nbsp;QSAP: Quick Spectrum Analysis Program
 
 *An Analysis Tool for Astronomical Spectra*
 
-## Version 0.11
+## Version 0.12
 
 ![Python](https://img.shields.io/badge/Python-3.7%2B-blue)
 ![PyQt5](https://img.shields.io/badge/PyQt5-5.15%2B-blue?logo=pyqt&logoColor=white)
@@ -13,7 +13,7 @@
 ![lmfit](https://img.shields.io/badge/lmfit-0.9%2B-purple?logo=python&logoColor=white)
 ![emcee](https://img.shields.io/badge/emcee-3.0%2B-yellowgreen?logo=python&logoColor=white)
 
-Interactive Python tool for 1D spectral analysis with file format detection. QASAP provides both quick-look functionality and some more advanced analysis features including multi-component line fitting, continuum modeling, and Bayesian MCMC fitting.
+Interactive Python tool for 1D spectral analysis with file format detection. QSAP provides both quick-look functionality and some more advanced analysis features including multi-component line fitting, continuum modeling, and Bayesian MCMC fitting.
 
 ## Features
 
@@ -36,18 +36,18 @@ To **download a specific tagged version** (e.g., v0.11), instead run:
 
 ```bash
 # Clone only the tag (shallow clone, fastest)
-git clone --depth 1 --branch v0.11 https://github.com/eriksolhaug/qasap.git
+git clone --depth 1 --branch v0.12 https://github.com/eriksolhaug/qsap.git
 
 # Or clone the whole repo and checkout the tag
-git clone https://github.com/eriksolhaug/qasap.git
-cd qasap
-git checkout v0.11
+git clone https://github.com/eriksolhaug/qsap.git
+cd qsap
+git checkout v0.12
 ```
 
 You can download main branch as it is. However, **this is not recommended** as the main branch is actively undergoing development:
 
 ```bash
-git clone https://github.com/eriksolhaug/qasap.git
+git clone https://github.com/eriksolhaug/qsap.git
 ```
 
 ### Conda Environment Setup
@@ -56,24 +56,24 @@ Then install the required packages (regardless of version):
 
 ```bash
 # Create a new conda environment
-conda create -n qasap python=3.8
+conda create -n qsap python=3.8
 
 # Activate the environment
-conda activate qasap
+conda activate qsap
 
-# Enter qasap directory
-cd qasap # This is the repo you cloned from github
+# Enter qsap directory
+cd qsap # This is the repo you cloned from github
 
 # Install dependencies
 pip install -r requirements.txt
 # OR install requirements using conda
 conda install numpy scipy matplotlib astropy pandas lmfit pyqt emcee corner
 
-# Run QASAP
-python qasap.py <spectrum.fits>
+# Run QSAP
+python qsap.py <spectrum.fits>
 
 # An example spectrum is available. Run...
-python qasap.py example/sample_spectrum.txt
+python qsap.py example/sample_spectrum.txt
 # ...to get started!
 ```
 
@@ -84,13 +84,13 @@ python qasap.py example/sample_spectrum.txt
 
 ```bash
 # Automatic format detection
-python qasap.py <spectrum.fits>
+python qsap.py <spectrum.fits>
 
 # Preview detected formats
-python qasap.py <spectrum.fits> --detect
+python qsap.py <spectrum.fits> --detect
 
 # Force specific format if needed
-python qasap.py <spectrum.fits> --fmt fits:image1d
+python qsap.py <spectrum.fits> --fmt fits:image1d
 ```
 
 ### Supported Formats
@@ -116,26 +116,26 @@ python qasap.py <spectrum.fits> --fmt fits:image1d
 --gui              Launch GUI for interactive input
 ```
 
-### Making `qasap` Executable
+### Making `qsap` Executable
 
-To run QASAP from anywhere as a simple `qasap` command, use one of these options:
+To run QSAP from anywhere as a simple `qsap` command, use one of these options:
 
 **Option 1: Package Installation (Recommended)**
 
-Install QASAP as a Python package, which automatically creates the executable:
+Install QSAP as a Python package, which automatically creates the executable:
 
 ```bash
-# From inside the qasap directory
+# From inside the qsap directory
 pip install .
 
-# Or in development mode (allows you to modify the code and run it with the updated changes using the qasap command)
+# Or in development mode (allows you to modify the code and run it with the updated changes using the qsap command)
 pip install -e .
 ```
 
-Now you can run QASAP from anywhere:
+Now you can run QSAP from anywhere:
 
 ```bash
-qasap <path/to/spectrum.fits>
+qsap <path/to/spectrum.fits>
 ```
 
 This method uses the entry point defined in `setup.py` to create a proper command-line executable.
@@ -144,29 +144,29 @@ This method uses the entry point defined in `setup.py` to create a proper comman
 
 1. **Make the script executable:**
    ```bash
-   chmod +x qasap.py
+   chmod +x qsap.py
    ```
 
 2. **Create a symlink in a directory on your PATH:**
    ```bash
-   # Find your qasap installation path
-   QASAP_PATH=$(pwd)/qasap.py
+   # Find your qsap installation path
+   QSAP_PATH=$(pwd)/qsap.py
    
    # Link to a bin directory in your PATH (example: /usr/local/bin)
-   sudo ln -s $QASAP_PATH /usr/local/bin/qasap
+   sudo ln -s $QSAP_PATH /usr/local/bin/qsap
    ```
 
 ## Upgrading Versions
 
-If you already have QASAP installed and want to upgrade to a newer version, follow one of these methods:
+If you already have QSAP installed and want to upgrade to a newer version, follow one of these methods:
 
 ### Method 1: Git Pull
 
 If you cloned from git and want to update to the latest version:
 
 ```bash
-# Navigate to your qasap directory
-cd /path/to/qasap
+# Navigate to your qsap directory
+cd /path/to/qsap
 
 # Pull the latest changes
 git pull origin main
@@ -175,7 +175,7 @@ git pull origin main
 pip install -e .
 
 # Verify
-qasap --help
+qsap --help
 ```
 
 ### Method 2: Update to a Specific Version Tag
@@ -183,20 +183,20 @@ qasap --help
 To update to a specific version (e.g., v0.10):
 
 ```bash
-# Navigate to your qasap directory
-cd /path/to/qasap
+# Navigate to your qsap directory
+cd /path/to/qsap
 
 # Fetch all available versions/tags from remote
 git fetch origin
 
 # Checkout the specific version you want
-git checkout v0.10
+git checkout v0.12
 
 # Reinstall (if dependencies changed)
 pip install -e .
 
 # Verify
-qasap --help
+qsap --help
 ```
 
 ### Method 3: Fresh Installation
@@ -205,24 +205,24 @@ If you prefer a clean installation:
 
 ```bash
 # Clone the latest version
-git clone https://github.com/eriksolhaug/qasap.git
+git clone https://github.com/eriksolhaug/qsap.git
 # OR clone a specific version tag
-git clone --depth 1 --branch v0.10 https://github.com/eriksolhaug/qasap.git
+git clone --depth 1 --branch v0.12 https://github.com/eriksolhaug/qsap.git
 
-# Navigate to the new qasap directory
-cd qasap
+# Navigate to the new qsap directory
+cd qsap
 
 # Install
 pip install -e .
 
 # Verify
-qasap --help
+qsap --help
 ```
 
 ### Troubleshooting Version Updates
 
-**"command not found: qasap"** after updating:
-- Make sure your conda environment is activated: `conda activate qasap`
+**"command not found: qsap"** after updating:
+- Make sure your conda environment is activated: `conda activate qsap`
 - Try reinstalling: `pip install -e .`
 
 **Import errors or missing modules**:
@@ -230,27 +230,27 @@ qasap --help
 - Or reinstall all requirements: `pip install --upgrade -r requirements.txt`
 
 **Old version still running**:
-- Check which qasap is being used: `which qasap`
+- Check which qsap is being used: `which qsap`
 - Verify it points to your new installation
 - If it's a symlink (Method 2 of initial install), update it to point to the new location
 
 ## Quick Start
 
-### Running QASAP
+### Running QSAP
 
-Once installed with `pip install -e .`, you have two ways to launch QASAP:
+Once installed with `pip install -e .`, you have two ways to launch QSAP:
 
 **Without a Spectrum File:**
 ```bash
-qasap
+qsap
 ```
-This launches QASAP with an empty plotter. You can then load a spectrum using the Open button in the Control Panel.
+This launches QSAP with an empty plotter. You can then load a spectrum using the Open button in the Control Panel.
 
 **With a Spectrum File:**
 ```bash
-qasap <path/to/spectrum.fits>
-qasap example/sample_spectrum.txt
-qasap data/my_spectrum.txt --redshift 0.1
+qsap <path/to/spectrum.fits>
+qsap example/sample_spectrum.txt
+qsap data/my_spectrum.txt --redshift 0.1
 ```
 
 ### Opening a Spectrum
@@ -259,20 +259,20 @@ You can load a spectrum file in two ways:
 
 1. **Command Line**: Provide the file path as an argument when launching:
    ```bash
-   qasap /path/to/your/spectrum.fits
+   qsap /path/to/your/spectrum.fits
    ```
 
 2. **GUI Open Button**: 
-   - Launch QASAP by running `qasap` in the terminal (specifying a spectrum file is not required)
+   - Launch QSAP by running `qsap` in the terminal (specifying a spectrum file is not required)
    - In the Control Panel (left side), click the **Open** button
    - A file browser will appear—navigate to and select your spectrum file
-   - QASAP automatically detects the file format and loads the data
+   - QSAP automatically detects the file format and loads the data
 
 ## Package Structure
 
 ```
 .
-├── qasap.py                 # Main entry point (root level)
+├── qsap.py                  # Main entry point (root level)
 ├── setup.py                 # Package setup and installation
 ├── requirements.txt         # Python dependencies
 ├── LICENSE
@@ -280,7 +280,7 @@ You can load a spectrum file in two ways:
 ├── __init__.py              # Package initialization
 ├── example/                 # Example data
 │   └── sample_spectrum.txt  # Sample spectrum file to get started
-├── qasap/                   # Main package directory
+├── qsap/                    # Main package directory
 │   ├── __init__.py
 │   ├── spectrum_io.py                  # File I/O with auto-detection
 │   ├── spectrum_analysis.py            # Fitting and analysis functions
@@ -310,7 +310,7 @@ You can load a spectrum file in two ways:
 ## Data Files
 
 **Example Data** (in `example/`):
-- `sample_spectrum.txt`: Sample spectrum file to get started with QASAP
+- `sample_spectrum.txt`: Sample spectrum file to get started with QSAP
 
 **Line Lists** (in `resources/linelist/`):
 - `emlines.txt`: Emission line catalog
@@ -392,11 +392,11 @@ Note: You will need to select the line list and Toggle Display to view lines. Se
 - `?` - Show keyboard shortcuts help window
 
 **File Storage:**
-All saved screenshots, redshifts, and profile info are stored in the directory where QASAP was launched from.
+All saved screenshots, redshifts, and profile info are stored in the directory where QSAP was launched from.
 
 ### Fitting Engines by Mode
 
-QASAP employs different fitting algorithms optimized for each analysis task:
+QSAP employs different fitting algorithms optimized for each analysis task:
 
 | Mode | Key | Fitting Engine | Method | Use Case |
 |------|-----|----------------|--------|----------|
@@ -559,13 +559,13 @@ Detailed parameter display and management for all fitted components:
 - **v0.9** (stable): Fixed Listfit parameter error extraction, PolynomialModel integration for proper coefficient variation, Item Tracker synchronization with internal storage removal
 - **v0.8**: Listfit mode for simultaneous multi-component fitting, ItemTracker for centralized feature management with multi-select and deletion, auto-fit registration, redshift mode improvements
 - **v0.7** (stable): Available as tagged release on GitHub. Refactored with intelligent format auto-detection, modular architecture, and comprehensive UI
-- **v0.5** (legacy): Available in `qasap_v0.5/` directory with full Voigt/Gaussian fitting, MCMC, velocity mode
+- **v0.5** (legacy): Available in `qsap_v0.5/` directory with full Voigt/Gaussian fitting, MCMC, velocity mode
 
 ## Citation
 
 ```
-Solhaug, E. (2025). QASAP: Quick Analysis of Spectra and Profiles.
-https://github.com/eriksolhaug/qasap
+Solhaug, E. (2025). QSAP: Quick Spectrum Analysis Program.
+https://github.com/eriksolhaug/qsap
 ```
 
 ## License
