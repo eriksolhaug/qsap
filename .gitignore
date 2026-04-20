@@ -1,9 +1,10 @@
 # Large files and presentations
 *.key
-qasap_v0.5/*.key
+qsap_v0.5/*.key
 
 # Working documents (not for repository)
 FORPAPER.md
+FORMANUAL.md
 CONSOLIDATION*.md
 
 # Byte-compiled / optimized / DLL files

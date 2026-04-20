@@ -10,13 +10,13 @@ with open("version.txt", "r", encoding="utf-8") as fh:
     version = fh.read().strip()
 
 setup(
-    name="qasap",
+    name="qsap",
     version=version,
     author="Erik Solhaug",
-    description="Quick Analysis of Spectra and Profiles - Interactive spectral analysis tool",
+    description="Quick Spectrum Analysis Program - Interactive spectral analysis tool",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/eriksolhaug/qasap",
+    url="https://github.com/eriksolhaug/qsap",
     packages=find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
@@ -31,7 +31,7 @@ setup(
     install_requires=requirements,
     entry_points={
         "console_scripts": [
-            "qasap=qasap:main",
+            "qsap=qsap:main",
         ],
     },
     include_package_data=True,
