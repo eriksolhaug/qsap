@@ -19,7 +19,7 @@ class LineList:
     """Represents a collection of spectral lines"""
     name: str
     lines: List[Line]
-    color: str = "#1f77b4"  # Default blue
+    color: str = "#496F5D"  # Default teal/sage green from config
     path: Optional[Path] = None
 
 

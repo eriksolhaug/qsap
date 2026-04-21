@@ -51,6 +51,9 @@ class LineListSelector(QtWidgets.QWidget):
         # Connect checkbox changes to auto-update
         self.linelist_table.itemChanged.connect(self.on_checkbox_changed)
         
+        # Connect double-click to change color
+        self.linelist_table.doubleClicked.connect(self.on_row_double_clicked)
+        
         # Buttons
         button_layout = QtWidgets.QHBoxLayout()
         self.btn_toggle = QtWidgets.QPushButton("Toggle Display")
@@ -137,6 +140,16 @@ class LineListSelector(QtWidgets.QWidget):
     def on_checkbox_changed(self, item):
         """Handle checkbox state changes - auto-toggle display"""
         self.toggle_linelist()
+    
+    def on_row_double_clicked(self, index):
+        """Handle double-click on a row to change color"""
+        row = index.row()
+        col = index.column()
+        
+        # Allow double-click on any column to change color
+        # Set current row and call change_color
+        self.linelist_table.setCurrentCell(row, col)
+        self.change_color()
     
     def change_color(self):
         """Change color of selected line list"""

@@ -46,6 +46,11 @@
     "linestyle": "-",
     "linewidth": 2
   },
+  "line_lists": {
+    "color": "#496F5D",
+    "linestyle": "--",
+    "linewidth": 1
+  },
   "reference_lines": {
     "color": "gray",
     "linestyle": "--",

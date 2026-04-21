@@ -797,6 +797,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         
         self.load_fit_button = QPushButton("Load Fit...")
         self.load_fit_button.clicked.connect(self.load_fit_file)
+        self.load_fit_button.setEnabled(False)
         left_column_layout.addWidget(self.load_fit_button)
         
         left_column_layout.addStretch()
@@ -886,11 +887,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.undo_button = QPushButton("← Undo")
         self.undo_button.setMaximumWidth(80)
         self.undo_button.clicked.connect(self.on_undo)
+        self.undo_button.setEnabled(False)
         button_row_layout.addWidget(self.undo_button)
         
         self.redo_button = QPushButton("Redo →")
         self.redo_button.setMaximumWidth(80)
         self.redo_button.clicked.connect(self.on_redo)
+        self.redo_button.setEnabled(False)
         button_row_layout.addWidget(self.redo_button)
         
         button_row_layout.addSpacing(20)  # Add horizontal space
@@ -2013,7 +2016,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         main_layout.setSpacing(5)
         
         # ===== FITTING SECTION TITLE =====
-        fitting_title = QtWidgets.QLabel("Fitting")
+        fitting_title = QtWidgets.QLabel("Fit")
         fitting_title.setStyleSheet("font-weight: bold; font-size: 12px; color: #0078d4;")
         main_layout.addWidget(fitting_title)
         
@@ -2147,6 +2150,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         calculate_dropdown_layout.addWidget(self.calculate_mode_dropdown)
         calculate_dropdown_layout.addStretch()
         calculate_layout.addLayout(calculate_dropdown_layout)
+        
+        # Plot Residual button
+        plot_residual_layout = QtWidgets.QHBoxLayout()
+        self.plot_residual_button = QtWidgets.QPushButton("Plot Residual     [r]")
+        self.plot_residual_button.clicked.connect(self.toggle_residual_panel)
+        plot_residual_layout.addWidget(self.plot_residual_button)
+        plot_residual_layout.addStretch()
+        calculate_layout.addLayout(plot_residual_layout)
         
         main_layout.addLayout(calculate_layout)
         
@@ -4500,6 +4511,143 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         
         # Redraw plot to ensure the new marker and label are visible
         plt.draw()
+    
+    def create_standalone_marker_from_linelist(self, x_position):
+        """Create a standalone marker at x_position using line list selection"""
+        available_line_lists = self.get_all_available_line_lists()
+        self.marker_linelist_window = LineListWindow(available_line_lists=available_line_lists)
+        self.marker_linelist_window.x_position = x_position  # Store x position
+        self.marker_linelist_window.selected_line.connect(self.on_standalone_marker_line_selected)
+        self.marker_linelist_window.setWindowFlags(self.marker_linelist_window.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
+        self.marker_linelist_window.show()
+        self.marker_linelist_window.raise_()
+        self.marker_linelist_window.activateWindow()
+    
+    def on_standalone_marker_line_selected(self, line_id, wavelength):
+        """Handle line selection for standalone marker creation"""
+        if hasattr(self, 'marker_linelist_window'):
+            x_position = self.marker_linelist_window.x_position
+            # Create a standalone marker with a marker color (use gaussian color by default)
+            marker_color = self.colors['markers']['gaussian']['color']
+            # Create marker with default bounds (just at the position)
+            bounds = (x_position - 1, x_position + 1)
+            
+            # Get current y-axis limits and calculate the y-position
+            x_min, x_max = self.ax.get_xlim()
+            y_min, y_max = self.ax.get_ylim()
+            x_pos_add = (x_max - x_min) * 0.02
+            y_pos = y_min + 0.925 * (y_max - y_min)
+            
+            # Draw marker at x_position
+            marker, = self.ax.plot(
+                [x_position, x_position],
+                [y_pos, y_pos + 0.05 * (y_max - y_min)],
+                color=marker_color,
+                lw=2
+            )
+            # Attach attributes to marker
+            setattr(marker, 'bounds', bounds)
+            setattr(marker, 'center', x_position)
+            setattr(marker, 'line_id', line_id)
+            self.markers.append(marker)
+            
+            # Add label
+            label = self.ax.text(
+                x_position + x_pos_add, y_pos - 0.10 * (y_max - y_min),
+                line_id,
+                color=marker_color,
+                verticalalignment='center',
+                horizontalalignment='center',
+                rotation='vertical'
+            )
+            setattr(label, 'bounds', bounds)
+            setattr(label, 'center', x_position)
+            setattr(label, 'marker', marker)
+            self.labels.append(label)
+            
+            # Register in item tracker (do NOT connect to any fit)
+            marker_id = f"marker_standalone_{len(self.markers)-1}_{line_id}"
+            self.item_tracker.add_item(marker_id, 'marker', f'Marker: {line_id}', position=f'{x_position:.2f} Å', color=marker_color, line_obj=marker)
+            
+            # Register in item_id_map for removal
+            self.item_id_map[marker_id] = {
+                'type': 'marker',
+                'fit_dict': None,
+                'line_obj': marker,
+                'name': f'Marker: {line_id}',
+                'position': f'{x_position:.2f} Å',
+                'color': marker_color
+            }
+            
+            print(f"Created standalone marker: {line_id} at λ={x_position:.2f} Å")
+            self.record_action('create_standalone_marker', f'Create Marker: {line_id}')
+            self.ax.figure.canvas.draw_idle()
+    
+    def create_standalone_marker_from_text(self, x_position):
+        """Create a standalone marker at x_position with custom text input"""
+        # Open text input dialog
+        text, ok = QtWidgets.QInputDialog.getText(
+            self, 'Marker Label', 'Enter text for marker label:'
+        )
+        
+        if ok and text:
+            self.on_standalone_marker_text_entered(x_position, text)
+    
+    def on_standalone_marker_text_entered(self, x_position, label_text):
+        """Handle marker creation with text input"""
+        marker_color = self.colors['markers']['gaussian']['color']
+        bounds = (x_position - 1, x_position + 1)
+        
+        # Get current y-axis limits and calculate the y-position
+        x_min, x_max = self.ax.get_xlim()
+        y_min, y_max = self.ax.get_ylim()
+        x_pos_add = (x_max - x_min) * 0.02
+        y_pos = y_min + 0.925 * (y_max - y_min)
+        
+        # Draw marker at x_position
+        marker, = self.ax.plot(
+            [x_position, x_position],
+            [y_pos, y_pos + 0.05 * (y_max - y_min)],
+            color=marker_color,
+            lw=2
+        )
+        # Attach attributes to marker
+        setattr(marker, 'bounds', bounds)
+        setattr(marker, 'center', x_position)
+        setattr(marker, 'line_id', label_text)
+        self.markers.append(marker)
+        
+        # Add label with custom text
+        label = self.ax.text(
+            x_position + x_pos_add, y_pos - 0.10 * (y_max - y_min),
+            label_text,
+            color=marker_color,
+            verticalalignment='center',
+            horizontalalignment='center',
+            rotation='vertical'
+        )
+        setattr(label, 'bounds', bounds)
+        setattr(label, 'center', x_position)
+        setattr(label, 'marker', marker)
+        self.labels.append(label)
+        
+        # Register in item tracker
+        marker_id = f"marker_text_{len(self.markers)-1}_{label_text}"
+        self.item_tracker.add_item(marker_id, 'marker', f'Marker: {label_text}', position=f'{x_position:.2f} Å', color=marker_color, line_obj=marker)
+        
+        # Register in item_id_map for removal
+        self.item_id_map[marker_id] = {
+            'type': 'marker',
+            'fit_dict': None,
+            'line_obj': marker,
+            'name': f'Marker: {label_text}',
+            'position': f'{x_position:.2f} Å',
+            'color': marker_color
+        }
+        
+        print(f"Created text marker: {label_text} at λ={x_position:.2f} Å")
+        self.record_action('create_text_marker', f'Create Text Marker: {label_text}')
+        self.ax.figure.canvas.draw_idle()
 
     def assign_line_to_fit(self, selected_line_id, selected_wavelength):
         # Assign the selected line ID and wavelength to the selected Gaussian or Voigt profile
@@ -5604,6 +5752,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             print("Plot style toggled:", "Step plot" if self.is_step_plot else "Line plot")
 
         if event.key == 'v':  # Use 'v' key to calculate equivalent width
+            if event.xdata is None:
+                print("Please click inside the plot area to use this function.")
+                return
             x_pos = event.xdata  # Get x position of mouse click
 
             # Find the Gaussian fit corresponding to the selected x position
@@ -5781,6 +5932,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.input_poly_order.hide()
             print('Exiting continuum mode.')
         elif event.key == ' ' and self.continuum_mode:
+            if event.xdata is None:
+                print("Please click inside the plot area to use this function.")
+                return
             # Capture current mouse x-coordinate for regions
             if len(self.continuum_regions) == 0 or self.continuum_regions[-1][1] is not None:
                 # Start a new region
@@ -5805,6 +5959,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 self.fig.canvas.draw_idle()  # Update plot with the new region
         # Remove continuum region
         if event.key == 'M':
+            if event.xdata is None:
+                print("Please click inside the plot area to use this function.")
+                return
             # Check each continuum fit to see if the mouse is over it
             for fit in self.continuum_fits:
                 region_bounds = fit['bounds']
@@ -6997,6 +7154,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
 
         if event.key == 'x':
             # Center x-bounds on cursor position
+            if event.xdata is None:
+                print("Please click inside the plot area to use this function.")
+                return
             center_x = event.xdata
             x_range = self.x_upper_bound - self.x_lower_bound
             half_range = x_range / 2
@@ -7579,6 +7739,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.save_plot_as_pdf()
 
         if event.key == ',':  # Use ',' key to assign line ID and wavelength
+            if event.xdata is None:
+                print("Please click inside the plot area to use this function.")
+                return
             x_pos = event.xdata  # Get x position of mouse click
             self.selected_gaussian = None
             self.selected_voigt = None
@@ -7612,6 +7775,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             
         elif event.key == '<':
             # Find the marker and label nearest to the cursor to remove
+            if event.xdata is None:
+                print("Please click inside the plot area to use this function.")
+                return
             x_pos = event.xdata  # Current cursor x-position
             for marker in self.markers:
                 left_bound, right_bound = getattr(marker, 'bounds')
@@ -7646,6 +7812,24 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     print(f"Removed marker within bounds ({left_bound}, {right_bound})")
                     plt.draw()
                     break
+        
+        elif event.key == '.':
+            # Create a standalone marker from line list at cursor position
+            if event.xdata is None:
+                print("Please click inside the plot area to use this function.")
+                return
+            x_pos = event.xdata
+            if x_pos is not None:
+                self.create_standalone_marker_from_linelist(x_pos)
+        
+        elif event.key == '>':
+            # Create a standalone marker from custom text input at cursor position
+            if event.xdata is None:
+                print("Please click inside the plot area to use this function.")
+                return
+            x_pos = event.xdata
+            if x_pos is not None:
+                self.create_standalone_marker_from_text(x_pos)
 
     def show_listfit_window(self):
         """Display the listfit component selection window"""
