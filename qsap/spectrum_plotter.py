@@ -82,6 +82,8 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Qt5Agg')
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 import matplotlib.cm as cm
 from astropy.io import fits
 from scipy.optimize import curve_fit
@@ -91,7 +93,7 @@ import lmfit
 from lmfit import Model, Parameters, conf_interval, minimize
 from lmfit.models import PolynomialModel
 from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton
-from PyQt5 import QtWidgets, QtCore
+from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import pyqtSignal, Qt
 from PyQt5.QtGui import QDoubleValidator, QIntValidator, QIcon, QKeyEvent
 from PyQt5.QtWidgets import QFileDialog
@@ -157,6 +159,14 @@ class OutputPanel(QtWidgets.QWidget):
         # Create text display area
         self.text_edit = QtWidgets.QPlainTextEdit()
         self.text_edit.setReadOnly(True)
+        
+        # Enable text selection and copying
+        self.text_edit.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse | 
+            QtCore.Qt.TextSelectableByKeyboard | 
+            QtCore.Qt.LinksAccessibleByMouse
+        )
+        
         # Set size policy to expand to fill available space
         self.text_edit.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.text_edit.setMinimumHeight(100)  # Set minimum height instead of maximum
@@ -170,10 +180,33 @@ class OutputPanel(QtWidgets.QWidget):
             }
         """)
         
+        # Enable context menu for copy/paste operations
+        self.text_edit.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.text_edit.customContextMenuRequested.connect(self.show_context_menu)
+        
         layout.addWidget(self.text_edit)
         self.setLayout(layout)
         # Set the OutputPanel itself to expand
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+    
+    def show_context_menu(self, position):
+        """Show context menu for copy/select all operations."""
+        menu = QtWidgets.QMenu()
+        
+        # Copy action
+        copy_action = menu.addAction("Copy")
+        copy_action.triggered.connect(self.text_edit.copy)
+        
+        # Select All action
+        select_all_action = menu.addAction("Select All")
+        select_all_action.triggered.connect(self.text_edit.selectAll)
+        
+        # Clear action
+        menu.addSeparator()
+        clear_action = menu.addAction("Clear")
+        clear_action.triggered.connect(self.clear_output)
+        
+        menu.exec_(self.text_edit.mapToGlobal(position))
     
     def append_text(self, text):
         """Append text to the output panel."""
@@ -185,6 +218,19 @@ class OutputPanel(QtWidgets.QWidget):
     def clear_output(self):
         """Clear the output panel."""
         self.text_edit.clear()
+    
+    def keyPressEvent(self, event):
+        """Handle keyboard shortcuts for copy/select all."""
+        if event.key() == QtCore.Qt.Key_C and event.modifiers() == QtCore.Qt.ControlModifier:
+            # Ctrl+C: Copy selected text
+            self.text_edit.copy()
+            event.accept()
+        elif event.key() == QtCore.Qt.Key_A and event.modifiers() == QtCore.Qt.ControlModifier:
+            # Ctrl+A: Select all text
+            self.text_edit.selectAll()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
     
     def restore_streams(self):
         """Restore original stdout/stderr."""
@@ -276,7 +322,8 @@ class HelpWindow(QtWidgets.QDialog):
 - **?** - Show this help window
 
 ## File Storage
-All saved screenshots, redshifts, and profile info are stored in the directory where QSAP was launched from.
+All saved screenshots, redshifts, and profile info are by default stored in the directory where QSAP was launched from.
+This can be changed in the settings menu.
 """
     
     def keyPressEvent(self, event):
@@ -301,13 +348,20 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Process LSF
         self.process_lsf(lsf)
 
-        # Create central widget for the control panel
-        central_widget = QtWidgets.QWidget()
-        self.setCentralWidget(central_widget)
+        # Set window properties first
+        from qsap.ui_utils import get_qsap_icon
+        self.setWindowTitle("QSAP - Spectrum Viewer")
+        self.setWindowIcon(get_qsap_icon())
+        self.setGeometry(100, 100, 1200, 700)
 
-        # Initialize the control panel (will be added to central widget)
+        # Initialize the control panel (will be docked later in plot_spectrum)
         # This must be done BEFORE create_menu_bar() since the menu bar references windows created here
         self.init_controlpanel()
+        
+        # Initialize settings panel
+        self.save_directory = str(Path.cwd())  # Default to app launch directory
+        self.load_directory = str(Path.cwd())  # Default to app launch directory
+        self.init_settings_panel()
         
         # Initialize window creation attempt flags and resources BEFORE create_menu_bar()
         self.help_window = None
@@ -446,6 +500,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.action_history_window = ActionHistoryWindow()
         self.action_history_window.set_action_history(self.action_history)
         self.action_history_window.action_selected.connect(self.on_action_selected)
+        # Connect visibility changes if signal is available
+        if hasattr(self.action_history_window, 'visibilityChanged'):
+            self.action_history_window.visibilityChanged.connect(self.on_window_visibility_changed)
+        if hasattr(self.action_history_window, 'destroyed'):
+            self.action_history_window.destroyed.connect(self.on_window_visibility_changed)
         
         # Track if this is the first spectrum load (for initial action recording)
         self.is_first_load = True
@@ -515,6 +574,12 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Create View menu
         self.view_menu = menubar.addMenu("View")
         self.update_view_menu()
+        
+        # Create Help menu
+        self.help_menu = menubar.addMenu("Help")
+        help_action = self.help_menu.addAction("Show Help")
+        help_action.setShortcut("?")
+        help_action.triggered.connect(self.show_help_window)
 
     def update_view_menu(self):
         """Update the View menu with all available windows"""
@@ -577,6 +642,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 is_visible = self.listfit_window.isVisible()
                 windows.append(("Listfit", self.listfit_window, is_visible))
         
+        # Add Control Panel Dock Widget
+        if hasattr(self, 'control_panel_dock') and self.control_panel_dock is not None:
+            is_visible = self.control_panel_dock.isVisible()
+            windows.append(("Control Panel", self.control_panel_dock, is_visible))
+        
         # Add Right Dock Widget (Fitting Options)
         if hasattr(self, 'right_dock_widget') and self.right_dock_widget is not None:
             is_visible = self.right_dock_widget.isVisible()
@@ -606,6 +676,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         try:
             from qsap.help_window import HelpWindow
             self.help_window = HelpWindow()
+            # Connect visibility changes to update the View menu if signal available
+            if hasattr(self.help_window, 'visibilityChanged'):
+                self.help_window.visibilityChanged.connect(self.on_window_visibility_changed)
+            if hasattr(self.help_window, 'destroyed'):
+                self.help_window.destroyed.connect(self.on_window_visibility_changed)
         except Exception as e:
             pass  # Silently skip if help_window module not available
     
@@ -615,6 +690,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             from qsap.line_list_selector import LineListSelector
             self.line_list_selector = LineListSelector(self.resources_dir)
             self.line_list_selector.line_lists_changed.connect(self.on_line_lists_changed)
+            # Connect visibility changes to update the View menu if signal available
+            if hasattr(self.line_list_selector, 'visibilityChanged'):
+                self.line_list_selector.visibilityChanged.connect(self.on_window_visibility_changed)
+            if hasattr(self.line_list_selector, 'destroyed'):
+                self.line_list_selector.destroyed.connect(self.on_window_visibility_changed)
         except Exception as e:
             pass  # Silently skip if line_list_selector module not available
     
@@ -628,27 +708,42 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             print(f"Could not create Listfit window: {e}")
 
     def toggle_window(self, window_obj):
-        """Toggle the visibility of a window"""
+        """Toggle the visibility of a window - resets to default position when shown"""
         if window_obj is None:
             return
         
-        # Handle QDockWidget specially - use toggleViewAction() to restore as docked, not floating
+        # Handle QDockWidget specially - use toggleViewAction() to restore as docked
         if isinstance(window_obj, QtWidgets.QDockWidget):
-            # Use the dock widget's built-in toggle action to restore properly
+            # Use the dock widget's built-in toggle action to restore properly to default docked position
             window_obj.toggleViewAction().trigger()
-        # Handle matplotlib canvas specially
-        elif hasattr(window_obj, 'figure'):
-            # It's a matplotlib canvas
-            if window_obj.isVisible():
-                window_obj.hide()
-            else:
-                window_obj.show()
+        # Handle regular QWidget windows - reset position when showing
         elif hasattr(window_obj, 'isVisible'):
-            # It's a QWidget or similar
             if window_obj.isVisible():
                 window_obj.hide()
             else:
+                # Reset to default position when showing
+                if window_obj == self.help_window and self.help_window is not None:
+                    # Reset help window position
+                    self.help_window.move(200, 200)
+                elif window_obj == self.fit_information_window:
+                    # Reset fit information window to default position
+                    self.fit_information_window.setGeometry(100, 550, 1200, 350)
+                elif window_obj == self.action_history_window:
+                    # Reset action history window to default position
+                    self.action_history_window.setGeometry(300, 300, 400, 300)
+                elif window_obj == self.item_tracker:
+                    # Reset item tracker to default position
+                    self.item_tracker.setGeometry(100, 550, 600, 300)
+                elif window_obj == self.line_list_selector and self.line_list_selector is not None:
+                    # Reset line list selector to default position
+                    self.line_list_selector.setGeometry(500, 400, 400, 300)
+                
                 window_obj.show()
+                # Bring window to front and activate it
+                if hasattr(window_obj, 'raise_'):
+                    window_obj.raise_()
+                if hasattr(window_obj, 'activateWindow'):
+                    window_obj.activateWindow()
         
         # Refresh the View menu after toggling to update checkmarks
         self.update_view_menu()
@@ -657,90 +752,162 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         """Refresh the View menu - called after windows are created or shown/hidden"""
         self.update_view_menu()
 
+    def on_window_visibility_changed(self):
+        """Handle window visibility changes and update the View menu accordingly"""
+        self.update_view_menu()
+
     def init_controlpanel(self):
-        # Create a container widget for control panel
-        control_panel_container = QtWidgets.QWidget()
+        # Create a container widget for control panel (will be added to matplotlib window as dock later)
+        self.control_panel_container = QtWidgets.QWidget()
         control_panel_layout = QVBoxLayout()
         control_panel_layout.setContentsMargins(10, 10, 10, 10)
         control_panel_layout.setSpacing(5)
         
-        # Redshift section
-        redshift_group = QtWidgets.QGroupBox("Redshift")
-        redshift_layout = QHBoxLayout()
+        # ===== TOP ROW: Logo & File buttons (left) + Redshift section (right) =====
+        top_row_layout = QHBoxLayout()
+        top_row_layout.setSpacing(10)
         
+        # LEFT SIDE: Logo and File buttons
+        left_column_layout = QVBoxLayout()
+        left_column_layout.setSpacing(5)
+        left_column_layout.setAlignment(QtCore.Qt.AlignTop)
+        
+        # Logo (at top of left column)
+        logo_label = QtWidgets.QLabel()
+        logo_path = Path(__file__).parent.parent / 'logo' / 'qsap_logo.png'
+        if logo_path.exists():
+            pixmap = QtGui.QPixmap(str(logo_path))
+            # Scale logo to reasonable size (max 80px wide)
+            scaled_pixmap = pixmap.scaledToWidth(80, QtCore.Qt.SmoothTransformation)
+            logo_label.setPixmap(scaled_pixmap)
+            logo_label.setAlignment(QtCore.Qt.AlignCenter)
+            left_column_layout.addWidget(logo_label)
+        
+        # Version label under logo
+        from qsap import __version__
+        version_label = QtWidgets.QLabel(f"QSAP v{__version__}")
+        version_label.setAlignment(QtCore.Qt.AlignCenter)
+        version_label.setStyleSheet("font-size: 9px; color: #666666;")
+        left_column_layout.addWidget(version_label)
+        
+        # File buttons (below version)
+        self.open_button = QPushButton("Load Spectrum...")
+        self.open_button.clicked.connect(self.open_spectrum_file)
+        left_column_layout.addWidget(self.open_button)
+        
+        self.load_fit_button = QPushButton("Load Fit...")
+        self.load_fit_button.clicked.connect(self.load_fit_file)
+        left_column_layout.addWidget(self.load_fit_button)
+        
+        left_column_layout.addStretch()
+        
+        # RIGHT SIDE: Redshift section
+        redshift_group = QtWidgets.QGroupBox("Redshift")
+        redshift_layout = QVBoxLayout()
+        redshift_layout.setSpacing(2)
+        
+        # Redshift value input
+        redshift_input_layout = QHBoxLayout()
+        redshift_input_layout.setSpacing(5)
         self.label_redshift = QLabel("Value:")
         self.input_redshift = QLineEdit()
         self.input_redshift.setText(str(self.redshift))
         self.input_redshift.setMaximumWidth(80)
-        
-        # Redshift adjustment buttons
-        self.button_redshift_increase_0001 = QPushButton("↑ 0.001")
-        self.button_redshift_increase_0001.setMaximumWidth(75)
-        self.button_redshift_increase_0001.clicked.connect(lambda: self.adjust_redshift(0.001))
-        
-        self.button_redshift_increase_001 = QPushButton("↑ 0.01")
-        self.button_redshift_increase_001.setMaximumWidth(75)
-        self.button_redshift_increase_001.clicked.connect(lambda: self.adjust_redshift(0.01))
-        
-        self.button_redshift_increase_01 = QPushButton("↑ 0.1")
-        self.button_redshift_increase_01.setMaximumWidth(75)
-        self.button_redshift_increase_01.clicked.connect(lambda: self.adjust_redshift(0.1))
-        
-        self.button_redshift_decrease_0001 = QPushButton("↓ 0.001")
-        self.button_redshift_decrease_0001.setMaximumWidth(75)
-        self.button_redshift_decrease_0001.clicked.connect(lambda: self.adjust_redshift(-0.001))
-        
-        self.button_redshift_decrease_001 = QPushButton("↓ 0.01")
-        self.button_redshift_decrease_001.setMaximumWidth(75)
-        self.button_redshift_decrease_001.clicked.connect(lambda: self.adjust_redshift(-0.01))
-        
-        self.button_redshift_decrease_01 = QPushButton("↓ 0.1")
-        self.button_redshift_decrease_01.setMaximumWidth(75)
-        self.button_redshift_decrease_01.clicked.connect(lambda: self.adjust_redshift(-0.1))
-        
-        redshift_layout.addWidget(self.label_redshift)
-        redshift_layout.addWidget(self.input_redshift)
-        redshift_layout.addWidget(self.button_redshift_increase_0001)
-        redshift_layout.addWidget(self.button_redshift_increase_001)
-        redshift_layout.addWidget(self.button_redshift_increase_01)
-        redshift_layout.addWidget(self.button_redshift_decrease_0001)
-        redshift_layout.addWidget(self.button_redshift_decrease_001)
-        redshift_layout.addWidget(self.button_redshift_decrease_01)
-        redshift_group.setLayout(redshift_layout)
+        redshift_input_layout.addWidget(self.label_redshift)
+        redshift_input_layout.addWidget(self.input_redshift)
+        redshift_input_layout.addStretch()
+        redshift_layout.addLayout(redshift_input_layout)
         
         self.input_redshift.returnPressed.connect(self.apply_changes)
         
-        # Action buttons
-        button_layout = QHBoxLayout()
+        # UP buttons row
+        redshift_up_layout = QHBoxLayout()
+        redshift_up_layout.setSpacing(2)
         
+        self.button_redshift_increase_0001 = QPushButton("↑ 0.001")
+        self.button_redshift_increase_0001.setMaximumWidth(80)
+        self.button_redshift_increase_0001.clicked.connect(lambda: self.adjust_redshift(0.001))
+        redshift_up_layout.addWidget(self.button_redshift_increase_0001)
+        
+        self.button_redshift_increase_001 = QPushButton("↑ 0.01")
+        self.button_redshift_increase_001.setMaximumWidth(80)
+        self.button_redshift_increase_001.clicked.connect(lambda: self.adjust_redshift(0.01))
+        redshift_up_layout.addWidget(self.button_redshift_increase_001)
+        
+        self.button_redshift_increase_01 = QPushButton("↑ 0.1")
+        self.button_redshift_increase_01.setMaximumWidth(80)
+        self.button_redshift_increase_01.clicked.connect(lambda: self.adjust_redshift(0.1))
+        redshift_up_layout.addWidget(self.button_redshift_increase_01)
+        redshift_up_layout.addStretch()
+        redshift_layout.addLayout(redshift_up_layout)
+        
+        # DOWN buttons row
+        redshift_down_layout = QHBoxLayout()
+        redshift_down_layout.setSpacing(2)
+        
+        self.button_redshift_decrease_0001 = QPushButton("↓ 0.001")
+        self.button_redshift_decrease_0001.setMaximumWidth(80)
+        self.button_redshift_decrease_0001.clicked.connect(lambda: self.adjust_redshift(-0.001))
+        redshift_down_layout.addWidget(self.button_redshift_decrease_0001)
+        
+        self.button_redshift_decrease_001 = QPushButton("↓ 0.01")
+        self.button_redshift_decrease_001.setMaximumWidth(80)
+        self.button_redshift_decrease_001.clicked.connect(lambda: self.adjust_redshift(-0.01))
+        redshift_down_layout.addWidget(self.button_redshift_decrease_001)
+        
+        self.button_redshift_decrease_01 = QPushButton("↓ 0.1")
+        self.button_redshift_decrease_01.setMaximumWidth(80)
+        self.button_redshift_decrease_01.clicked.connect(lambda: self.adjust_redshift(-0.1))
+        redshift_down_layout.addWidget(self.button_redshift_decrease_01)
+        redshift_down_layout.addStretch()
+        redshift_layout.addLayout(redshift_down_layout)
+        
+        # Apply button under redshift section (left-aligned, not full width)
+        apply_button_layout = QHBoxLayout()
         self.apply_button = QPushButton("Apply")
+        self.apply_button.setMaximumWidth(80)
         self.apply_button.clicked.connect(self.apply_changes)
+        apply_button_layout.addWidget(self.apply_button)
+        apply_button_layout.addStretch()
+        redshift_layout.addLayout(apply_button_layout)
         
-        self.open_button = QPushButton("Load Spectrum...")
-        self.open_button.clicked.connect(self.open_spectrum_file)
+        redshift_group.setLayout(redshift_layout)
         
-        self.load_fit_button = QPushButton("Load Fit...")
-        self.load_fit_button.clicked.connect(self.load_fit_file)
+        # Add left and right to top row
+        top_row_layout.addLayout(left_column_layout, 1)  # 50% width (logo + buttons)
+        top_row_layout.addWidget(redshift_group, 1)  # 50% width
         
-        button_layout.addWidget(self.apply_button)
-        button_layout.addWidget(self.open_button)
-        button_layout.addWidget(self.load_fit_button)
+        control_panel_layout.addLayout(top_row_layout)
         
-        # Undo/Redo buttons
-        undo_redo_layout = QHBoxLayout()
+        # ===== MIDDLE ROW: Undo/Redo/Quit/Help buttons =====
+        button_row_layout = QHBoxLayout()
+        button_row_layout.setSpacing(5)
         
         self.undo_button = QPushButton("← Undo")
+        self.undo_button.setMaximumWidth(80)
         self.undo_button.clicked.connect(self.on_undo)
+        button_row_layout.addWidget(self.undo_button)
         
         self.redo_button = QPushButton("Redo →")
+        self.redo_button.setMaximumWidth(80)
         self.redo_button.clicked.connect(self.on_redo)
+        button_row_layout.addWidget(self.redo_button)
+        
+        button_row_layout.addSpacing(20)  # Add horizontal space
+        
+        self.help_button = QPushButton("Help (?)")
+        self.help_button.setMaximumWidth(80)
+        self.help_button.clicked.connect(self.show_help_window)
+        button_row_layout.addWidget(self.help_button)
         
         self.quit_button = QPushButton("Quit")
+        self.quit_button.setMaximumWidth(80)
         self.quit_button.clicked.connect(self.quit_application)
+        button_row_layout.addWidget(self.quit_button)
         
-        undo_redo_layout.addWidget(self.undo_button)
-        undo_redo_layout.addWidget(self.redo_button)
-        undo_redo_layout.addWidget(self.quit_button)
+        button_row_layout.addStretch()
+        
+        control_panel_layout.addLayout(button_row_layout)
         
         # Polynomial order (hidden by default)
         poly_layout = QHBoxLayout()
@@ -761,25 +928,131 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.poly_order = 1
         
         # Add all sections to main layout
-        control_panel_layout.addWidget(redshift_group)
-        control_panel_layout.addLayout(button_layout)
-        control_panel_layout.addLayout(undo_redo_layout)
         control_panel_layout.addWidget(self.poly_order_widget)
         control_panel_layout.addStretch()
         
-        control_panel_container.setLayout(control_panel_layout)
+        self.control_panel_container.setLayout(control_panel_layout)
+
+    def init_settings_panel(self):
+        """Initialize the Settings panel for save directory configuration"""
+        self.settings_container = QtWidgets.QWidget()
+        settings_layout = QVBoxLayout()
+        settings_layout.setContentsMargins(10, 10, 10, 10)
+        settings_layout.setSpacing(10)
         
-        # Create dock widget for control panel at top left
-        self.control_panel_dock = QtWidgets.QDockWidget("Control Panel", self)
-        self.control_panel_dock.setAllowedAreas(QtCore.Qt.TopDockWidgetArea | QtCore.Qt.LeftDockWidgetArea)
-        self.control_panel_dock.setWidget(control_panel_container)
-        self.addDockWidget(QtCore.Qt.TopDockWidgetArea, self.control_panel_dock)
+        # Title
+        settings_title = QtWidgets.QLabel("Settings")
+        settings_title.setStyleSheet("font-weight: bold; font-size: 12px;")
+        settings_layout.addWidget(settings_title)
         
-        # Set window properties
-        from qsap.ui_utils import get_qsap_icon
-        self.setWindowTitle("QSAP")
-        self.setWindowIcon(get_qsap_icon())
-        self.setGeometry(100, 100, 1200, 700)
+        # Save Directory Section
+        save_dir_layout = QVBoxLayout()
+        save_dir_layout.setSpacing(5)
+        
+        save_dir_label = QtWidgets.QLabel("Save Directory:")
+        save_dir_label.setStyleSheet("font-weight: bold; font-size: 11px;")
+        save_dir_layout.addWidget(save_dir_label)
+        
+        # Directory input field and browse button
+        dir_input_layout = QHBoxLayout()
+        dir_input_layout.setSpacing(5)
+        
+        self.save_directory_input = QLineEdit()
+        self.save_directory_input.setText(self.save_directory)
+        self.save_directory_input.editingFinished.connect(self.on_save_directory_changed)
+        dir_input_layout.addWidget(self.save_directory_input)
+        
+        browse_button = QPushButton("Browse...")
+        browse_button.setMaximumWidth(100)
+        browse_button.clicked.connect(self.on_browse_save_directory)
+        dir_input_layout.addWidget(browse_button)
+        
+        save_dir_layout.addLayout(dir_input_layout)
+        
+        settings_layout.addLayout(save_dir_layout)
+        
+        # Load Directory Section
+        load_dir_layout = QVBoxLayout()
+        load_dir_layout.setSpacing(5)
+        
+        load_dir_label = QtWidgets.QLabel("Load Directory:")
+        load_dir_label.setStyleSheet("font-weight: bold; font-size: 11px;")
+        load_dir_layout.addWidget(load_dir_label)
+        
+        # Directory input field and browse button
+        load_input_layout = QHBoxLayout()
+        load_input_layout.setSpacing(5)
+        
+        self.load_directory_input = QLineEdit()
+        self.load_directory_input.setText(self.load_directory)
+        self.load_directory_input.editingFinished.connect(self.on_load_directory_changed)
+        load_input_layout.addWidget(self.load_directory_input)
+        
+        load_browse_button = QPushButton("Browse...")
+        load_browse_button.setMaximumWidth(100)
+        load_browse_button.clicked.connect(self.on_browse_load_directory)
+        load_input_layout.addWidget(load_browse_button)
+        
+        load_dir_layout.addLayout(load_input_layout)
+        
+        settings_layout.addLayout(load_dir_layout)
+        settings_layout.addStretch()
+        
+        self.settings_container.setLayout(settings_layout)
+
+    def on_browse_save_directory(self):
+        """Open file dialog to select save directory"""
+        directory = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select Save Directory",
+            self.save_directory,
+            QtWidgets.QFileDialog.ShowDirsOnly | QtWidgets.QFileDialog.DontResolveSymlinks
+        )
+        if directory:
+            self.save_directory = directory
+            self.save_directory_input.setText(directory)
+
+    def on_save_directory_changed(self):
+        """Handle changes to the save directory input field"""
+        new_directory = self.save_directory_input.text().strip()
+        try:
+            # Verify the directory exists
+            Path(new_directory).resolve()
+            self.save_directory = new_directory
+        except Exception as e:
+            # If invalid path, revert to previous value
+            self.save_directory_input.setText(self.save_directory)
+
+    def on_browse_load_directory(self):
+        """Open file dialog to select load directory"""
+        directory = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select Load Directory",
+            self.load_directory,
+            QtWidgets.QFileDialog.ShowDirsOnly | QtWidgets.QFileDialog.DontResolveSymlinks
+        )
+        if directory:
+            self.load_directory = directory
+            self.load_directory_input.setText(directory)
+
+    def on_load_directory_changed(self):
+        """Handle changes to the load directory input field"""
+        new_directory = self.load_directory_input.text().strip()
+        try:
+            # Verify the directory exists
+            Path(new_directory).resolve()
+            self.load_directory = new_directory
+        except Exception as e:
+            # If invalid path, revert to previous value
+            self.load_directory_input.setText(self.load_directory)
+
+    def show_help_window(self):
+        """Show the help window."""
+        if self.help_window is None:
+            self.help_window = HelpWindow(self)
+        self.help_window.show()
+        self.help_window.raise_()
+        self.help_window.activateWindow()
 
     def adjust_redshift(self, delta):
         """Adjust redshift by a specified delta value and update the input field."""
@@ -1562,13 +1835,83 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Set up plot - reuse existing figure if available, otherwise create new
         is_first_plot = not hasattr(self, 'fig') or self.fig is None
         if is_first_plot:
-            # Create new figure for first time
-            self.fig, self.ax = plt.subplots(figsize=(10, 6))
-            # Adjust plot
-            self.fig.subplots_adjust(bottom=0.35)
+            # Create new figure directly (not via plt)
+            self.fig = Figure(figsize=(10, 6))
+            self.ax = self.fig.add_subplot(111)
             
-            # Create output panel for first plot only
+            # Create canvas and set as central widget
+            self.canvas = FigureCanvas(self.fig)
+            
+            # Create wrapper widget with toolbar for spectrum plotter
+            wrapper_widget = QtWidgets.QWidget()
+            wrapper_layout = QVBoxLayout()
+            wrapper_layout.setContentsMargins(0, 0, 0, 0)
+            wrapper_layout.setSpacing(0)
+            
+            # Add matplotlib toolbar
+            from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
+            self.toolbar = NavigationToolbar2QT(self.canvas, self)
+            wrapper_layout.addWidget(self.toolbar)
+            
+            # Add canvas
+            wrapper_layout.addWidget(self.canvas)
+            wrapper_widget.setLayout(wrapper_layout)
+            wrapper_widget.setMinimumHeight(350)  # Spectrum plotter minimum size
+            
+            # Create vertical splitter for spectrum only (central widget)
+            center_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+            center_splitter.setContentsMargins(0, 0, 0, 0)
+            
+            # Add spectrum plotter (only section)
+            center_splitter.addWidget(wrapper_widget)
+            
+            # Don't add terminal to splitter - it will be a dockable widget
+            
+            self.center_splitter = center_splitter
+            self.setCentralWidget(center_splitter)
+            
+            # Create tab widget for dockable Control Panel + Item Tracker + Settings
+            top_tab_widget = QtWidgets.QTabWidget()
+            top_tab_widget.addTab(self.control_panel_container, "Control Panel")
+            top_tab_widget.addTab(self.item_tracker, "Item Tracker")
+            top_tab_widget.addTab(self.settings_container, "Settings")
+            
+            # Create dock widget for the tab widget (Control Panel - top/left)
+            self.control_panel_dock = QtWidgets.QDockWidget("Control Panel", self)
+            self.control_panel_dock.setWidget(top_tab_widget)
+            self.control_panel_dock.setAllowedAreas(QtCore.Qt.RightDockWidgetArea | QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.BottomDockWidgetArea | QtCore.Qt.TopDockWidgetArea)
+            self.control_panel_dock.setMinimumWidth(200)
+            self.control_panel_dock.setMaximumHeight(350)
+            self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.control_panel_dock)
+            
+            # Connect visibility changes if available
+            if hasattr(self.control_panel_dock, 'visibilityChanged'):
+                self.control_panel_dock.visibilityChanged.connect(self.on_window_visibility_changed)
+            if hasattr(self.control_panel_dock, 'destroyed'):
+                self.control_panel_dock.destroyed.connect(self.on_window_visibility_changed)
+            
+            # Create output panel (terminal at bottom) as a dockable widget
             self.output_panel = OutputPanel()
+            self.output_panel.setMinimumHeight(150)
+            terminal_dock = QtWidgets.QDockWidget("Terminal", self)
+            terminal_dock.setWidget(self.output_panel)
+            terminal_dock.setAllowedAreas(QtCore.Qt.BottomDockWidgetArea | QtCore.Qt.TopDockWidgetArea | QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea)
+            self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, terminal_dock)
+            self.bottom_dock_widget = terminal_dock
+            
+            # Connect visibility changes if available
+            if hasattr(terminal_dock, 'visibilityChanged'):
+                terminal_dock.visibilityChanged.connect(self.on_window_visibility_changed)
+            if hasattr(terminal_dock, 'destroyed'):
+                terminal_dock.destroyed.connect(self.on_window_visibility_changed)
+            
+            # Connect matplotlib events to SpectrumPlotter handlers
+            self.fig.canvas.mpl_connect('key_press_event', self.on_key)
+            self.fig.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
+            self.fig.canvas.mpl_connect('button_press_event', self.on_canvas_click)
+            
+            # Ensure canvas can receive focus for keyboard events
+            self.canvas.setFocus()
         else:
             # Reuse existing figure - clear axes
             self.ax.clear()
@@ -1608,17 +1951,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
 
         # Set the custom window title
         from qsap import __version__
-        self.fig.canvas.manager.set_window_title(f"QSAP - Quick Spectrum Analysis Program (v{__version__})")
+        # Update title with version (no matplotlib manager anymore)
+        self.setWindowTitle(f"QSAP - Quick Spectrum Analysis Program (v{__version__})")
 
         self.ax.legend(loc='upper right')
-
-        # Connect the key press and mouse move event
-        self.fig.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
-        self.fig.canvas.mpl_connect("key_press_event", self.on_key)
-        # Connect x-bounds update to the main plot's x-axis
-        self.ax.callbacks.connect('xlim_changed', self.update_residual_xbounds)
-        # self.fig.canvas.setFocus() # Removed this because it was not needed
-        # self.fig.canvas.draw() # Removed this because it was not needed
 
         # Show the Item Tracker window (in background)
         self.item_tracker.item_deleted.connect(self.on_item_deleted_from_tracker)
@@ -1626,132 +1962,878 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.item_tracker.item_individually_deselected.connect(self.on_item_individually_deselected_from_tracker)
         self.item_tracker.item_deselected.connect(self.on_item_deselected_from_tracker)
         self.item_tracker.estimate_redshift.connect(self.on_estimate_redshift_from_tracker)
-        
-        # Create dock widget for item tracker at top right
-        self.item_tracker_dock = QtWidgets.QDockWidget("Item Tracker", self)
-        self.item_tracker_dock.setAllowedAreas(QtCore.Qt.TopDockWidgetArea | QtCore.Qt.RightDockWidgetArea)
-        self.item_tracker_dock.setWidget(self.item_tracker)
-        self.addDockWidget(QtCore.Qt.TopDockWidgetArea, self.item_tracker_dock)
+        # Connect visibility changes to update the View menu if signal available
+        if hasattr(self.item_tracker, 'visibilityChanged'):
+            self.item_tracker.visibilityChanged.connect(self.on_window_visibility_changed)
+        if hasattr(self.item_tracker, 'destroyed'):
+            self.item_tracker.destroyed.connect(self.on_window_visibility_changed)
 
         # Connect Fit Information window signals
         self.fit_information_window.item_selected.connect(self.on_fit_info_item_selected)
         self.fit_information_window.item_deselected.connect(self.on_fit_info_item_deselected)
-        self.fit_information_window.setGeometry(100, 500, 1200, 400)  # Position below main window
+        self.fit_information_window.setGeometry(100, 550, 1200, 350)  # Position below main window
+        # Connect visibility changes to update the View menu if signal available
+        if hasattr(self.fit_information_window, 'visibilityChanged'):
+            self.fit_information_window.visibilityChanged.connect(self.on_window_visibility_changed)
+        if hasattr(self.fit_information_window, 'destroyed'):
+            self.fit_information_window.destroyed.connect(self.on_window_visibility_changed)
 
-        # Set icon for the matplotlib figure window
-        if hasattr(self.fig, 'canvas') and hasattr(self.fig.canvas, 'manager'):
-            if hasattr(self.fig.canvas.manager, 'window'):
-                logo_path = Path(__file__).parent.parent / 'logo' / 'qsap_logo.png'
-                if logo_path.exists():
-                    self.fig.canvas.manager.window.setWindowIcon(QIcon(str(logo_path)))
-                self.fig.canvas.manager.window.setWindowTitle("QSAP - Spectrum Viewer")
+        # Connect keyboard and mouse events to the canvas
+        self.fig.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
+        self.fig.canvas.mpl_connect("key_press_event", self.on_key)
+        self.fig.canvas.mpl_connect('button_press_event', self.on_canvas_click)
+        
+        # Connect x-bounds update to the axes
+        self.ax.callbacks.connect('xlim_changed', self.update_residual_xbounds)
 
         # Update the View menu now that the spectrum plotter figure has been created
         self.update_view_menu()
 
-        # Only show the figure window on first plot creation
+        # On first plot creation, set up dock widgets
         if is_first_plot:
-            # Show the plot without blocking
-            plt.show(block=False)
+            # Add right dock widget for controls
+            self.setup_right_dock(self)
             
-            if hasattr(self.fig.canvas, 'manager') and hasattr(self.fig.canvas.manager, 'window'):
-                mpl_window = self.fig.canvas.manager.window
-                mpl_window.setWindowTitle("QSAP - Spectrum Viewer")
-                
-                # Integrate output panel with matplotlib window
-                import time
-                time.sleep(0.1)  # Give Qt time to fully create the window
-                
-                # Get the current central widget (matplotlib canvas)
-                original_canvas = mpl_window.centralWidget()
-                
-                # Create wrapper widget with vertical layout
-                wrapper_widget = QtWidgets.QWidget()
-                wrapper_layout = QVBoxLayout()
-                wrapper_layout.setContentsMargins(0, 0, 0, 0)
-                wrapper_layout.setSpacing(0)
-                
-                # Add matplotlib canvas to top (with more space)
-                wrapper_layout.addWidget(original_canvas, stretch=1)
-                
-                # Set wrapper as central widget
-                wrapper_widget.setLayout(wrapper_layout)
-                mpl_window.setCentralWidget(wrapper_widget)
-                
-                # Add output panel as a bottom dock widget
-                self.setup_bottom_dock(mpl_window)
-                
-                # Add right dock widget for controls
-                self.setup_right_dock(mpl_window)
-                
-                # Refresh the View menu to include the new dock widget
-                self.update_view_menu()
-
-        self.fig.canvas.setFocus() # Removed this because it was not needed
-        self.fig.canvas.draw() # Removed this because it was not needed
+            # Show the window
+            self.show()
+            
+            # Refresh the View menu to include the new dock widget
+            self.update_view_menu()
 
     def setup_right_dock(self, mpl_window):
-        """Create and setup the right dock widget for controls"""
+        """Create and setup the right dock widget for fitting options"""
         # Create dock widget
         dock_widget = QtWidgets.QDockWidget("Options", mpl_window)
-        dock_widget.setAllowedAreas(QtCore.Qt.RightDockWidgetArea | QtCore.Qt.LeftDockWidgetArea)
+        dock_widget.setAllowedAreas(QtCore.Qt.RightDockWidgetArea)
         
-        # Create placeholder content for the dock
+        # Create main content widget
         dock_content = QtWidgets.QWidget()
-        dock_layout = QtWidgets.QVBoxLayout()
+        main_layout = QtWidgets.QVBoxLayout()
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(5)
         
-        # Add placeholder label
-        placeholder_label = QtWidgets.QLabel("Fitting Options Panel")
-        placeholder_label.setStyleSheet("font-weight: bold; font-size: 12px;")
-        dock_layout.addWidget(placeholder_label)
+        # ===== FITTING SECTION TITLE =====
+        fitting_title = QtWidgets.QLabel("Fitting")
+        fitting_title.setStyleSheet("font-weight: bold; font-size: 12px; color: #0078d4;")
+        main_layout.addWidget(fitting_title)
         
-        # Add some spacing
-        dock_layout.addSpacing(20)
+        fitting_layout = QtWidgets.QVBoxLayout()
+        fitting_layout.setContentsMargins(15, 5, 10, 10)
+        fitting_layout.setSpacing(6)
         
-        # Add placeholder text
-        placeholder_text = QtWidgets.QLabel(
-            "This panel will contain:\n"
-            "• Fitting mode buttons\n"
-            "• Configuration options\n"
-            "• Parameter controls\n\n"
-            "(Functionality coming soon...)"
-        )
-        placeholder_text.setStyleSheet("color: gray; font-size: 10px;")
-        placeholder_text.setWordWrap(True)
-        dock_layout.addWidget(placeholder_text)
+        # --- CONTINUUM SUBSECTION ---
+        continuum_label = QtWidgets.QLabel("Continuum")
+        continuum_label.setStyleSheet("font-weight: bold; font-size: 11px;")
+        fitting_layout.addWidget(continuum_label)
+        
+        continuum_sub_layout = QtWidgets.QVBoxLayout()
+        continuum_sub_layout.setContentsMargins(10, 5, 10, 5)
+        continuum_sub_layout.setSpacing(4)
+        
+        # Continuum mode dropdown
+        cont_dropdown_layout = QtWidgets.QHBoxLayout()
+        self.continuum_mode_dropdown = QtWidgets.QComboBox()
+        self.continuum_mode_dropdown.addItem("")  # Empty (inactive)
+        self.continuum_mode_dropdown.addItem("Continuum Region(s)     [m]")
+        self.continuum_mode_dropdown.currentTextChanged.connect(self.on_continuum_mode_changed)
+        cont_dropdown_layout.addWidget(self.continuum_mode_dropdown)
+        cont_dropdown_layout.addStretch()
+        continuum_sub_layout.addLayout(cont_dropdown_layout)
+        
+        # Polynomial order with +/- buttons
+        poly_order_layout = QtWidgets.QHBoxLayout()
+        poly_order_layout.setSpacing(4)
+        poly_minus_btn = QtWidgets.QPushButton("-")
+        poly_minus_btn.setMaximumWidth(30)
+        poly_minus_btn.clicked.connect(self.on_poly_order_minus)
+        self.options_poly_order_input = QtWidgets.QLineEdit()
+        self.options_poly_order_input.setText("1")
+        self.options_poly_order_input.setMaximumWidth(50)
+        poly_validator = QIntValidator(0, 10, self)
+        self.options_poly_order_input.setValidator(poly_validator)
+        self.options_poly_order_input.editingFinished.connect(self.on_poly_order_changed)
+        poly_plus_btn = QtWidgets.QPushButton("+")
+        poly_plus_btn.setMaximumWidth(30)
+        poly_plus_btn.clicked.connect(self.on_poly_order_plus)
+        poly_order_layout.addWidget(poly_minus_btn)
+        poly_order_layout.addWidget(self.options_poly_order_input)
+        poly_order_layout.addWidget(poly_plus_btn)
+        poly_order_layout.addStretch()
+        continuum_sub_layout.addLayout(poly_order_layout)
+        
+        # Continuum Enter button
+        continuum_enter_layout = QtWidgets.QHBoxLayout()
+        self.continuum_enter_button = QtWidgets.QPushButton("Enter")
+        self.continuum_enter_button.setEnabled(False)
+        self.continuum_enter_button.clicked.connect(self.on_continuum_enter_clicked)
+        continuum_enter_layout.addWidget(self.continuum_enter_button)
+        continuum_enter_layout.addStretch()
+        continuum_sub_layout.addLayout(continuum_enter_layout)
+        
+        fitting_layout.addLayout(continuum_sub_layout)
+        
+        # --- LINE PROFILES SUBSECTION ---
+        line_profiles_label = QtWidgets.QLabel("Line Profiles")
+        line_profiles_label.setStyleSheet("font-weight: bold; font-size: 11px;")
+        fitting_layout.addWidget(line_profiles_label)
+        
+        line_profiles_sub_layout = QtWidgets.QVBoxLayout()
+        line_profiles_sub_layout.setContentsMargins(10, 5, 10, 5)
+        line_profiles_sub_layout.setSpacing(4)
+        
+        # Dropdown for Gaussian mode selection
+        gaussian_dropdown_layout = QtWidgets.QHBoxLayout()
+        self.gaussian_mode_dropdown = QtWidgets.QComboBox()
+        self.gaussian_mode_dropdown.addItem("")  # Empty (inactive)
+        self.gaussian_mode_dropdown.addItem("Single Gaussian     [g]")
+        self.gaussian_mode_dropdown.addItem("Multi Gaussian      [|]")
+        self.gaussian_mode_dropdown.currentTextChanged.connect(self.on_gaussian_mode_changed)
+        gaussian_dropdown_layout.addWidget(self.gaussian_mode_dropdown)
+        gaussian_dropdown_layout.addStretch()
+        line_profiles_sub_layout.addLayout(gaussian_dropdown_layout)
+        
+        # Enter button for Multi Gaussian mode
+        gaussian_enter_layout = QtWidgets.QHBoxLayout()
+        self.gaussian_enter_button = QtWidgets.QPushButton("Enter")
+        self.gaussian_enter_button.setEnabled(False)
+        self.gaussian_enter_button.clicked.connect(self.on_gaussian_enter_clicked)
+        gaussian_enter_layout.addWidget(self.gaussian_enter_button)
+        gaussian_enter_layout.addStretch()
+        line_profiles_sub_layout.addLayout(gaussian_enter_layout)
+        
+        fitting_layout.addLayout(line_profiles_sub_layout)
+        
+        # --- ADVANCED SUBSECTION ---
+        advanced_label = QtWidgets.QLabel("Advanced")
+        advanced_label.setStyleSheet("font-weight: bold; font-size: 11px;")
+        fitting_layout.addWidget(advanced_label)
+        
+        advanced_sub_layout = QtWidgets.QVBoxLayout()
+        advanced_sub_layout.setContentsMargins(10, 5, 10, 5)
+        advanced_sub_layout.setSpacing(4)
+        
+        # Dropdown for Advanced mode selection
+        advanced_dropdown_layout = QtWidgets.QHBoxLayout()
+        self.advanced_mode_dropdown = QtWidgets.QComboBox()
+        self.advanced_mode_dropdown.addItem("")  # Empty (inactive)
+        self.advanced_mode_dropdown.addItem("Listfit            [H]")
+        self.advanced_mode_dropdown.addItem("Bayes Fit          [:]")
+        self.advanced_mode_dropdown.currentTextChanged.connect(self.on_advanced_mode_changed)
+        advanced_dropdown_layout.addWidget(self.advanced_mode_dropdown)
+        advanced_dropdown_layout.addStretch()
+        advanced_sub_layout.addLayout(advanced_dropdown_layout)
+        
+        fitting_layout.addLayout(advanced_sub_layout)
+        
+        # Add fitting layout to main
+        main_layout.addLayout(fitting_layout)
+        
+        # ===== CALCULATE SECTION TITLE =====
+        calculate_title = QtWidgets.QLabel("Calculate")
+        calculate_title.setStyleSheet("font-weight: bold; font-size: 12px; color: #0078d4;")
+        main_layout.addWidget(calculate_title)
+        
+        calculate_layout = QtWidgets.QVBoxLayout()
+        calculate_layout.setContentsMargins(15, 5, 10, 10)
+        calculate_layout.setSpacing(4)
+        
+        # Dropdown for Calculate mode selection
+        calculate_dropdown_layout = QtWidgets.QHBoxLayout()
+        self.calculate_mode_dropdown = QtWidgets.QComboBox()
+        self.calculate_mode_dropdown.addItem("")  # Empty (inactive)
+        self.calculate_mode_dropdown.addItem("Estimate Redshift     [z]")
+        self.calculate_mode_dropdown.addItem("Velocity x-axis      [b]")
+        self.calculate_mode_dropdown.currentTextChanged.connect(self.on_calculate_mode_changed)
+        calculate_dropdown_layout.addWidget(self.calculate_mode_dropdown)
+        calculate_dropdown_layout.addStretch()
+        calculate_layout.addLayout(calculate_dropdown_layout)
+        
+        main_layout.addLayout(calculate_layout)
+        
+        # --- DEACTIVATE ALL BUTTON ---
+        main_layout.addSpacing(5)
+        deactivate_button_layout = QtWidgets.QHBoxLayout()
+        self.deactivate_all_button = QtWidgets.QPushButton("Deactivate All")
+        self.deactivate_all_button.clicked.connect(self.on_deactivate_all)
+        deactivate_button_layout.addWidget(self.deactivate_all_button)
+        deactivate_button_layout.addStretch()
+        main_layout.addLayout(deactivate_button_layout)
         
         # Add stretch to push content to top
-        dock_layout.addStretch()
+        main_layout.addStretch()
         
-        dock_content.setLayout(dock_layout)
+        # Wrap main_layout in a scroll area
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_widget = QtWidgets.QWidget()
+        scroll_widget.setLayout(main_layout)
+        scroll_area.setWidget(scroll_widget)
+        
+        # Apply styling to indicate scrollability
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                background-color: #f5f5f5;
+                border-left: 3px solid #e0e0e0;
+                border-radius: 4px;
+            }
+            QScrollBar:vertical {
+                background-color: #f0f0f0;
+                width: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #b0b0b0;
+                border-radius: 6px;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #808080;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                border: none;
+                background: none;
+            }
+        """)
+        
+        # Set the scroll area as the dock widget's content
+        dock_content.setLayout(QtWidgets.QVBoxLayout())
+        dock_content.layout().addWidget(scroll_area)
         dock_widget.setWidget(dock_content)
         
         # Set minimum width for the dock
-        dock_widget.setMinimumWidth(200)
+        dock_widget.setMinimumWidth(220)
         
         # Add dock widget to the right side
         mpl_window.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock_widget)
         
-        # Store reference for potential future updates
+        # Store reference
         self.right_dock_widget = dock_widget
 
-    def setup_bottom_dock(self, mpl_window):
-        """Create and setup the bottom dock widget for output terminal"""
-        # Create dock widget
-        dock_widget = QtWidgets.QDockWidget("Terminal", mpl_window)
-        dock_widget.setAllowedAreas(QtCore.Qt.BottomDockWidgetArea | QtCore.Qt.TopDockWidgetArea)
+    def on_gaussian_mode_changed(self, mode_text):
+        """Handle change in Gaussian fitting mode from dropdown"""
+        # Strip keystroke indicator for comparison
+        mode_clean = mode_text.split("     [")
+        if len(mode_clean) > 1:
+            mode_text = mode_clean[0]
+        else:
+            mode_clean = mode_text.split("      [")
+            if len(mode_clean) > 1:
+                mode_text = mode_clean[0]
+            else:
+                mode_text = mode_clean[0]
+        if mode_text == "":
+            # Deactivated
+            self.gaussian_mode = False
+            self.multi_gaussian_mode_old = False
+            self.gaussian_enter_button.setEnabled(False)
+        elif mode_text == "Single Gaussian":
+            # Activate single Gaussian mode (same as pressing 'd')
+            self.gaussian_mode = True
+            self.multi_gaussian_mode_old = False
+            self.bounds = []
+            self.bound_lines.clear()
+            print("Single Gaussian mode activated from Options panel")
+            self.gaussian_enter_button.setEnabled(False)
+            self.record_action('activate_single_gaussian', 'Activated Single Gaussian Mode')
+        elif mode_text == "Multi Gaussian":
+            # Activate multi Gaussian mode (same as pressing 'D')
+            self.multi_gaussian_mode_old = True
+            self.gaussian_mode = False
+            self.bounds = []
+            self.bound_lines.clear()
+            print("Multi Gaussian mode activated from Options panel")
+            self.update_gaussian_enter_button()
+            self.record_action('activate_multi_gaussian', 'Activated Multi Gaussian Mode')
+
+    def on_continuum_mode_changed(self, mode_text):
+        """Handle change in Continuum fitting mode from dropdown"""
+        # Strip keystroke indicator for comparison
+        mode_clean = mode_text.split("    [")
+        if len(mode_clean) > 1:
+            mode_text = mode_clean[0]
+        else:
+            mode_text = mode_clean[0]
+        if mode_text == "":
+            # Deactivated - exit continuum mode
+            self.continuum_mode = False
+            self.continuum_regions = []
+            for patch_info in self.continuum_patches:
+                if 'patch' in patch_info:
+                    patch = patch_info['patch']
+                    if patch in self.ax.patches:
+                        patch.remove()
+            self.continuum_patches.clear()
+            self.label_poly_order.hide()
+            self.input_poly_order.hide()
+            self.continuum_enter_button.setEnabled(False)
+            self.fig.canvas.draw_idle()
+            print("Continuum mode deactivated from Options panel")
+        elif mode_text == "Continuum Region(s)":
+            # Activate continuum mode (same as pressing 'm')
+            self.continuum_mode = True
+            self.continuum_regions = []
+            self.continuum_patches = []
+            self.label_poly_order.show()
+            self.input_poly_order.show()
+            self.continuum_enter_button.setEnabled(True)
+            print("Continuum fitting mode activated from Options panel")
+            print("Use the spacebar to define regions.")
+            self.record_action('activate_continuum_mode', 'Activated Continuum Mode')
+
+    def on_advanced_mode_changed(self, mode_text):
+        """Handle change in Advanced fitting mode (Listfit or Bayes) from dropdown"""
+        # Strip keystroke indicator for comparison
+        mode_clean = mode_text.split("            [")
+        if len(mode_clean) > 1:
+            mode_text = mode_clean[0]
+        else:
+            mode_text = mode_clean[0]
         
-        # Set the output panel as the dock widget's content
-        dock_widget.setWidget(self.output_panel)
+        if mode_text == "":
+            # Deactivated
+            pass
+        elif mode_text == "Listfit":
+            # Activate listfit mode (same as pressing 'H')
+            self.listfit_mode = True
+            self.listfit_bounds = []
+            self.listfit_bound_lines = []
+            self.listfit_components = []
+            print("Listfit mode: Use the spacebar to define left and right boundaries.")
+            self.record_action('activate_listfit_mode', 'Activated Listfit Mode')
+        elif mode_text == "Bayes Fit":
+            # Activate bayes mode (same as pressing ':')
+            if self.bayes_mode:
+                self.bayes_mode = False
+                print("Exiting Bayes fit mode.")
+            else:
+                self.bayes_mode = True
+                self.bayes_bounds = []
+                if self.bayes_bound_lines is not None:
+                    for line in self.bayes_bound_lines:
+                        if line in self.ax.lines:
+                            line.remove()
+                self.bayes_bound_lines = []
+                print("Bayes fit mode: Use the spacebar to define left and right boundaries.")
+                self.record_action('activate_bayes_mode', 'Activated Bayes Fit Mode')
+
+    def on_calculate_mode_changed(self, mode_text):
+        """Handle change in Calculate mode (Redshift Estimation or Velocity) from dropdown"""
+        # Strip keystroke indicator for comparison
+        mode_clean = mode_text.split("     [")
+        if len(mode_clean) > 1:
+            mode_text = mode_clean[0]
+        else:
+            mode_clean = mode_text.split("      [")
+            if len(mode_clean) > 1:
+                mode_text = mode_clean[0]
+            else:
+                mode_text = mode_clean[0]
         
-        # Set minimum height for the dock
-        dock_widget.setMinimumHeight(100)
+        if mode_text == "":
+            # Deactivated
+            pass
+        elif mode_text == "Estimate Redshift":
+            # Activate redshift estimation mode (same as pressing 'z')
+            if self.redshift_estimation_mode:
+                self.redshift_estimation_mode = False
+                print('Exiting redshift estimation mode.')
+            else:
+                self.redshift_estimation_mode = True
+                print('Redshift estimation mode: Select Gaussian to use for redshift estimation. Assign a line to it, and estimate the redshift.')
+                self.record_action('activate_redshift_estimation', 'Activated Redshift Estimation Mode')
+        elif mode_text == "Velocity x-axis":
+            # Activate velocity mode (same as pressing 'b')
+            self.is_velocity_mode = not self.is_velocity_mode  # Toggle Velocity mode
+            if self.is_velocity_mode:
+                self.activate_velocity_mode()  # Enter velocity mode
+                if self.is_residual_shown:
+                    self.residual_ax.set_xlabel(r"Velocity (km s$^{-1}$)")
+                    self.update_residual_ticks()
+                else:
+                    self.ax.set_xlabel(r"Velocity (km s$^{-1}$)")
+                print("Velocity mode activated from Calculate menu")
+                self.record_action('activate_velocity_mode', 'Activated Velocity Mode')
+            else:
+                # Exit velocity mode
+                self.exit_velocity_mode()  
+                self.rest_wavelength = None
+                self.rest_id = None
+                
+                # Revert labels and limits to wavelength mode
+                if self.is_residual_shown:
+                    self.residual_ax.set_xlabel(self._get_wavelength_unit_label())
+                    self.update_residual_ticks()
+                else:
+                    self.ax.set_xlabel(self._get_wavelength_unit_label())
+                    
+                # Update ticks and plot
+                self.update_ticks(self.ax)
+                if self.is_residual_shown:
+                    self.update_residual_ticks()
+                    self.update_residual_ybounds()
+                    self.residual_ax.set_xlim(self.x_lower_bound, self.x_upper_bound)
+                if self.markers and self.labels:
+                    self.update_marker_and_label_positions()
+                print("Velocity mode deactivated from Calculate menu")
+                self.record_action('deactivate_velocity_mode', 'Deactivated Velocity Mode')
+                plt.draw()
+
+    def on_poly_order_minus(self):
+        """Handle minus button for polynomial order"""
+        try:
+            current = int(self.options_poly_order_input.text())
+            if current > 0:
+                current -= 1
+                self.options_poly_order_input.setText(str(current))
+                self.poly_order = current
+                print(f"Polynomial order set to: {current}")
+        except ValueError:
+            pass
+
+    def on_poly_order_plus(self):
+        """Handle plus button for polynomial order"""
+        try:
+            current = int(self.options_poly_order_input.text())
+            if current < 10:
+                current += 1
+                self.options_poly_order_input.setText(str(current))
+                self.poly_order = current
+                print(f"Polynomial order set to: {current}")
+        except ValueError:
+            pass
+
+    def on_poly_order_changed(self):
+        """Handle direct edit of polynomial order field"""
+        try:
+            value = int(self.options_poly_order_input.text())
+            if 0 <= value <= 10:
+                self.poly_order = value
+                print(f"Polynomial order set to: {value}")
+        except ValueError:
+            self.options_poly_order_input.setText(str(self.poly_order))
+
+    def on_continuum_enter_clicked(self):
+        """Handle Enter button click to perform continuum fit"""
+        if not self.continuum_mode or len(self.continuum_regions) == 0:
+            print("No continuum regions defined. Define regions with spacebar first.")
+            return
         
-        # Add dock widget to the bottom
-        mpl_window.addDockWidget(QtCore.Qt.BottomDockWidgetArea, dock_widget)
+        # Trigger the continuum fit logic (same as pressing 'enter' in continuum mode)
+        # Combine all defined regions into a single dataset for fitting
+        combined_wav = []
+        combined_spec = []
+        combined_err = []
+
+        for region in self.continuum_regions:
+            start, end = region
+            mask = (self.x_data >= start) & (self.x_data <= end)
+            if np.any(mask):
+                combined_wav.extend(self.x_data[mask])
+                combined_spec.extend(self.spec[mask])
+                if self.err is not None:
+                    combined_err.extend(self.err[mask])
+
+        region_bounds = (min(region[0] for region in self.continuum_regions), 
+                        max(region[1] for region in self.continuum_regions))
+
+        combined_wav = np.array(combined_wav)
+        combined_spec = np.array(combined_spec)
+        combined_err = np.array(combined_err) if combined_err else None
+
+        # Fit the continuum
+        continuum, coeffs, perr = self.fit_continuum(combined_wav, combined_spec, combined_err, 
+                                                      poly_order=self.poly_order)
         
-        # Store reference for potential future updates
-        self.bottom_dock_widget = dock_widget
+        poly_str = f"Continuum fit (order {self.poly_order}):"
+        for i, (coeff, err) in enumerate(zip(coeffs, perr)):
+            poly_str += f" c{i}={coeff:.6e}±{err:.6e}"
+        print(poly_str)
+
+        # Plot the fitted continuum
+        x_plot = np.linspace(region_bounds[0], region_bounds[1], 500)
+        continuum_full = np.polyval(coeffs, x_plot)
+        continuum_cfg = self.colors['profiles']['continuum_line']
+        continuum_line, = self.ax.plot(x_plot, continuum_full, color=continuum_cfg['color'], 
+                                      linestyle=continuum_cfg['linestyle'], alpha=0.8)
+        if self.is_residual_shown:
+            self.calculate_and_plot_residuals()
+        self.ax.legend(loc='upper right')
+        self.ax.figure.canvas.draw()
+        QtWidgets.QApplication.processEvents()
+
+        # Store continuum fit
+        continuum_fit = {
+            'bounds': region_bounds,
+            'coeffs': coeffs,
+            'coeffs_err': perr,
+            'poly_order': self.poly_order,
+            'patches': self.continuum_patches,
+            'line': continuum_line,
+            'is_velocity_mode': self.is_velocity_mode
+        }
+        self.continuum_fits.append(continuum_fit)
+        
+        # Register with ItemTracker
+        bounds_str = f"λ: {region_bounds[0]:.2f}-{region_bounds[1]:.2f} Å"
+        self.register_item('continuum', f'Continuum (order {self.poly_order})', fit_dict=continuum_fit,
+                         line_obj=continuum_line, position=bounds_str, color=continuum_cfg['color'])
+        
+        self.record_action('fit_continuum', f'Fit Continuum (order {self.poly_order})')
+        
+        # Clean up and deactivate
+        self.continuum_regions = []
+        self.continuum_patches = []
+        self.continuum_mode = False
+        self.label_poly_order.hide()
+        self.input_poly_order.hide()
+        
+        # Reset dropdown to blank
+        self.continuum_mode_dropdown.blockSignals(True)
+        self.continuum_mode_dropdown.setCurrentIndex(0)
+        self.continuum_mode_dropdown.blockSignals(False)
+        self.continuum_enter_button.setEnabled(False)
+        
+        print('Continuum fitting completed and mode deactivated.')
+
+    def reset_advanced_dropdown(self):
+        """Reset Advanced dropdown to blank and deactivate related modes"""
+        self.listfit_mode = False
+        self.bayes_mode = False
+        self.bayes_bounds = []
+        for line in self.bayes_bound_lines:
+            try:
+                line.remove()
+            except (ValueError, NotImplementedError):
+                pass
+        self.bayes_bound_lines.clear()
+        if hasattr(self, 'advanced_mode_dropdown'):
+            self.advanced_mode_dropdown.blockSignals(True)
+            self.advanced_mode_dropdown.setCurrentIndex(0)
+            self.advanced_mode_dropdown.blockSignals(False)
+        if self.ax is not None:
+            self.ax.figure.canvas.draw_idle()
+    
+    def reset_calculate_dropdown(self):
+        """Reset Calculate dropdown to blank and deactivate related modes"""
+        self.redshift_estimation_mode = False
+        self.is_velocity_mode = False
+        if hasattr(self, 'calculate_mode_dropdown'):
+            self.calculate_mode_dropdown.blockSignals(True)
+            self.calculate_mode_dropdown.setCurrentIndex(0)
+            self.calculate_mode_dropdown.blockSignals(False)
+        if self.ax is not None:
+            self.ax.figure.canvas.draw_idle()
+    
+    def _cleanup_redshift_highlighting(self):
+        """Remove neon green highlighting from redshift selected line"""
+        if hasattr(self, 'redshift_selected_line') and self.redshift_selected_line:
+            # Restore the line to its original color based on its fit type
+            if hasattr(self, 'gaussian_fits'):
+                for fit in self.gaussian_fits:
+                    if 'line' in fit and fit['line'] is self.redshift_selected_line:
+                        gaussian_cfg = self.colors['profiles']['gaussian']
+                        fit['line'].set_color(gaussian_cfg['color'])
+                        fit['line'].set_linewidth(gaussian_cfg['linewidth'])
+                        fit['line'].set_zorder(1)  # Reset z-order
+                        break
+            if hasattr(self, 'voigt_fits'):
+                for fit in self.voigt_fits:
+                    if 'line' in fit and fit['line'] is self.redshift_selected_line:
+                        voigt_cfg = self.colors['profiles']['voigt']
+                        fit['line'].set_color(voigt_cfg['color'])
+                        fit['line'].set_linewidth(voigt_cfg['linewidth'])
+                        fit['line'].set_zorder(1)  # Reset z-order
+                        break
+            self.redshift_selected_line = None
+        
+        # Remove any preview plots
+        if hasattr(self, 'current_gaussian_plot') and self.current_gaussian_plot:
+            try:
+                self.current_gaussian_plot.remove()
+            except (ValueError, RuntimeError):
+                pass
+            self.current_gaussian_plot = None
+        if hasattr(self, 'current_voigt_plot') and self.current_voigt_plot:
+            try:
+                self.current_voigt_plot.remove()
+            except (ValueError, RuntimeError):
+                pass
+            self.current_voigt_plot = None
+        
+        if self.ax is not None:
+            self.ax.figure.canvas.draw_idle()
+    
+    def on_deactivate_all(self):
+        """Deactivate all active fitting modes"""
+        modes_deactivated = []
+        
+        # Deactivate continuum mode if active
+        if self.continuum_mode:
+            self.continuum_mode = False
+            self.continuum_regions = []
+            # Remove patches
+            for patch_info in self.continuum_patches:
+                if 'patch' in patch_info:
+                    patch = patch_info['patch']
+                    if patch in self.ax.patches:
+                        patch.remove()
+            self.continuum_patches.clear()
+            # Remove bound lines if any
+            for line in self.bound_lines:
+                line.remove()
+            self.label_poly_order.hide()
+            self.input_poly_order.hide()
+            self.continuum_mode_dropdown.blockSignals(True)
+            self.continuum_mode_dropdown.setCurrentIndex(0)
+            self.continuum_mode_dropdown.blockSignals(False)
+            self.continuum_enter_button.setEnabled(False)
+            modes_deactivated.append("Continuum")
+        
+        # Deactivate Gaussian mode if active
+        if self.gaussian_mode or self.multi_gaussian_mode_old:
+            self.gaussian_mode = False
+            self.multi_gaussian_mode_old = False
+            # Remove bounds
+            for line in self.bound_lines:
+                line.remove()
+            self.bound_lines.clear()
+            self.bounds.clear()
+            self.gaussian_mode_dropdown.blockSignals(True)
+            self.gaussian_mode_dropdown.setCurrentIndex(0)
+            self.gaussian_mode_dropdown.blockSignals(False)
+            self.gaussian_enter_button.setEnabled(False)
+            modes_deactivated.append("Gaussian")
+        
+        # Deactivate Advanced modes (Listfit, Bayes)
+        if self.listfit_mode:
+            for line in self.listfit_bound_lines:
+                try:
+                    line.remove()
+                except (ValueError, NotImplementedError):
+                    pass
+            self.listfit_bound_lines.clear()
+            self.listfit_bounds = []
+            self.listfit_mode = False
+            modes_deactivated.append("Listfit")
+        if self.bayes_mode:
+            for line in self.bayes_bound_lines:
+                try:
+                    line.remove()
+                except (ValueError, NotImplementedError):
+                    pass
+            self.bayes_bound_lines.clear()
+            self.bayes_bounds = []
+            self.bayes_mode = False
+            modes_deactivated.append("Bayes Fit")
+        if hasattr(self, 'advanced_mode_dropdown'):
+            self.advanced_mode_dropdown.blockSignals(True)
+            self.advanced_mode_dropdown.setCurrentIndex(0)
+            self.advanced_mode_dropdown.blockSignals(False)
+        
+        # Deactivate Calculate modes (Redshift estimation, Velocity)
+        if self.redshift_estimation_mode:
+            self.redshift_estimation_mode = False
+            modes_deactivated.append("Redshift Estimation")
+        if self.is_velocity_mode:
+            self.is_velocity_mode = False
+            modes_deactivated.append("Velocity Mode")
+        if hasattr(self, 'calculate_mode_dropdown'):
+            self.calculate_mode_dropdown.blockSignals(True)
+            self.calculate_mode_dropdown.setCurrentIndex(0)
+            self.calculate_mode_dropdown.blockSignals(False)
+        
+        # Redraw canvas
+        if self.ax is not None:
+            self.ax.figure.canvas.draw_idle()
+        
+        if modes_deactivated:
+            print(f"Deactivated: {', '.join(modes_deactivated)}")
+        else:
+            print("No active fitting modes to deactivate.")
+
+    def update_gaussian_enter_button(self):
+        """Update the enabled state of the Enter button based on number of bounds"""
+        if self.multi_gaussian_mode_old:
+            # For Multi Gaussian: enable if even number of bounds >= 4
+            if len(self.bounds) >= 4 and len(self.bounds) % 2 == 0:
+                self.gaussian_enter_button.setEnabled(True)
+            else:
+                self.gaussian_enter_button.setEnabled(False)
+        else:
+            self.gaussian_enter_button.setEnabled(False)
+
+    def on_gaussian_enter_clicked(self):
+        """Handle Enter button click to perform Multi Gaussian fit"""
+        if not self.multi_gaussian_mode_old or len(self.bounds) < 4:
+            print("Invalid Multi Gaussian configuration: need at least 4 bounds (2 profiles minimum)")
+            return
+        
+        # Perform the fit with the current bounds
+        self.perform_multi_gaussian_fit()
+
+    def perform_multi_gaussian_fit(self):
+        """Perform multi-gaussian fitting with current bounds"""
+        self.multi_gaussian_mode_old = False
+        bound_pairs = [(self.bounds[i], self.bounds[i + 1]) for i in range(0, len(self.bounds), 2)]
+        
+        # Pre-flight check: Verify no partial overlaps with continuum before processing
+        for left_bound, right_bound in bound_pairs:
+            has_partial_overlap, overlap_msg = self.check_continuum_partial_overlap(left_bound, right_bound)
+            if has_partial_overlap:
+                print(f"WARNING: {overlap_msg}")
+                print("Multi-Gaussian fit aborted to avoid ambiguous continuum handling.")
+                # Clear bounds
+                for line in self.bound_lines:
+                    line.remove()
+                self.bound_lines.clear()
+                self.bounds.clear()
+                self.fig.canvas.draw_idle()
+                # Update button state
+                self.update_gaussian_enter_button()
+                return
+        
+        comp_xs = []
+        comp_ys = []
+        comp_errs = []
+        continuum_subtracted_ys = []
+        continuum_ys = []
+        line_id = None
+        line_wavelength = None
+
+        # Prepare data for fitting multiple Gaussians, applying continuum subtraction
+        initial_guesses = []
+        sigma_maxes = []  # Store sigma_max for each component
+        for left_bound, right_bound in bound_pairs:
+            comp_x = self.x_data[(self.x_data >= left_bound) & (self.x_data <= right_bound)]
+            comp_y = self.spec[(self.x_data >= left_bound) & (self.x_data <= right_bound)]
+            # Handle optional error spectrum
+            if self.err is not None:
+                comp_err = self.err[(self.x_data >= left_bound) & (self.x_data <= right_bound)]
+            else:
+                comp_err = None
+            comp_ys.append(comp_y)
+            
+            # Check for existing continuum within bounds
+            existing_continuum, _, _ = self.get_existing_continuum(left_bound, right_bound)
+            if existing_continuum is not None:
+                # If an existing continuum is available, subtract it
+                continuum_subtracted_y = comp_y - existing_continuum
+                print(f"Using existing continuum for bounds {left_bound}-{right_bound}.")
+                continuum_y = np.array(existing_continuum)
+            else:
+                # No continuum defined - fit directly to data
+                continuum_subtracted_y = comp_y
+                continuum_y = np.zeros_like(comp_y)
+                print(f"No existing continuum found; fitting directly to data for bounds {left_bound}-{right_bound}.")
+
+            continuum_ys.append(continuum_y)
+            comp_xs.extend(comp_x)
+            # Add error to list only if available
+            if comp_err is not None:
+                comp_errs.extend(comp_err)
+            continuum_subtracted_ys.extend(continuum_subtracted_y)
+            # Add initial guesses for Gaussian fitting
+            mean_guess = np.mean(comp_x)
+            # Calculate max sigma for this component FIRST
+            sigma_max = self._calculate_max_sigma(left_bound, right_bound, mean_guess, epsilon=0.05)
+            sigma_maxes.append(sigma_max)
+            # Cap initial sigma guess to stay within bounds (use 50% of max for safety)
+            sigma_guess = min(np.std(comp_x), sigma_max * 0.5)
+            initial_guesses.extend([max(continuum_subtracted_y) - min(continuum_subtracted_y), mean_guess, sigma_guess])
+
+        # Fit multiple Gaussians
+        if len(comp_xs) > 0:
+            comp_xs = np.array(comp_xs)
+            continuum_subtracted_ys = np.array(continuum_subtracted_ys)
+            # Use sigma if errors available, otherwise None
+            sigma_param = np.array(comp_errs) if comp_errs else None
+            
+            # Build bounds with sigma constraints for each component
+            num_components = len(bound_pairs)
+            lower_bounds = [-np.inf] * (num_components * 3)
+            upper_bounds = [np.inf] * (num_components * 3)
+            for i, sigma_max in enumerate(sigma_maxes):
+                lower_bounds[i * 3 + 2] = 0  # sigma >= 0
+                upper_bounds[i * 3 + 2] = sigma_max  # sigma <= sigma_max
+            
+            params, pcov = curve_fit(self.multi_gaussian, comp_xs, continuum_subtracted_ys, sigma=sigma_param, p0=initial_guesses, bounds=(lower_bounds, upper_bounds))
+            perr = np.sqrt(np.diag(pcov))
+            for i in range(0, len(params), 3):
+                amp, mean, stddev = params[i:i+3]
+                amp_err, mean_err, stddev_err = perr[i:i+3]
+                x_fit = self.x_data[(self.x_data >= bound_pairs[i // 3][0]) & (self.x_data <= bound_pairs[i // 3][1])]
+                y_fit = self.gaussian(x_fit, amp, mean, stddev) + continuum_ys[i // 3]
+                continuum_sub_data = comp_ys[i // 3] - continuum_ys[i // 3]
+                residuals = continuum_sub_data - self.gaussian(x_fit, amp, mean, stddev)
+                # Calculate chi2 (simpler without errors since they're concatenated)
+                chi2 = np.sum(residuals ** 2)  # Chi2 without decomposed errors
+                chi2_nu = chi2 / (len(x_fit) - 3)  # 3 params per component
+                interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
+                x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
+                y_plt = interpolator(x_plt)
+                gaussian_cfg = self.colors['profiles']['gaussian']
+                fit_line, = self.ax.plot(x_plt, y_plt, color=gaussian_cfg['color'], linestyle=gaussian_cfg['linestyle'])
+                left_bound, right_bound = bound_pairs[i // 3]
+                gaussian_fit = {
+                'fit_id': self.fit_id,
+                'is_velocity_mode': self.is_velocity_mode,
+                'chi2': chi2,
+                'chi2_nu': chi2_nu,
+                'component_id': self.component_id,
+                'amp': amp, 'amp_err': amp_err, 'mean': mean, 'mean_err': mean_err, 'stddev': stddev, 'stddev_err': stddev_err,
+                'bounds': (left_bound, right_bound),
+                'line_id': line_id if line_id else None,
+                'line_wavelength': line_wavelength  if line_wavelength else None,
+                'line': fit_line,
+                'rest_wavelength': self.rest_wavelength,
+                'rest_id': self.rest_id,
+                'z_sys': self.redshift
+                }
+                self.gaussian_fits.append(gaussian_fit)
+                # Register with ItemTracker
+                position_str = f"λ: {mean:.2f} Å"
+                gaussian_cfg = self.colors['profiles']['gaussian']
+                self.register_item('gaussian', f'Gaussian', fit_dict=gaussian_fit, line_obj=fit_line,
+                                 position=position_str, color=gaussian_cfg['color'])
+                
+                # Record action for undo/redo (only record once after all components)
+                if i == len(params) - 3:  # Last component
+                    self.record_action('fit_multi_gaussian', f'Fit {len(bound_pairs)} Gaussians')
+                
+                print(f"  Fit ID: {self.fit_id}")
+                print(f"  Component ID: {self.component_id}")
+                print(f"  Velocity mode: {self.is_velocity_mode}")
+                print(f"  Line ID: {line_id}")
+                print(f"  Line Wavelength: {line_wavelength}")
+                print(f"  Amplitude: {amp}+-{amp_err}")
+                print(f"  Mean: {mean}+-{mean_err}")
+                print(f"  Std_dev: {stddev}+-{stddev_err}")
+                print(f"  Bounds: ({left_bound}, {right_bound})")
+                print(f"  Chi-squared: {chi2}")
+                print(f"  Chi-squared_nu: {chi2_nu}")
+                print(f"  Line Object: {fit_line}\n")
+
+                self.component_id += 1
+
+            # Force immediate redraw of the canvas
+            self.ax.figure.canvas.draw()
+            QtWidgets.QApplication.processEvents()  # Process Qt events to ensure redraw
+            self.fit_id += 1
+            # Clear bound lines after fit
+            for line in self.bound_lines:
+                line.remove()
+            self.bound_lines.clear()
+            self.bounds = []
+            self.ax.figure.canvas.draw_idle()  # Redraw to show bound lines removed
+            for i in range(0, len(params), 3):
+                print(f"Simultaneous Gaussian fit parameters:\nGaussian {i//3 + 1}: Amplitude = {amp}+-{amp_err}, Mean = {mean}+-{mean_err}, Std Dev = {stddev}+-{stddev_err}")
+        
+        # Update button state
+        self.update_gaussian_enter_button()
+        # Update dropdown to show mode is inactive
+        self.gaussian_mode_dropdown.blockSignals(True)
+        self.gaussian_mode_dropdown.setCurrentText("Single Gaussian")
+        self.gaussian_mode_dropdown.blockSignals(False)
 
     def read_lines(self):
         # Read spectral lines from file
@@ -2815,11 +3897,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         
         # Highlight the original fit line in neon green for redshift mode
         if 'line' in fit and fit['line']:
-            fit['line'].set_color(preview_cfg['color'])
-            fit['line'].set_linewidth(preview_cfg['linewidth'] + 0.5)
+            neon_green = '#39FF14'  # Neon green color
+            fit['line'].set_color(neon_green)
+            fit['line'].set_linewidth(3.0)  # Make it thicker for visibility
+            fit['line'].set_zorder(10)  # Bring to front
             self.redshift_selected_line = fit['line']
+            print(f"Highlighted Gaussian fit line in neon green")
         
-        plt.draw()  # Refresh the plot
+        self.ax.figure.canvas.draw_idle()  # Refresh the plot
 
     def plot_redshift_voigt(self, fit):
         left_bound, right_bound = fit['bounds']
@@ -2849,11 +3934,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         
         # Highlight the original fit line in neon green for redshift mode
         if 'line' in fit and fit['line']:
-            fit['line'].set_color(preview_cfg['color'])
-            fit['line'].set_linewidth(preview_cfg['linewidth'] + 0.5)
+            neon_green = '#39FF14'  # Neon green color
+            fit['line'].set_color(neon_green)
+            fit['line'].set_linewidth(3.0)  # Make it thicker for visibility
+            fit['line'].set_zorder(10)  # Bring to front
             self.redshift_selected_line = fit['line']
+            print(f"Highlighted Voigt fit line in neon green")
         
-        plt.draw()  # Refresh the plot to show the updated Voigt profile
+        self.ax.figure.canvas.draw_idle()  # Refresh the plot to show the updated Voigt profile
 
     def display_linelist(self):
         """Display all active line lists on the spectrum"""
@@ -3247,6 +4335,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             df = pd.DataFrame(data)
             filename = f"z_{est_redshift:.3f}_from{self.selected_rest_wavelength:.2f}_{timestamp}.csv"
             df.to_csv(filename, sep='\t', index=False, float_format='%.6f')
+            
+            # Cleanup highlighting and reset Calculate dropdown
+            self._cleanup_redshift_highlighting()
+            self.reset_calculate_dropdown()
+            print(f"Redshift result saved to {filename}. Exiting redshift estimation mode.")
         else:
             print("No line selected.")
     
@@ -4068,6 +5161,12 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             else:
                 print(f"Unknown command: {command}")
 
+    def on_canvas_click(self, event):
+        """Handle canvas click events to refocus on the plot area"""
+        # Set focus to the canvas when clicked to deselect text fields
+        if event.inaxes or event.xdata is not None:
+            self.canvas.setFocus()
+
     def on_mouse_move(self, event):
         # Check if the cursor is within the axes bounds
         if event.inaxes == self.ax:
@@ -4260,7 +5359,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.action_history_window.refresh_display()
 
     def keyPressEvent(self, event):
-        """Handle key press events - check for undo/redo shortcuts and quit first"""
+        """Handle key press events - forward to canvas so matplotlib can handle them"""
         if isinstance(event, QKeyEvent):
             # Check for Ctrl+Z (undo) or Cmd+Z (undo) on macOS
             if event.key() == Qt.Key_Z and (event.modifiers() & Qt.ControlModifier or event.modifiers() & Qt.MetaModifier):
@@ -4269,14 +5368,26 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     self.on_redo()
                 else:
                     self.on_undo()
+                event.accept()
                 return
             
             # Check for 'q' or 'Q' to quit
             if event.key() == Qt.Key_Q:
                 self.quit_application()
+                event.accept()
+                return
+            
+            # For all other keys, ensure canvas has focus and forward to it
+            if hasattr(self, 'canvas'):
+                self.canvas.setFocus()
+                # Let the canvas handle the key - matplotlib will convert it to a matplotlib event
+                # and call our on_key handler through mpl_connect
+                self.canvas.keyPressEvent(event)
+                event.accept()
                 return
         
-        self.on_key(event)
+        # Fallback to parent class
+        super().keyPressEvent(event)
 
     def update_total_line_if_shown(self):
         """Redraw the total line if it's currently displayed. Called when fits change."""
@@ -4435,6 +5546,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             if event.key == 'q' or event.key == 'Q':
                 self.quit_application()
                 return
+            
+            # Deactivate all modes with 'escape' key
+            if event.key == 'escape':
+                self.on_deactivate_all()
+                return
 
         # Check if the cursor is within the axes bounds
         if hasattr(event, 'xdata') and hasattr(event, 'ydata'):
@@ -4566,24 +5682,29 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 self.continuum_mode = False
                 self.label_poly_order.hide()
                 self.input_poly_order.hide()
-                self.separator_line_poly.hide()
-                self.setGeometry(100, 100, 440, 200)  # Restore original window size
                 self.continuum_regions = []  # Clear any defined regions
+                # Update dropdown to blank
+                self.continuum_mode_dropdown.blockSignals(True)
+                self.continuum_mode_dropdown.setCurrentIndex(0)
+                self.continuum_mode_dropdown.blockSignals(False)
                 print('Exiting continuum mode.')
             else:
                 # Enter continuum mode
                 self.continuum_mode = True
                 self.label_poly_order.show()
                 self.input_poly_order.show()
-                self.separator_line_poly.show()
-                self.setGeometry(100, 100, 440, 250)  # Expand window to fit poly order field
+                # Update dropdown to show active mode
+                self.continuum_mode_dropdown.blockSignals(True)
+                self.continuum_mode_dropdown.setCurrentText("Continuum Region(s)")
+                self.continuum_mode_dropdown.blockSignals(False)
+                self.continuum_enter_button.setEnabled(True)
                 print("Continuum fitting mode: Use the spacebar to define regions.")
                 print(f"Current polynomial order: {self.poly_order}")
 
         if event.key == 'enter' and self.continuum_mode:
-            # Update polynomial order from input field
+            # Update polynomial order from Options panel input field
             try:
-                self.poly_order = int(self.input_poly_order.text())
+                self.poly_order = int(self.options_poly_order_input.text())
                 print(f"Using polynomial order: {self.poly_order}")
             except ValueError:
                 print("Invalid polynomial order, using default order 1")
@@ -4658,7 +5779,6 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.continuum_mode = False # Exit continuum mode
             self.label_poly_order.hide()
             self.input_poly_order.hide()
-            self.setGeometry(100, 100, 440, 200)  # Restore original window size
             print('Exiting continuum mode.')
         elif event.key == ' ' and self.continuum_mode:
             # Capture current mouse x-coordinate for regions
@@ -4806,6 +5926,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             elif len(self.bounds) == 2:
                 self.record_action('set_gaussian_bound_2', f'Set Gaussian upper bound at λ={bound_value:.2f} Å')
             self.fig.canvas.draw_idle()  # Update plot with the new bound line
+            
+            # Update button state for Multi Gaussian mode
+            self.update_gaussian_enter_button()
 
             # If two bounds are selected, fit the Gaussian
             if self.gaussian_mode and len(self.bounds) == 2:
@@ -5286,6 +6409,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 # Record action for undo/redo
                 self.record_action('fit_voigt', f'Fit Voigt at λ={fit_results.get("center", fit_results.get("mean", 0)):.2f} Å')
                 
+                # Reset Advanced dropdown if Bayes mode was active
+                if self.bayes_mode:
+                    self.reset_advanced_dropdown()
+                
                 print(f"  Fit ID: {self.fit_id}")
                 print(f"  Component ID: {self.component_id}")
                 print(f"  Velocity mode: {self.is_velocity_mode}")
@@ -5559,10 +6686,21 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
 
         # Enter multi Gaussian fit mode
         if event.key == 'D':
-            if self.multi_gaussian_mode:
+            if self.multi_gaussian_mode or self.multi_gaussian_mode_old:
                 self.multi_gaussian_mode = False
+                self.multi_gaussian_mode_old = False
+                # Update dropdown to blank
+                self.gaussian_mode_dropdown.blockSignals(True)
+                self.gaussian_mode_dropdown.setCurrentIndex(0)
+                self.gaussian_mode_dropdown.blockSignals(False)
             else:
-                self.multi_gaussian_mode = True
+                self.multi_gaussian_mode_old = True
+                self.multi_gaussian_mode = False
+                self.gaussian_mode = False
+                # Update dropdown to show active mode
+                self.gaussian_mode_dropdown.blockSignals(True)
+                self.gaussian_mode_dropdown.setCurrentText("Multi Gaussian")
+                self.gaussian_mode_dropdown.blockSignals(False)
             print("self.bounds:", self.bounds)
             self.bounds = []  # Reset bounds
             print("self.bounds:", self.bounds)
@@ -6054,6 +7192,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         elif event.key == 'd':
             if self.gaussian_mode:
                 self.gaussian_mode = False
+                # Update dropdown to blank
+                self.gaussian_mode_dropdown.blockSignals(True)
+                self.gaussian_mode_dropdown.setCurrentIndex(0)
+                self.gaussian_mode_dropdown.blockSignals(False)
                 print("Exiting Gaussian fit mode.")
             else:
                 self.gaussian_mode = True
@@ -6064,6 +7206,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     for line in self.bound_lines:  # Remove any existing bound lines
                         line.remove()
                 self.bound_lines.clear()  # Clear the list of bound lines
+                # Update dropdown to show active mode
+                self.gaussian_mode_dropdown.blockSignals(True)
+                self.gaussian_mode_dropdown.setCurrentText("Single Gaussian")
+                self.gaussian_mode_dropdown.blockSignals(False)
                 print("Gaussian fit mode: Press space to set left and right bounds.")
                 plt.draw()  # Update the plot to remove old lines
 
@@ -6152,6 +7298,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Exit redshift mode with Escape
         if event.key == 'escape' and self.redshift_estimation_mode:
             self.redshift_estimation_mode = False
+            self._cleanup_redshift_highlighting()
             print('Exiting redshift estimation mode.')
 
         # Enter redshift estimation mode
@@ -6218,6 +7365,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 if self.markers and self.labels:
                     self.update_marker_and_label_positions()
                 plt.draw()
+                
+                # Reset Calculate dropdown when exiting velocity mode
+                self.reset_calculate_dropdown()
 
         # Enter Bayes fit mode with ':' key
         if event.key == ':':
@@ -6657,6 +7807,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             line.remove()
         self.listfit_bound_lines.clear()
         self.listfit_bounds = []
+        
+        # Reset Advanced dropdown after successful fit
+        self.reset_advanced_dropdown()
         
         self.fig.canvas.draw_idle()  # Redraw to show listfit results
 

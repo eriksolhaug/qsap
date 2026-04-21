@@ -41,7 +41,7 @@ class ItemTracker(QtWidgets.QWidget):
         self.setWindowTitle("QSAP - Item Tracker")
         # Load and set window icon
         self.setWindowIcon(get_qsap_icon())
-        self.setGeometry(100, 700, 600, 350)
+        self.setGeometry(100, 550, 600, 300)
         
         layout = QtWidgets.QVBoxLayout()
         
@@ -51,17 +51,17 @@ class ItemTracker(QtWidgets.QWidget):
         # Table widget with columns
         self.item_table = QtWidgets.QTableWidget()
         self.item_table.setColumnCount(4)
-        self.item_table.setHorizontalHeaderLabels(['Name', 'Type', 'Position', 'Color'])
+        self.item_table.setHorizontalHeaderLabels(['Name', 'Type', 'Color', 'Position'])
         self.item_table.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
         self.item_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.item_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.item_table.customContextMenuRequested.connect(self.show_context_menu)
         self.item_table.itemSelectionChanged.connect(self.on_selection_changed)
-        self.item_table.horizontalHeader().setStretchLastSection(False)
+        self.item_table.horizontalHeader().setStretchLastSection(True)
         self.item_table.setColumnWidth(0, 150)
         self.item_table.setColumnWidth(1, 100)
-        self.item_table.setColumnWidth(2, 150)
-        self.item_table.setColumnWidth(3, 80)
+        self.item_table.setColumnWidth(2, 100)
+        self.item_table.setColumnWidth(3, 150)
         layout.addWidget(self.item_table)
         
         # Buttons
@@ -111,14 +111,14 @@ class ItemTracker(QtWidgets.QWidget):
             type_item = QtWidgets.QTableWidgetItem(item_info['type'])
             self.item_table.setItem(row, 1, type_item)
             
-            # Position column
-            pos_item = QtWidgets.QTableWidgetItem(str(item_info['position']))
-            self.item_table.setItem(row, 2, pos_item)
-            
             # Color column
             color_item = QtWidgets.QTableWidgetItem(item_info['color'])
             color_item.setBackground(QtGui.QColor(item_info['color']))
-            self.item_table.setItem(row, 3, color_item)
+            self.item_table.setItem(row, 2, color_item)
+            
+            # Position column
+            pos_item = QtWidgets.QTableWidgetItem(str(item_info['position']))
+            self.item_table.setItem(row, 3, pos_item)
     
     def show_context_menu(self, position):
         """Show right-click context menu"""

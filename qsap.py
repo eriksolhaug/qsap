@@ -151,14 +151,14 @@ Examples:
             if args.lsf:
                 try:
                     lsf_fwhm = SpectrumAnalysis.parse_lsf_spec(args.lsf)
-                    print(f"Applying LSF (FWHM: {lsf_fwhm:.2f} km/s)...")
+                    # print(f"Applying LSF (FWHM: {lsf_fwhm:.2f} km/s)...")
                     spec = SpectrumAnalysis.apply_lsf(wav, spec, lsf_fwhm)
-                    print("LSF applied successfully")
+                    # print("LSF applied successfully")
                 except Exception as e:
                     print(f"Error applying LSF: {e}")
                     sys.exit(1)
             
-            # Apply redshift if requested
+            # Apply redshift to wavelength array if requested
             if args.redshift != 0.0:
                 z = args.redshift
                 wav_rest = wav / (1 + z)
@@ -187,14 +187,14 @@ Examples:
     else:
         # Display welcome message with ASCII art
         version = _get_version()
-        title_line = f"   WELCOME TO QSAP  v{version}"
+        title_line = f"WELCOME TO QSAP  v{version}"
         subtitle_line = "Quick Spectrum Analysis Program"
         welcome_art = f"""
 ╔══════════════════════════════════════════════════════════════╗
 ║                                                              ║
-║    ==== {title_line:^62} ====      ║
+║{title_line:^62}║
 ║                                                              ║
-║         {subtitle_line:^62}         ║
+║{subtitle_line:^62}║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 
