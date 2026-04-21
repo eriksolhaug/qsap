@@ -1078,9 +1078,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
     def apply_changes(self):
         """Apply changes based on user input for redshift and zoom factor."""
         try:
-            # Update redshift and zoom factor from input fields
+            # Update redshift from input field
             self.redshift = float(self.input_redshift.text())
-            self.zoom_factor = float(self.input_zoom.text())
+            
+            # Note: zoom_factor is no longer controlled via UI input field
+            # It's only used internally for y-axis zoom operations (y and Y keys)
             
             # Format redshift without trailing zeros for display
             redshift_str = f"{self.redshift:.6f}".rstrip('0').rstrip('.')
@@ -1091,7 +1093,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 self.poly_order = int(self.input_poly_order.text())
                 print(f"Polynomial order set to: {self.poly_order}")
             
-            print(f"Applied Redshift: {self.redshift}, Zoom Factor: {self.zoom_factor}")
+            print(f"Applied Redshift: {self.redshift}")
             
             # Redisplay active line lists with new redshift
             if self.active_line_lists:
@@ -1104,7 +1106,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             
             self.fig.canvas.draw_idle()  # Redraw the figure to update the display
         except ValueError:
-            print("Invalid input for redshift, zoom factor, or polynomial order. Please enter numerical values.")
+            print("Invalid input for redshift or polynomial order. Please enter numerical values.")
 
     def open_spectrum_file(self):
         """Open a file dialog to select and load a new spectrum file."""
@@ -5861,6 +5863,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 print("Invalid polynomial order, using default order 1")
                 self.poly_order = 1
             
+            # Check if we have valid continuum regions
+            if not self.continuum_regions:
+                self.continuum_mode = False
+                self.label_poly_order.hide()
+                self.input_poly_order.hide()
+                print('Exiting continuum mode.')
+                return
+            
             # Combine all defined regions into a single dataset for fitting
             combined_wav = []
             combined_spec = []
@@ -5877,7 +5887,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         combined_err.extend(self.err[mask])
 
             # Make combined region to define the outer x-bounds of the continuum fit
-            region_bounds = (min(region[0] for region in self.continuum_regions), max(region[1] for region in self.continuum_regions))
+            try:
+                region_bounds = (min(region[0] for region in self.continuum_regions), max(region[1] for region in self.continuum_regions))
+            except (ValueError, TypeError) as e:
+                self.continuum_mode = False
+                self.label_poly_order.hide()
+                self.input_poly_order.hide()
+                print('Exiting continuum mode due to error.')
+                return
 
             # Convert to numpy arrays
             combined_wav = np.array(combined_wav)
