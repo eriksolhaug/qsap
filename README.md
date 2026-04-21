@@ -373,7 +373,6 @@ Note: You will need to select the line list and Toggle Display to view lines. Se
 - `w` - Remove fitted profile under cursor
 - `,` (comma) - Add a line tag to fitted profile under cursor
 - `<` (less than) - Remove tag from fitted profile under cursor
-- `S` - Save all fits information to file
 - `;` (semicolon) - Show/toggle total line for Single Mode fitted lines
 - `v` - Calculate equivalent width of fitted line. In progress. Use with caution.
 

@@ -18,7 +18,7 @@
     "continuum_region": {
       "color": "#8EA4D2",
       "alpha": 0.3,
-      "hatch": "//"
+      "hatch": null
     },
     "total_line": {
       "color": "#496F5D",

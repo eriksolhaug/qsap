@@ -34,8 +34,6 @@ Fitting Modes:
 
 Measurement & Analysis:
   v                    - Calculate equivalent width of fitted line
-  S                    - Save all fits (Gaussian, Voigt, Continuum, Listfit) to files
-  a                    - Load saved fits from file (or use Load Fit button)
   ;                    - Show/toggle total line for Single Mode fitted lines
   w                    - Remove fitted profile under cursor
   ,                    - Add a line tag to fitted profile under cursor
@@ -85,13 +83,27 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 import matplotlib.cm as cm
+from matplotlib import font_manager
 from astropy.io import fits
-from scipy.optimize import curve_fit
-from scipy.special import wofz
-from scipy.interpolate import interp1d
-import lmfit
-from lmfit import Model, Parameters, conf_interval, minimize
-from lmfit.models import PolynomialModel
+import os
+
+# Register Computer Modern Unicode fonts from local fonts/ directory (qsap/fonts/)
+fonts_dir = os.path.join(os.path.dirname(__file__), '..', 'fonts')
+fonts_dir = os.path.abspath(fonts_dir)
+if os.path.isdir(fonts_dir):
+    for font_file in os.listdir(fonts_dir):
+        if font_file.endswith('.otf'):
+            font_path = os.path.join(fonts_dir, font_file)
+            try:
+                font_manager.fontManager.addfont(font_path)
+            except Exception as e:
+                pass  # Silently skip fonts that fail to load
+    # Configure matplotlib to use Computer Modern Serif Unicode
+    plt.rcParams['font.serif'] = ['CMU Serif', 'DejaVu Serif']
+    plt.rcParams['font.sans-serif'] = ['CMU Sans Serif', 'DejaVu Sans']
+    plt.rcParams['font.family'] = 'serif'
+
+# scipy and lmfit are imported lazily in functions that need them to speed up startup
 from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import pyqtSignal, Qt
@@ -114,6 +126,7 @@ from .linelist import get_available_line_lists
 from .linelist_selector_window import LineListSelector
 from .action_history import ActionHistory
 from .action_history_window import ActionHistoryWindow
+from .qsap_file_handler import QSAPFileHandler
 
 
 class OutputStreamCapture:
@@ -340,6 +353,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.fits_file = fits_file
         self.redshift = redshift
         self.zoom_factor = zoom_factor
+        self.flux_scale_factor = 1.0  # Track the flux scaling applied to the spectrum
         self.file_flag = file_flag
         self.lsf = lsf
         self.lsf_kernel_x = None
@@ -361,6 +375,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Initialize settings panel
         self.save_directory = str(Path.cwd())  # Default to app launch directory
         self.load_directory = str(Path.cwd())  # Default to app launch directory
+        self.qsap_handler = QSAPFileHandler(self.save_directory)  # Initialize QSAP file handler
         self.init_settings_panel()
         
         # Initialize window creation attempt flags and resources BEFORE create_menu_bar()
@@ -400,6 +415,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.continuum_patches = []
         self.continuum_fits = []
         self.continuum_params = []
+        self.poly_order = 2  # Default polynomial order for continuum fitting
 
         self.listfit_mode = False
         self.listfit_bounds = []
@@ -483,6 +499,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.mask_bound_lines = []
         self.mask_mode = False
         self.mask_patches = []
+
+        # Legend tracking - track which profile types have been added to legend
+        self.legend_profile_types = set()  # Tracks which profile types have a legend entry
 
         # Item Tracker
         self.item_tracker = ItemTracker()
@@ -797,7 +816,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         
         self.load_fit_button = QPushButton("Load Fit...")
         self.load_fit_button.clicked.connect(self.load_fit_file)
-        self.load_fit_button.setEnabled(False)
+        self.load_fit_button.setEnabled(True)
         left_column_layout.addWidget(self.load_fit_button)
         
         left_column_layout.addStretch()
@@ -911,27 +930,6 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         button_row_layout.addStretch()
         
         control_panel_layout.addLayout(button_row_layout)
-        
-        # Polynomial order (hidden by default)
-        poly_layout = QHBoxLayout()
-        self.label_poly_order = QLabel("Poly Order:")
-        self.input_poly_order = QLineEdit()
-        self.input_poly_order.setText("1")
-        self.input_poly_order.setMaximumWidth(60)
-        poly_validator = QIntValidator(0, 10, self)
-        self.input_poly_order.setValidator(poly_validator)
-        poly_layout.addWidget(self.label_poly_order)
-        poly_layout.addWidget(self.input_poly_order)
-        poly_layout.addStretch()
-        
-        poly_group_widget = QtWidgets.QWidget()
-        poly_group_widget.setLayout(poly_layout)
-        poly_group_widget.hide()
-        self.poly_order_widget = poly_group_widget
-        self.poly_order = 1
-        
-        # Add all sections to main layout
-        control_panel_layout.addWidget(self.poly_order_widget)
         control_panel_layout.addStretch()
         
         self.control_panel_container.setLayout(control_panel_layout)
@@ -1013,6 +1011,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         )
         if directory:
             self.save_directory = directory
+            self.qsap_handler.save_directory = directory  # Update QSAP handler
             self.save_directory_input.setText(directory)
 
     def on_save_directory_changed(self):
@@ -1022,6 +1021,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # Verify the directory exists
             Path(new_directory).resolve()
             self.save_directory = new_directory
+            self.qsap_handler.save_directory = new_directory  # Update QSAP handler
         except Exception as e:
             # If invalid path, revert to previous value
             self.save_directory_input.setText(self.save_directory)
@@ -1088,10 +1088,12 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             redshift_str = f"{self.redshift:.6f}".rstrip('0').rstrip('.')
             self.input_redshift.setText(redshift_str)
             
-            # Update polynomial order if visible
-            if not self.input_poly_order.isHidden():
-                self.poly_order = int(self.input_poly_order.text())
+            # Update polynomial order from Options panel input field
+            try:
+                self.poly_order = int(self.options_poly_order_input.text())
                 print(f"Polynomial order set to: {self.poly_order}")
+            except ValueError:
+                print("Invalid polynomial order")
             
             print(f"Applied Redshift: {self.redshift}")
             
@@ -1191,51 +1193,74 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             traceback.print_exc()
 
     def load_fit_file(self):
-        """Load previously saved fits from consolidated CSV file"""
+        """Load previously saved fits from .qsap or CSV files"""
         from PyQt5.QtWidgets import QFileDialog
         import pandas as pd
         
         dialog = QFileDialog(
             self,
-            "Load Fit File",
-            "",
-            "QSAP Fit Files (qsap_fits_*.csv gaussian_fits_*.csv voigt_fits_*.csv continuum_fits_*.csv listfit_polynomials_*.csv);;CSV Files (*.csv);;All Files (*)"
+            "Load Fit File(s)",
+            self.load_directory,
+            "QSAP Files (*.qsap);;CSV Files (*.csv);;All Files (*)"
         )
-        dialog.setFileMode(QFileDialog.ExistingFile)
+        dialog.setFileMode(QFileDialog.ExistingFiles)
         
         if dialog.exec_() != QFileDialog.Accepted:
             return
         
-        file_path = dialog.selectedFiles()[0]
+        file_paths = dialog.selectedFiles()
+        if not file_paths:
+            return
+            
+        self.load_directory = os.path.dirname(file_paths[0])
+        
+        # Load all selected files
+        for file_path in file_paths:
+            try:
+                basename = os.path.basename(file_path)
+                
+                # Check if this is a .qsap file
+                if file_path.endswith('.qsap'):
+                    self._load_qsap_file(file_path)
+                    print(f"Loaded fits from QSAP file: {basename}")
+                else:
+                    # Legacy CSV support
+                    df = pd.read_csv(file_path)
+                    
+                    # Check if this is a consolidated file (has 'type' column)
+                    if 'type' in df.columns:
+                        # New consolidated format
+                        self._load_consolidated_fits_from_dataframe(df)
+                        print(f"Loaded {len(df)} fits from consolidated file {file_path}")
+                    # Legacy support: auto-detect from old format filenames
+                    elif 'gaussian_fits' in basename:
+                        self._load_gaussian_fits_from_dataframe(df)
+                        print(f"Loaded {len(df)} Gaussian fits from {file_path}")
+                    elif 'voigt_fits' in basename:
+                        self._load_voigt_fits_from_dataframe(df)
+                        print(f"Loaded {len(df)} Voigt fits from {file_path}")
+                    elif 'continuum_fits' in basename:
+                        self._load_continuum_fits_from_dataframe(df)
+                        print(f"Loaded {len(df)} continuum fits from {file_path}")
+                    elif 'listfit_polynomials' in basename:
+                        self._load_listfit_polynomials_from_dataframe(df)
+                        print(f"Loaded listfit polynomials from {file_path}")
+                    else:
+                        # Try to detect by column names
+                        self._load_by_column_detection(df)
+                
+            except Exception as e:
+                print(f"Error loading fit file {basename}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
         
         try:
-            basename = os.path.basename(file_path)
-            df = pd.read_csv(file_path)
-            
-            # Check if this is a consolidated file (has 'type' column)
-            if 'type' in df.columns:
-                # New consolidated format
-                self._load_consolidated_fits_from_dataframe(df)
-                print(f"Loaded {len(df)} fits from consolidated file {file_path}")
-            # Legacy support: auto-detect from old format filenames
-            elif 'gaussian_fits' in basename:
-                self._load_gaussian_fits_from_dataframe(df)
-                print(f"Loaded {len(df)} Gaussian fits from {file_path}")
-            elif 'voigt_fits' in basename:
-                self._load_voigt_fits_from_dataframe(df)
-                print(f"Loaded {len(df)} Voigt fits from {file_path}")
-            elif 'continuum_fits' in basename:
-                self._load_continuum_fits_from_dataframe(df)
-                print(f"Loaded {len(df)} continuum fits from {file_path}")
-            elif 'listfit_polynomials' in basename:
-                self._load_listfit_polynomials_from_dataframe(df)
-                print(f"Loaded listfit polynomials from {file_path}")
-            else:
-                # Try to detect by column names
-                self._load_by_column_detection(df)
-            
             # Update plot and redraw all loaded fits
-            self.plot_spectrum()
+            # Only plot spectrum if not already loaded
+            if len(self.wav) == 0 or len(self.spec) == 0:
+                self.plot_spectrum()
+            # Always redraw fits (will only add new ones that don't have lines yet)
             self._redraw_loaded_fits()
             self.fig.canvas.draw_idle()
             
@@ -1243,6 +1268,390 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             print(f"Error loading fit file: {e}")
             import traceback
             traceback.print_exc()
+    
+    def _load_qsap_file(self, filepath):
+        """Load fits from a .qsap file and populate relevant fit lists
+        
+        Args:
+            filepath: Path to the .qsap file
+        """
+        qsap_data = self.qsap_handler.parse_qsap_file(filepath)
+        metadata = qsap_data.get('metadata', {})
+        components = qsap_data.get('components', [])
+        
+        fit_type = metadata.get('TYPE', 'Unknown')
+        fit_mode = metadata.get('MODE', 'Unknown')
+        
+        print(f"Loading {fit_type} fit (mode: {fit_mode})")
+        
+        # Load scale factor from metadata if present
+        if 'SCALE_FACTOR' in metadata:
+            self.flux_scale_factor = metadata['SCALE_FACTOR']
+            print(f"  Scale factor: {self.flux_scale_factor}")
+        
+        # Process components based on fit type
+        if fit_type == 'Gaussian':
+            for comp in components:
+                fit_dict = self._parse_qsap_gaussian_component(comp)
+                if fit_dict:
+                    self.gaussian_fits.append(fit_dict)
+                    # Register with ItemTracker
+                    position_str = f"λ: {fit_dict.get('mean', 0):.2f} Å"
+                    self.register_item('gaussian', f'Gaussian', fit_dict=fit_dict, position=position_str, 
+                                     color=self.colors['profiles']['gaussian']['color'])
+            print(f"  Loaded {len(components)} Gaussian components")
+            
+        elif fit_type == 'Voigt':
+            for comp in components:
+                fit_dict = self._parse_qsap_voigt_component(comp)
+                if fit_dict:
+                    self.voigt_fits.append(fit_dict)
+                    # Register with ItemTracker
+                    position_str = f"λ: {fit_dict.get('center', 0):.2f} Å"
+                    self.register_item('voigt', f'Voigt', fit_dict=fit_dict, position=position_str,
+                                     color='orange')
+            print(f"  Loaded {len(components)} Voigt components")
+            
+        elif fit_type == 'Continuum':
+            for comp in components:
+                fit_dict = self._parse_qsap_continuum_component(comp)
+                if fit_dict:
+                    self.continuum_fits.append(fit_dict)
+                    
+                    # Register with ItemTracker
+                    bounds = fit_dict.get('bounds', (0, 0))
+                    bounds_str = f"λ: {bounds[0]:.2f}-{bounds[1]:.2f} Å"
+                    self.register_item('continuum', f'Continuum (order {fit_dict.get("poly_order", 2)})',
+                                     fit_dict=fit_dict, position=bounds_str, 
+                                     color=self.colors['profiles']['continuum_line']['color'])
+                    
+                    # Recreate continuum regions/patches for visualization
+                    # Check if individual_regions was stored, otherwise use the combined bounds
+                    individual_regions = fit_dict.get('individual_regions', [bounds])
+                    
+                    for region_bounds in individual_regions:
+                        if region_bounds[0] > 0 and region_bounds[1] > 0:  # Valid bounds
+                            # Add to continuum_regions list
+                            self.continuum_regions.append(region_bounds)
+                            
+                            # Create visual patch for the region
+                            try:
+                                continuum_region_cfg = self.colors['profiles']['continuum_region']
+                                patch = self.ax.axvspan(region_bounds[0], region_bounds[1], 
+                                                      color=continuum_region_cfg['color'], 
+                                                      alpha=continuum_region_cfg['alpha'], 
+                                                      hatch=continuum_region_cfg['hatch'])
+                                self.continuum_patches.append({'patch': patch, 'bounds': region_bounds})
+                                
+                                # Register the region with ItemTracker
+                                position_str = f"λ: {region_bounds[0]:.2f}-{region_bounds[1]:.2f} Å"
+                                self.register_item('continuum_region', f'Continuum Region', patch_obj=patch,
+                                                 position=position_str, color=continuum_region_cfg['color'], bounds=region_bounds)
+                            except Exception as e:
+                                print(f"Error creating continuum region patch: {e}")
+            print(f"  Loaded {len(components)} Continuum fits")
+            
+        elif fit_type == 'Listfit':
+            mask_count = 0
+            poly_count = 0
+            for comp in components:
+                if comp.get('TYPE') == 'Gaussian':
+                    fit_dict = self._parse_qsap_gaussian_component(comp)
+                    if fit_dict:
+                        self.gaussian_fits.append(fit_dict)
+                        position_str = f"λ: {fit_dict.get('mean', 0):.2f} Å"
+                        self.register_item('gaussian', f'Gaussian (listfit)', fit_dict=fit_dict, 
+                                         position=position_str, color=self.colors['profiles']['gaussian']['color'])
+                elif comp.get('TYPE') == 'Voigt':
+                    fit_dict = self._parse_qsap_voigt_component(comp)
+                    if fit_dict:
+                        self.voigt_fits.append(fit_dict)
+                        position_str = f"λ: {fit_dict.get('center', 0):.2f} Å"
+                        self.register_item('voigt', f'Voigt (listfit)', fit_dict=fit_dict, 
+                                         position=position_str, color='orange')
+                elif comp.get('TYPE') == 'Polynomial':
+                    fit_dict = self._parse_qsap_polynomial_component(comp)
+                    if fit_dict:
+                        # Use bounds from the parsed polynomial, or default to full spectrum
+                        bounds = fit_dict.get('bounds', (self.x_data.min(), self.x_data.max()))
+                        fit_dict['bounds'] = bounds
+                        fit_dict['is_velocity_mode'] = False
+                        self.continuum_fits.append(fit_dict)
+                        position_str = f"λ: {bounds[0]:.2f}-{bounds[1]:.2f} Å"
+                        self.register_item('polynomial', f'Polynomial (listfit, order={fit_dict.get("poly_order", 1)})', 
+                                         fit_dict=fit_dict, position=position_str, 
+                                         color=self.colors['profiles']['continuum_line']['color'])
+                        poly_count += 1
+                elif comp.get('TYPE') == 'PolynomialGuessMask':
+                    mask_dict = self._parse_qsap_polynomial_guess_mask_component(comp)
+                    if mask_dict:
+                        min_lambda = mask_dict.get('min_lambda', 0)
+                        max_lambda = mask_dict.get('max_lambda', 0)
+                        position_str = f"λ: {min_lambda:.2f}-{max_lambda:.2f} Å"
+                        self.register_item('polynomial_guess_mask', f'Polynomial Guess Mask (listfit)',
+                                         fit_dict=mask_dict, position=position_str,
+                                         color='lightblue', bounds=(min_lambda, max_lambda))
+                        mask_count += 1
+                elif comp.get('TYPE') == 'DataMask':
+                    mask_dict = self._parse_qsap_data_mask_component(comp)
+                    if mask_dict:
+                        min_lambda = mask_dict.get('min_lambda', 0)
+                        max_lambda = mask_dict.get('max_lambda', 0)
+                        position_str = f"λ: {min_lambda:.2f}-{max_lambda:.2f} Å"
+                        self.register_item('data_mask', f'Data Mask (listfit)',
+                                         fit_dict=mask_dict, position=position_str,
+                                         color='lightcoral', bounds=(min_lambda, max_lambda))
+                        mask_count += 1
+            print(f"  Loaded {len(components)} Listfit components (including {mask_count} masks, {poly_count} polynomials)")
+            
+        elif fit_type == 'Redshift':
+            redshift_value = components[0].get('REDSHIFT') if components else None
+            if isinstance(redshift_value, tuple):
+                redshift_value = redshift_value[0]
+            
+            if redshift_value:
+                print(f"  Loaded Redshift: {redshift_value}")
+                print(f"  Line ID: {components[0].get('LINE_ID', 'Unknown')}")
+                print(f"  Rest Wavelength: {components[0].get('LINE_WAVELENGTH_REST', 'Unknown')} Å")
+                print(f"  Observed Wavelength: {components[0].get('LINE_WAVELENGTH_OBSERVED', 'Unknown')} Å")
+    
+    def _parse_qsap_gaussian_component(self, comp_dict):
+        """Parse a Gaussian component from QSAP format"""
+        fit_dict = {}
+        
+        # Core parameters
+        if 'FIT_ID' in comp_dict:
+            fit_dict['fit_id'] = comp_dict['FIT_ID']
+        if 'COMPONENT_ID' in comp_dict:
+            fit_dict['component_id'] = comp_dict['COMPONENT_ID']
+        
+        # Line information
+        if 'LINE_ID' in comp_dict:
+            fit_dict['line_id'] = comp_dict['LINE_ID']
+        if 'LINE_WAVELENGTH' in comp_dict:
+            fit_dict['line_wavelength'] = comp_dict['LINE_WAVELENGTH']
+        if 'REST_WAVELENGTH' in comp_dict:
+            fit_dict['rest_wavelength'] = comp_dict['REST_WAVELENGTH']
+        
+        # Parse amplitude with error
+        if 'AMPLITUDE' in comp_dict:
+            val, err = comp_dict['AMPLITUDE'] if isinstance(comp_dict['AMPLITUDE'], tuple) else (comp_dict['AMPLITUDE'], None)
+            fit_dict['amp'] = val
+            if err:
+                fit_dict['amp_err'] = err
+        
+        # Parse mean with error
+        if 'MEAN' in comp_dict:
+            val, err = comp_dict['MEAN'] if isinstance(comp_dict['MEAN'], tuple) else (comp_dict['MEAN'], None)
+            fit_dict['mean'] = val
+            if err:
+                fit_dict['mean_err'] = err
+        
+        # Parse std_dev with error
+        if 'STD_DEV' in comp_dict:
+            val, err = comp_dict['STD_DEV'] if isinstance(comp_dict['STD_DEV'], tuple) else (comp_dict['STD_DEV'], None)
+            fit_dict['stddev'] = val
+            if err:
+                fit_dict['stddev_err'] = err
+        
+        # Bounds
+        if 'BOUNDS_LOWER' in comp_dict and 'BOUNDS_UPPER' in comp_dict:
+            fit_dict['bounds'] = (comp_dict['BOUNDS_LOWER'], comp_dict['BOUNDS_UPPER'])
+        
+        # Quality metrics
+        if 'CHI_SQUARED' in comp_dict:
+            fit_dict['chi2'] = comp_dict['CHI_SQUARED']
+        if 'CHI_SQUARED_NU' in comp_dict:
+            fit_dict['chi2_nu'] = comp_dict['CHI_SQUARED_NU']
+        
+        # Mode information (default to False if not present)
+        fit_dict['is_velocity_mode'] = comp_dict.get('VELOCITY_MODE', False)
+        
+        # System redshift
+        if 'SYSTEM_REDSHIFT' in comp_dict:
+            fit_dict['z_sys'] = comp_dict['SYSTEM_REDSHIFT']
+        
+        return fit_dict if fit_dict else None
+    
+    def _parse_qsap_voigt_component(self, comp_dict):
+        """Parse a Voigt component from QSAP format"""
+        fit_dict = {}
+        
+        # Core parameters
+        if 'FIT_ID' in comp_dict:
+            fit_dict['fit_id'] = comp_dict['FIT_ID']
+        if 'COMPONENT_ID' in comp_dict:
+            fit_dict['component_id'] = comp_dict['COMPONENT_ID']
+        
+        # Line information
+        if 'LINE_ID' in comp_dict:
+            fit_dict['line_id'] = comp_dict['LINE_ID']
+        if 'LINE_WAVELENGTH' in comp_dict:
+            fit_dict['line_wavelength'] = comp_dict['LINE_WAVELENGTH']
+        if 'REST_WAVELENGTH' in comp_dict:
+            fit_dict['rest_wavelength'] = comp_dict['REST_WAVELENGTH']
+        
+        # Parse amplitude with error
+        if 'AMPLITUDE' in comp_dict:
+            val, err = comp_dict['AMPLITUDE'] if isinstance(comp_dict['AMPLITUDE'], tuple) else (comp_dict['AMPLITUDE'], None)
+            fit_dict['amplitude'] = val
+            if err:
+                fit_dict['amplitude_err'] = err
+        
+        # Parse mean/center with error
+        if 'MEAN' in comp_dict:
+            val, err = comp_dict['MEAN'] if isinstance(comp_dict['MEAN'], tuple) else (comp_dict['MEAN'], None)
+            fit_dict['center'] = val
+            fit_dict['mean'] = val
+            if err:
+                fit_dict['center_err'] = err
+                fit_dict['mean_err'] = err
+        
+        # Parse sigma with error
+        if 'SIGMA' in comp_dict:
+            val, err = comp_dict['SIGMA'] if isinstance(comp_dict['SIGMA'], tuple) else (comp_dict['SIGMA'], None)
+            fit_dict['sigma'] = val
+            if err:
+                fit_dict['sigma_err'] = err
+        
+        # Parse gamma with error
+        if 'GAMMA' in comp_dict:
+            val, err = comp_dict['GAMMA'] if isinstance(comp_dict['GAMMA'], tuple) else (comp_dict['GAMMA'], None)
+            fit_dict['gamma'] = val
+            if err:
+                fit_dict['gamma_err'] = err
+        
+        # Doppler parameter
+        if 'B_DOPPLER' in comp_dict:
+            fit_dict['b'] = comp_dict['B_DOPPLER']
+        if 'LOG_T_EFF' in comp_dict:
+            fit_dict['logT_eff'] = comp_dict['LOG_T_EFF']
+        
+        # Bounds
+        if 'BOUNDS_LOWER' in comp_dict and 'BOUNDS_UPPER' in comp_dict:
+            fit_dict['bounds'] = (comp_dict['BOUNDS_LOWER'], comp_dict['BOUNDS_UPPER'])
+        
+        # Quality metrics
+        if 'CHI_SQUARED' in comp_dict:
+            fit_dict['chi2'] = comp_dict['CHI_SQUARED']
+        if 'CHI_SQUARED_NU' in comp_dict:
+            fit_dict['chi2_nu'] = comp_dict['CHI_SQUARED_NU']
+        
+        # Mode information (default to False if not present)
+        fit_dict['is_velocity_mode'] = comp_dict.get('VELOCITY_MODE', False)
+        
+        # System redshift
+        if 'SYSTEM_REDSHIFT' in comp_dict:
+            fit_dict['z_sys'] = comp_dict['SYSTEM_REDSHIFT']
+        
+        return fit_dict if fit_dict else None
+    
+    def _parse_qsap_continuum_component(self, comp_dict):
+        """Parse a continuum component from QSAP format"""
+        fit_dict = {}
+        
+        # Polynomial order
+        if 'POLY_ORDER' in comp_dict:
+            fit_dict['poly_order'] = comp_dict['POLY_ORDER']
+        
+        # Bounds (combined min-max for backward compatibility)
+        if 'BOUNDS_LOWER' in comp_dict and 'BOUNDS_UPPER' in comp_dict:
+            fit_dict['bounds'] = (comp_dict['BOUNDS_LOWER'], comp_dict['BOUNDS_UPPER'])
+        
+        # Individual regions (new format)
+        if 'NUM_REGIONS' in comp_dict:
+            num_regions = comp_dict['NUM_REGIONS']
+            individual_regions = []
+            for idx in range(num_regions):
+                lower_key = f'REGION_{idx}_LOWER'
+                upper_key = f'REGION_{idx}_UPPER'
+                if lower_key in comp_dict and upper_key in comp_dict:
+                    region = (comp_dict[lower_key], comp_dict[upper_key])
+                    individual_regions.append(region)
+            if individual_regions:
+                fit_dict['individual_regions'] = individual_regions
+        
+        # Polynomial coefficients
+        coeffs = []
+        coeffs_err = []
+        coeff_idx = 0
+        while f'COEFF_{coeff_idx}' in comp_dict:
+            val = comp_dict[f'COEFF_{coeff_idx}']
+            if isinstance(val, tuple):
+                coeffs.append(val[0])
+                coeffs_err.append(val[1])
+            else:
+                coeffs.append(val)
+                coeffs_err.append(None)
+            coeff_idx += 1
+        
+        if coeffs:
+            fit_dict['coeffs'] = np.array(coeffs)
+            fit_dict['coeffs_err'] = np.array(coeffs_err)
+        
+        # Mode information
+        if 'VELOCITY_MODE' in comp_dict:
+            fit_dict['is_velocity_mode'] = comp_dict['VELOCITY_MODE']
+        
+        return fit_dict if fit_dict else None
+    
+    def _parse_qsap_polynomial_guess_mask_component(self, comp_dict):
+        """Parse a polynomial guess mask component from QSAP format"""
+        mask_dict = {
+            'type': 'polynomial_guess_mask'
+        }
+        
+        if 'MIN_LAMBDA' in comp_dict:
+            mask_dict['min_lambda'] = comp_dict['MIN_LAMBDA']
+        if 'MAX_LAMBDA' in comp_dict:
+            mask_dict['max_lambda'] = comp_dict['MAX_LAMBDA']
+        
+        return mask_dict if mask_dict else None
+    
+    def _parse_qsap_data_mask_component(self, comp_dict):
+        """Parse a data mask component from QSAP format"""
+        mask_dict = {
+            'type': 'data_mask'
+        }
+        
+        if 'MIN_LAMBDA' in comp_dict:
+            mask_dict['min_lambda'] = comp_dict['MIN_LAMBDA']
+        if 'MAX_LAMBDA' in comp_dict:
+            mask_dict['max_lambda'] = comp_dict['MAX_LAMBDA']
+        
+        return mask_dict if mask_dict else None
+    
+    def _parse_qsap_polynomial_component(self, comp_dict):
+        """Parse a polynomial component from QSAP format (for listfit)"""
+        fit_dict = {}
+        
+        # Polynomial order
+        if 'POLY_ORDER' in comp_dict:
+            fit_dict['poly_order'] = comp_dict['POLY_ORDER']
+        
+        # Bounds
+        if 'BOUNDS_LOWER' in comp_dict and 'BOUNDS_UPPER' in comp_dict:
+            fit_dict['bounds'] = (comp_dict['BOUNDS_LOWER'], comp_dict['BOUNDS_UPPER'])
+        
+        # Polynomial coefficients
+        coeffs = []
+        coeffs_err = []
+        coeff_idx = 0
+        while f'COEFF_{coeff_idx}' in comp_dict:
+            val = comp_dict[f'COEFF_{coeff_idx}']
+            if isinstance(val, tuple):
+                coeffs.append(val[0])
+                coeffs_err.append(val[1])
+            else:
+                coeffs.append(val)
+                coeffs_err.append(None)
+            coeff_idx += 1
+        
+        if coeffs:
+            fit_dict['coeffs'] = np.array(coeffs)
+            fit_dict['coeffs_err'] = np.array(coeffs_err)
+        
+        return fit_dict if fit_dict else None
     
     def _redraw_loaded_fits(self):
         """Redraw all loaded fit lines on the plot and register with tracker"""
@@ -1258,7 +1667,12 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         existing_continuum = np.zeros_like(x_plot)
                     y_plot = self.gaussian(x_plot, fit['amp'], fit['mean'], fit['stddev']) + existing_continuum
                     gaussian_color = self.colors['profiles']['gaussian']
-                    fit['line'], = self.ax.plot(x_plot, y_plot, color=gaussian_color['color'], linestyle=gaussian_color['linestyle'])
+                    
+                    # Add label only for the first gaussian
+                    label = 'Gaussian' if 'gaussian' not in self.legend_profile_types else None
+                    fit['line'], = self.ax.plot(x_plot, y_plot, color=gaussian_color['color'], linestyle=gaussian_color['linestyle'], label=label)
+                    if label:
+                        self.legend_profile_types.add('gaussian')
                     
                     # Register with item tracker - use saved name if available
                     name = fit.get('_tracker_name') or f"Gaussian (μ={fit['mean']:.1f}, σ={fit['stddev']:.1f})"
@@ -1279,7 +1693,12 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         existing_continuum = np.zeros_like(x_plot)
                     y_plot = self.voigt(x_plot, fit['amp'], fit['center'], fit['sigma'], fit['gamma']) + existing_continuum
                     voigt_color = self.colors['profiles']['voigt']
-                    fit['line'], = self.ax.plot(x_plot, y_plot, color=voigt_color['color'], linestyle=voigt_color['linestyle'])
+                    
+                    # Add label only for the first voigt
+                    label = 'Voigt' if 'voigt' not in self.legend_profile_types else None
+                    fit['line'], = self.ax.plot(x_plot, y_plot, color=voigt_color['color'], linestyle=voigt_color['linestyle'], label=label)
+                    if label:
+                        self.legend_profile_types.add('voigt')
                     
                     # Register with item tracker - use saved name if available
                     name = fit.get('_tracker_name') or f"Voigt (c={fit['center']:.1f}, σ={fit['sigma']:.1f}, γ={fit['gamma']:.1f})"
@@ -1293,14 +1712,33 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             if fit.get('line') is None:
                 try:
                     x_plot = np.linspace(fit['bounds'][0], fit['bounds'][1], 100)
-                    y_plot = fit['a'] * x_plot + fit['b']
-                    continuum_color = self.colors['profiles']['continuum_line']
-                    fit['line'], = self.ax.plot(x_plot, y_plot, color=continuum_color['color'], linestyle=continuum_color['linestyle'])
                     
-                    # Register with item tracker - use saved name if available
-                    name = fit.get('_tracker_name') or f"Continuum (a={fit['a']:.2e}, b={fit['b']:.2f})"
+                    # Handle both old format (a, b) and new format (coeffs)
+                    if 'coeffs' in fit:
+                        y_plot = np.polyval(fit['coeffs'], x_plot)
+                    else:
+                        # Old format fallback for backward compatibility
+                        y_plot = fit['a'] * x_plot + fit['b']
+                    
+                    continuum_color = self.colors['profiles']['continuum_line']
+                    
+                    # Add label only for the first continuum
+                    label = 'Continuum' if 'continuum' not in self.legend_profile_types else None
+                    fit['line'], = self.ax.plot(x_plot, y_plot, color=continuum_color['color'], linestyle=continuum_color['linestyle'], label=label)
+                    if label:
+                        self.legend_profile_types.add('continuum')
+                    
+                    # Register with item tracker
+                    poly_order = fit.get('poly_order', 1)
+                    name = f"Continuum (order {poly_order})"
+                    # Create position string safely
+                    bounds = fit.get('bounds', (0, 0))
+                    if bounds and bounds[0] is not None and bounds[1] is not None:
+                        position_str = f"λ: {bounds[0]:.2f}-{bounds[1]:.2f} Å"
+                    else:
+                        position_str = "Continuum"
                     self.register_item('continuum', name, fit_dict=fit, line_obj=fit['line'],
-                                     color=continuum_color['color'], bounds=fit['bounds'])
+                                     position=position_str, color=continuum_color['color'], bounds=bounds)
                 except Exception as e:
                     print(f"Error redrawing continuum fit: {e}")
         
@@ -1579,6 +2017,12 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.wavelength_unit = meta['wave_unit']
         else:
             self.wavelength_unit = "Å"  # Default to Angstroms
+        
+        # Extract and store flux scale factor from metadata
+        if meta and 'scale_factor' in meta:
+            self.flux_scale_factor = meta['scale_factor']
+        else:
+            self.flux_scale_factor = 1.0  # Default to no scaling
         
         # Reset smoothing and other processing
         self.smoothing_kernel = None
@@ -1959,7 +2403,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Update title with version (no matplotlib manager anymore)
         self.setWindowTitle(f"QSAP - Quick Spectrum Analysis Program (v{__version__})")
 
-        self.ax.legend(loc='upper right')
+        self.update_legend()
 
         # Show the Item Tracker window (in background)
         self.item_tracker.item_deleted.connect(self.on_item_deleted_from_tracker)
@@ -2044,6 +2488,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         cont_dropdown_layout.addWidget(self.continuum_mode_dropdown)
         cont_dropdown_layout.addStretch()
         continuum_sub_layout.addLayout(cont_dropdown_layout)
+        
+        # Polynomial order label
+        poly_order_label = QtWidgets.QLabel("Polynomial order")
+        poly_order_label.setStyleSheet("font-size: 10px;")
+        continuum_sub_layout.addWidget(poly_order_label)
         
         # Polynomial order with +/- buttons
         poly_order_layout = QtWidgets.QHBoxLayout()
@@ -2161,15 +2610,29 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         plot_residual_layout.addStretch()
         calculate_layout.addLayout(plot_residual_layout)
         
+        # Plot Total Line button
+        plot_total_line_layout = QtWidgets.QHBoxLayout()
+        self.plot_total_line_button = QtWidgets.QPushButton("Plot Total Line    [;]")
+        self.plot_total_line_button.clicked.connect(self.toggle_total_line)
+        plot_total_line_layout.addWidget(self.plot_total_line_button)
+        plot_total_line_layout.addStretch()
+        calculate_layout.addLayout(plot_total_line_layout)
+        
         main_layout.addLayout(calculate_layout)
         
         # --- DEACTIVATE ALL BUTTON ---
         main_layout.addSpacing(5)
-        deactivate_button_layout = QtWidgets.QHBoxLayout()
-        self.deactivate_all_button = QtWidgets.QPushButton("Deactivate All")
+        deactivate_button_layout = QtWidgets.QVBoxLayout()
+        self.deactivate_all_button = QtWidgets.QPushButton("Deactivate All [Esc]")
         self.deactivate_all_button.clicked.connect(self.on_deactivate_all)
-        deactivate_button_layout.addWidget(self.deactivate_all_button)
-        deactivate_button_layout.addStretch()
+        button_layout = QtWidgets.QHBoxLayout()
+        button_layout.addWidget(self.deactivate_all_button)
+        button_layout.addStretch()
+        deactivate_button_layout.addLayout(button_layout)
+        # Add helper text
+        deactivate_help_label = QtWidgets.QLabel("Click this to deactivate all active processes from this Options tab.")
+        deactivate_help_label.setStyleSheet("font-size: 10px; color: gray;")
+        deactivate_button_layout.addWidget(deactivate_help_label)
         main_layout.addLayout(deactivate_button_layout)
         
         # Add stretch to push content to top
@@ -2224,16 +2687,19 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
 
     def on_gaussian_mode_changed(self, mode_text):
         """Handle change in Gaussian fitting mode from dropdown"""
-        # Strip keystroke indicator for comparison
-        mode_clean = mode_text.split("     [")
+        # Strip keystroke indicator for comparison - try different space counts
+        mode_clean = mode_text.split("     [")  # 5 spaces for Single Gaussian
         if len(mode_clean) > 1:
             mode_text = mode_clean[0]
         else:
-            mode_clean = mode_text.split("      [")
+            mode_clean = mode_text.split("      [")  # 6 spaces for Multi Gaussian
             if len(mode_clean) > 1:
                 mode_text = mode_clean[0]
             else:
-                mode_text = mode_clean[0]
+                mode_text = mode_text  # Keep original if no bracket found
+        
+        mode_text = mode_text.strip()  # Remove any trailing whitespace
+        
         if mode_text == "":
             # Deactivated
             self.gaussian_mode = False
@@ -2244,7 +2710,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.gaussian_mode = True
             self.multi_gaussian_mode_old = False
             self.bounds = []
-            self.bound_lines.clear()
+            if hasattr(self, 'bound_lines'):
+                self.bound_lines.clear()
             print("Single Gaussian mode activated from Options panel")
             self.gaussian_enter_button.setEnabled(False)
             self.record_action('activate_single_gaussian', 'Activated Single Gaussian Mode')
@@ -2253,7 +2720,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.multi_gaussian_mode_old = True
             self.gaussian_mode = False
             self.bounds = []
-            self.bound_lines.clear()
+            if hasattr(self, 'bound_lines'):
+                self.bound_lines.clear()
             print("Multi Gaussian mode activated from Options panel")
             self.update_gaussian_enter_button()
             self.record_action('activate_multi_gaussian', 'Activated Multi Gaussian Mode')
@@ -2261,7 +2729,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
     def on_continuum_mode_changed(self, mode_text):
         """Handle change in Continuum fitting mode from dropdown"""
         # Strip keystroke indicator for comparison
-        mode_clean = mode_text.split("    [")
+        mode_clean = mode_text.split("     [")
         if len(mode_clean) > 1:
             mode_text = mode_clean[0]
         else:
@@ -2276,8 +2744,6 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     if patch in self.ax.patches:
                         patch.remove()
             self.continuum_patches.clear()
-            self.label_poly_order.hide()
-            self.input_poly_order.hide()
             self.continuum_enter_button.setEnabled(False)
             self.fig.canvas.draw_idle()
             print("Continuum mode deactivated from Options panel")
@@ -2286,11 +2752,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.continuum_mode = True
             self.continuum_regions = []
             self.continuum_patches = []
-            self.label_poly_order.show()
-            self.input_poly_order.show()
             self.continuum_enter_button.setEnabled(True)
             print("Continuum fitting mode activated from Options panel")
-            print("Use the spacebar to define regions.")
+            print("Use the spacebar to define the left bound and then the right bound of a continuum region.")
+            print("You can define multiple continuum regions by selecting multiple pairs of bounds.")
+            print("When the regions are set, hit Enter or Return to fit a polynomial (the order of the polynomial is configurable in Options).")
             self.record_action('activate_continuum_mode', 'Activated Continuum Mode')
 
     def on_advanced_mode_changed(self, mode_text):
@@ -2303,8 +2769,28 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             mode_text = mode_clean[0]
         
         if mode_text == "":
-            # Deactivated
-            pass
+            # Deactivated - exit both listfit and bayes modes
+            if self.listfit_mode:
+                for line in self.listfit_bound_lines:
+                    try:
+                        line.remove()
+                    except (ValueError, NotImplementedError):
+                        pass
+                self.listfit_bound_lines.clear()
+                self.listfit_bounds = []
+                self.listfit_mode = False
+            if self.bayes_mode:
+                for line in self.bayes_bound_lines:
+                    try:
+                        line.remove()
+                    except (ValueError, NotImplementedError):
+                        pass
+                self.bayes_bound_lines.clear()
+                self.bayes_bounds = []
+                self.bayes_mode = False
+            if self.ax is not None:
+                self.ax.figure.canvas.draw_idle()
+            print("Advanced modes deactivated from Options panel")
         elif mode_text == "Listfit":
             # Activate listfit mode (same as pressing 'H')
             self.listfit_mode = True
@@ -2343,8 +2829,17 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 mode_text = mode_clean[0]
         
         if mode_text == "":
-            # Deactivated
-            pass
+            # Deactivated - exit both redshift and velocity modes
+            if self.redshift_estimation_mode:
+                self.redshift_estimation_mode = False
+                print('Redshift estimation mode deactivated from Options panel')
+            if self.is_velocity_mode:
+                self.exit_velocity_mode()
+                self.rest_wavelength = None
+                self.rest_id = None
+                print('Velocity mode deactivated from Options panel')
+            if self.ax is not None:
+                self.ax.figure.canvas.draw_idle()
         elif mode_text == "Estimate Redshift":
             # Activate redshift estimation mode (same as pressing 'z')
             if self.redshift_estimation_mode:
@@ -2446,6 +2941,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 if self.err is not None:
                     combined_err.extend(self.err[mask])
 
+        # Store the individual regions (not the combined bound) in the fit
+        individual_regions = list(self.continuum_regions)
         region_bounds = (min(region[0] for region in self.continuum_regions), 
                         max(region[1] for region in self.continuum_regions))
 
@@ -2456,11 +2953,6 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Fit the continuum
         continuum, coeffs, perr = self.fit_continuum(combined_wav, combined_spec, combined_err, 
                                                       poly_order=self.poly_order)
-        
-        poly_str = f"Continuum fit (order {self.poly_order}):"
-        for i, (coeff, err) in enumerate(zip(coeffs, perr)):
-            poly_str += f" c{i}={coeff:.6e}±{err:.6e}"
-        print(poly_str)
 
         # Plot the fitted continuum
         x_plot = np.linspace(region_bounds[0], region_bounds[1], 500)
@@ -2470,13 +2962,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                                       linestyle=continuum_cfg['linestyle'], alpha=0.8)
         if self.is_residual_shown:
             self.calculate_and_plot_residuals()
-        self.ax.legend(loc='upper right')
+        self.update_legend()
         self.ax.figure.canvas.draw()
         QtWidgets.QApplication.processEvents()
 
         # Store continuum fit
         continuum_fit = {
             'bounds': region_bounds,
+            'individual_regions': individual_regions,  # Store each region separately
             'coeffs': coeffs,
             'coeffs_err': perr,
             'poly_order': self.poly_order,
@@ -2493,20 +2986,19 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         
         self.record_action('fit_continuum', f'Fit Continuum (order {self.poly_order})')
         
+        # Save fit to .qsap file and print
+        self.save_and_print_qsap_fit(continuum_fit, 'Continuum', 'Single')
+        
         # Clean up and deactivate
         self.continuum_regions = []
         self.continuum_patches = []
         self.continuum_mode = False
-        self.label_poly_order.hide()
-        self.input_poly_order.hide()
         
         # Reset dropdown to blank
         self.continuum_mode_dropdown.blockSignals(True)
         self.continuum_mode_dropdown.setCurrentIndex(0)
         self.continuum_mode_dropdown.blockSignals(False)
         self.continuum_enter_button.setEnabled(False)
-        
-        print('Continuum fitting completed and mode deactivated.')
 
     def reset_advanced_dropdown(self):
         """Reset Advanced dropdown to blank and deactivate related modes"""
@@ -2594,8 +3086,6 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # Remove bound lines if any
             for line in self.bound_lines:
                 line.remove()
-            self.label_poly_order.hide()
-            self.input_poly_order.hide()
             self.continuum_mode_dropdown.blockSignals(True)
             self.continuum_mode_dropdown.setCurrentIndex(0)
             self.continuum_mode_dropdown.blockSignals(False)
@@ -2769,6 +3259,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 lower_bounds[i * 3 + 2] = 0  # sigma >= 0
                 upper_bounds[i * 3 + 2] = sigma_max  # sigma <= sigma_max
             
+            # Lazy import of scipy for curve fitting
+            from scipy.optimize import curve_fit
             params, pcov = curve_fit(self.multi_gaussian, comp_xs, continuum_subtracted_ys, sigma=sigma_param, p0=initial_guesses, bounds=(lower_bounds, upper_bounds))
             perr = np.sqrt(np.diag(pcov))
             for i in range(0, len(params), 3):
@@ -2781,6 +3273,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 # Calculate chi2 (simpler without errors since they're concatenated)
                 chi2 = np.sum(residuals ** 2)  # Chi2 without decomposed errors
                 chi2_nu = chi2 / (len(x_fit) - 3)  # 3 params per component
+                
+                # Lazy import of scipy for interpolation
+                from scipy.interpolate import interp1d
                 interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
                 x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                 y_plt = interpolator(x_plt)
@@ -2792,6 +3287,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 'is_velocity_mode': self.is_velocity_mode,
                 'chi2': chi2,
                 'chi2_nu': chi2_nu,
+                'has_errors': sigma_param is not None,  # Track if errors were available
                 'component_id': self.component_id,
                 'amp': amp, 'amp_err': amp_err, 'mean': mean, 'mean_err': mean_err, 'stddev': stddev, 'stddev_err': stddev_err,
                 'bounds': (left_bound, right_bound),
@@ -2813,24 +3309,18 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 if i == len(params) - 3:  # Last component
                     self.record_action('fit_multi_gaussian', f'Fit {len(bound_pairs)} Gaussians')
                 
-                print(f"  Fit ID: {self.fit_id}")
-                print(f"  Component ID: {self.component_id}")
-                print(f"  Velocity mode: {self.is_velocity_mode}")
-                print(f"  Line ID: {line_id}")
-                print(f"  Line Wavelength: {line_wavelength}")
-                print(f"  Amplitude: {amp}+-{amp_err}")
-                print(f"  Mean: {mean}+-{mean_err}")
-                print(f"  Std_dev: {stddev}+-{stddev_err}")
-                print(f"  Bounds: ({left_bound}, {right_bound})")
-                print(f"  Chi-squared: {chi2}")
-                print(f"  Chi-squared_nu: {chi2_nu}")
-                print(f"  Line Object: {fit_line}\n")
-
                 self.component_id += 1
 
             # Force immediate redraw of the canvas
             self.ax.figure.canvas.draw()
             QtWidgets.QApplication.processEvents()  # Process Qt events to ensure redraw
+            
+            # Save all components to single .qsap file with Multi-Gaussian MODE
+            # Get all gaussians for this fit_id
+            multi_gaussian_components = [g for g in self.gaussian_fits if g.get('fit_id') == self.fit_id]
+            if multi_gaussian_components:
+                self.save_and_print_qsap_fit(multi_gaussian_components, 'Gaussian', 'Multi-Gaussian')
+            
             self.fit_id += 1
             # Clear bound lines after fit
             for line in self.bound_lines:
@@ -2838,15 +3328,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.bound_lines.clear()
             self.bounds = []
             self.ax.figure.canvas.draw_idle()  # Redraw to show bound lines removed
-            for i in range(0, len(params), 3):
-                print(f"Simultaneous Gaussian fit parameters:\nGaussian {i//3 + 1}: Amplitude = {amp}+-{amp_err}, Mean = {mean}+-{mean_err}, Std Dev = {stddev}+-{stddev_err}")
         
         # Update button state
         self.update_gaussian_enter_button()
-        # Update dropdown to show mode is inactive
+        # Update dropdown to blank and deactivate mode
         self.gaussian_mode_dropdown.blockSignals(True)
-        self.gaussian_mode_dropdown.setCurrentText("Single Gaussian")
+        self.gaussian_mode_dropdown.setCurrentIndex(0)
         self.gaussian_mode_dropdown.blockSignals(False)
+        print('Exiting Multi Gaussian mode.')
 
     def read_lines(self):
         # Read spectral lines from file
@@ -2920,6 +3409,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
     def apply_lsf(self, profile):
         """Convolves the input y_data with the LSF kernel."""
         if self.lsf_kernel_x is not None and self.lsf_kernel_y is not None and self.is_velocity_mode:
+            # Lazy import for interpolation
+            from scipy.interpolate import interp1d
             # Interpolate LSF kernel to match the profile shape
             lsf_interp = interp1d(self.lsf_kernel_x, self.lsf_kernel_y, bounds_error=False, fill_value=0)
             # Create x-values that match the profile's x-values
@@ -3223,6 +3714,27 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.ax.set_xticks(self.ax.get_xticks())  # Restore the x-ticks based on current limits
 
         plt.draw()  # Refresh plot to show/hide residual panel
+
+    def toggle_total_line(self):
+        """Toggle the total line for ALL fitted profiles (single, multi-gaussian, voigt, continuum, listfit)"""
+        self.show_total_line = not self.show_total_line
+        if self.show_total_line:
+            # Ensure there is data to sum and plot
+            if self.continuum_fits or self.voigt_fits or self.gaussian_fits or self.listfit_fits:
+                self.draw_total_line()
+                self.ax.figure.canvas.draw()
+            else:
+                print("Warning: No fits available to sum for total line.")
+                self.show_total_line = not self.show_total_line
+        
+        # Clear the total line if toggled off
+        else:
+            total_lines = [line for line in self.ax.get_lines() if line.get_label() == "Total"]
+            for line in total_lines:
+                line.remove()
+            # Regenerate the legend to exclude removed lines
+            self.update_legend()
+            self.ax.figure.canvas.draw()
 
     def calculate_residuals(self):
         # Calculate total fitted Gaussian, Voigt, and continuum values
@@ -3609,6 +4121,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
     def voigt(self, x, amp, center, sigma, gamma):
         # z = (x - center + 1j * gamma) / (sigma * np.sqrt(2))
         # return amplitude * np.real(wofz(z))
+        from scipy.special import wofz  # Lazy import for Voigt profile
         tiny = np.finfo(float).eps
         s2 = np.sqrt(2)
         s2pi = np.sqrt(2*np.pi)
@@ -4098,6 +4611,208 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         if item_id in self.highlighted_item_ids:
             self.highlighted_item_ids.discard(item_id)
     
+    def save_and_print_qsap_fit(self, fit_data, fit_type, fit_mode='Single'):
+        """Save fit to .qsap file and print contents to terminal
+        
+        Args:
+            fit_data: Single dict or list of dicts with fit parameters
+            fit_type: 'Gaussian', 'Voigt', 'Continuum', or 'Listfit'
+            fit_mode: 'Single', 'Multi-Gaussian', 'Listfit', etc.
+            
+        Returns:
+            Tuple of (filepath, file_content)
+        """
+        # Calculate equivalent width if applicable - IN DEVELOPMENT
+        ### EQUIVALENT WIDTH - Uncomment block to enable during fitting
+        if fit_type in ['Gaussian', 'Voigt']:
+            ew_result = None
+            if isinstance(fit_data, list):
+                for fit in fit_data:
+                    ew_result = self._calculate_equivalent_width(fit, fit_type.lower())
+                    if ew_result:
+                        fit['equivalent_width'] = ew_result['ew']
+                        fit['equivalent_width_err'] = ew_result.get('ew_err')
+            else:
+                ew_result = self._calculate_equivalent_width(fit_data, fit_type.lower())
+                if ew_result:
+                    fit_data['equivalent_width'] = ew_result['ew']
+                    fit_data['equivalent_width_err'] = ew_result.get('ew_err')
+        ### END EQUIVALENT WIDTH CALCULATION
+        
+        # Build spectrum info dict
+        spectrum_info = {
+            'wavelength_unit': self.wavelength_unit,
+            'velocity_mode': self.is_velocity_mode,
+            'scale_factor': self.flux_scale_factor,
+        }
+        if self.x_data is not None and len(self.x_data) > 0:
+            spectrum_info['wavelength_range'] = (self.x_data[0], self.x_data[-1])
+        if self.rest_wavelength:
+            spectrum_info['rest_wavelength'] = self.rest_wavelength
+        
+        # Create .qsap file
+        if fit_type == 'Gaussian':
+            filepath, content = self.qsap_handler.create_gaussian_qsap(
+                fit_data, self.fits_file, fit_mode, spectrum_info
+            )
+        elif fit_type == 'Voigt':
+            filepath, content = self.qsap_handler.create_voigt_qsap(
+                fit_data, self.fits_file, fit_mode, spectrum_info
+            )
+        elif fit_type == 'Continuum':
+            filepath, content = self.qsap_handler.create_continuum_qsap(
+                fit_data, self.fits_file, spectrum_info
+            )
+        elif fit_type == 'Listfit':
+            filepath, content = self.qsap_handler.create_listfit_qsap(
+                fit_data, self.fits_file, spectrum_info
+            )
+        else:
+            raise ValueError(f"Unknown fit type: {fit_type}")
+        
+        # Print the file contents to terminal
+        print("\n" + "="*70)
+        print(f"FIT SAVED TO: {os.path.basename(filepath)}")
+        print("="*70)
+        print(content)
+        print("="*70 + "\n")
+        
+        return filepath, content
+    
+    def _format_param_value(self, value, error=None):
+        """Format parameter value with error for redshift data"""
+        if error is None or error != error:  # Check for NaN
+            return f"{value}"
+        return f"{value}±{error}"
+    
+    def _calculate_equivalent_width(self, fit_dict, fit_type='gaussian'):
+        """Calculate equivalent width for a fitted profile
+        
+        Equivalent width is the width of an imaginary perfectly black line that contains 
+        the same integrated area as the observed profile.
+        EW = ∫(1 - f_obs/f_continuum) dλ = ∫(f_continuum - f_obs)/f_continuum dλ
+        
+        Args:
+            fit_dict: Dictionary containing fit parameters
+            fit_type: 'gaussian' or 'voigt'
+            
+        Returns:
+            Dictionary with 'ew' and 'ew_err' keys, or None if calculation fails
+            
+        Note: Place between triple-hash marks (###) to easily comment out this development feature
+        """
+        ### EQUIVALENT WIDTH CALCULATION - IN DEVELOPMENT
+        try:
+            bounds = fit_dict.get('bounds', (None, None))
+            if bounds[0] is None or bounds[1] is None:
+                return None
+            
+            # Get continuum level - try to get it from stored continuum or calculate from data
+            continuum_level = None
+            
+            # Try to get continuum from existing continuum fits
+            if self.continuum_fits:
+                for cont_fit in self.continuum_fits:
+                    cont_bounds = cont_fit.get('bounds', (None, None))
+                    if cont_bounds[0] is not None and cont_bounds[1] is not None:
+                        if cont_bounds[0] <= bounds[0] and bounds[1] <= cont_bounds[1]:
+                            # This continuum covers our profile region
+                            x_center = (bounds[0] + bounds[1]) / 2.0
+                            if 'coeffs' in cont_fit:
+                                continuum_level = np.polyval(cont_fit['coeffs'], x_center)
+                            break
+            
+            # If no continuum found, estimate from data endpoints
+            if continuum_level is None:
+                # Find data points at the edges of the fit region
+                left_mask = (self.x_data >= bounds[0] - (bounds[1] - bounds[0]) * 0.1) & \
+                            (self.x_data <= bounds[0])
+                right_mask = (self.x_data >= bounds[1]) & \
+                             (self.x_data <= bounds[1] + (bounds[1] - bounds[0]) * 0.1)
+                
+                left_cont = np.nanmedian(self.spec[left_mask]) if np.any(left_mask) else np.nan
+                right_cont = np.nanmedian(self.spec[right_mask]) if np.any(right_mask) else np.nan
+                
+                if not np.isnan(left_cont) and not np.isnan(right_cont):
+                    continuum_level = (left_cont + right_cont) / 2.0
+                elif not np.isnan(left_cont):
+                    continuum_level = left_cont
+                elif not np.isnan(right_cont):
+                    continuum_level = right_cont
+            
+            if continuum_level is None or continuum_level <= 0:
+                return None
+            
+            # Create high-resolution wavelength grid for integration
+            x_int = np.linspace(bounds[0], bounds[1], 200)
+            
+            # Evaluate profile at high resolution
+            if fit_type.lower() == 'gaussian':
+                amp = fit_dict.get('amp', fit_dict.get('amplitude'))
+                mean = fit_dict.get('mean')
+                stddev = fit_dict.get('stddev', fit_dict.get('std_dev'))
+                if any(v is None for v in [amp, mean, stddev]):
+                    return None
+                y_profile = self.gaussian(x_int, amp, mean, stddev)
+                amp_err = fit_dict.get('amp_err')
+                stddev_err = fit_dict.get('stddev_err', fit_dict.get('std_dev_err'))
+                
+            elif fit_type.lower() == 'voigt':
+                amp = fit_dict.get('amplitude')
+                mean = fit_dict.get('mean', fit_dict.get('center'))
+                sigma = fit_dict.get('sigma')
+                gamma = fit_dict.get('gamma')
+                if any(v is None for v in [amp, mean, sigma, gamma]):
+                    return None
+                y_profile = self.voigt(x_int, amp, mean, sigma, gamma)
+                amp_err = fit_dict.get('amplitude_err')
+                sigma_err = fit_dict.get('sigma_err')
+                
+            else:
+                return None
+            
+            # Calculate equivalent width: EW = ∫ (continuum - profile) / continuum dλ
+            # For absorption lines (profile < continuum): EW is positive
+            # For emission lines (profile > continuum): EW is negative
+            normalized_diff = (continuum_level - y_profile) / continuum_level
+            
+            # Integrate using trapezoidal rule
+            ew = np.trapz(normalized_diff, x_int)
+            
+            # Apply sign convention: 
+            # - Emission lines (positive amplitude): EW should be negative
+            # - Absorption lines (negative amplitude): EW should be positive
+            amp = fit_dict.get('amp', fit_dict.get('amplitude'))
+            if amp is not None and amp > 0:
+                # Emission line - make EW negative
+                ew = -abs(ew)
+            else:
+                # Absorption line - keep EW positive
+                ew = abs(ew)
+            
+            # Estimate uncertainty - approximation using wave resolution and flux errors
+            # EW_err ~ (∂EW/∂amp) * amp_err for conservative estimate
+            if fit_type.lower() == 'gaussian' and amp_err is not None and stddev_err is not None:
+                # Approximate derivative: ∂EW/∂amp ≈ Δλ / continuum  
+                delta_lambda = bounds[1] - bounds[0]
+                ew_err_amp = (delta_lambda / continuum_level) * amp_err
+                ew_err_width = (amp / continuum_level) * stddev_err * 2.355  # FWHM = 2.355*sigma
+                ew_err = np.sqrt(ew_err_amp**2 + ew_err_width**2)
+            elif fit_type.lower() == 'voigt' and amp_err is not None and sigma_err is not None:
+                delta_lambda = bounds[1] - bounds[0]
+                ew_err_amp = (delta_lambda / continuum_level) * amp_err
+                ew_err_width = (amp / continuum_level) * sigma_err
+                ew_err = np.sqrt(ew_err_amp**2 + ew_err_width**2)
+            else:
+                ew_err = None
+            
+            return {'ew': ew, 'ew_err': ew_err}
+        except Exception as e:
+            # Development mode - print error but don't crash
+            print(f"[DEV] EW calculation error: {e}")
+            return None
+        ### END EQUIVALENT WIDTH CALCULATION
+    
     def show_item_tracker(self):
         """Show the item tracker window"""
         self.item_tracker.item_deleted.connect(self.on_item_deleted_from_tracker)
@@ -4173,6 +4888,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Update residual display if shown
         if self.is_residual_shown:
             self.calculate_and_plot_residuals()
+        
+        # Update legend - remove profile types that no longer exist
+        self._update_legend_profile_types()
+        self.update_legend()
         
         # Redraw the figure immediately
         if self.fig is not None:
@@ -4335,24 +5054,42 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             est_redshift = (self.center_profile - self.selected_rest_wavelength) / self.selected_rest_wavelength
             est_redshift_err = self.center_profile_err / self.selected_rest_wavelength
             print(f"Estimated Redshift: {est_redshift:.6f}+-{est_redshift_err:.6f}")
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            data = {
-                'z': [est_redshift],
-                'z_err': [est_redshift_err],
-                'line_id': [self.selected_id],
-                'lambda_rest': [self.selected_rest_wavelength],
-                'lambda_obs': [self.center_profile],
-                'lambda_obs_err': [self.center_profile_err],
-                'timestamp': [timestamp]
+            
+            # Prepare redshift data for .qsap file
+            redshift_data = {
+                'REDSHIFT': self._format_param_value(est_redshift, est_redshift_err),
+                'LINE_ID': self.selected_id or 'Unknown',
+                'LINE_WAVELENGTH_REST': self.selected_rest_wavelength,
+                'LINE_WAVELENGTH_OBSERVED': self.center_profile,
+                'LINE_WAVELENGTH_OBSERVED_ERR': self.center_profile_err,
             }
-            df = pd.DataFrame(data)
-            filename = f"z_{est_redshift:.3f}_from{self.selected_rest_wavelength:.2f}_{timestamp}.csv"
-            df.to_csv(filename, sep='\t', index=False, float_format='%.6f')
+            
+            # Get the parent gaussian/voigt fit ID if available
+            parent_fit_id = None
+            if self.selected_gaussian:
+                parent_fit_id = self.selected_gaussian.get('fit_id')
+            elif self.selected_voigt:
+                parent_fit_id = self.selected_voigt.get('fit_id')
+            
+            # Save to .qsap file and print contents
+            filepath, content = self.qsap_handler.create_redshift_qsap(
+                redshift_data, 
+                self.fits_file,
+                parent_fit_id=parent_fit_id,
+                parent_component_id=self.component_id
+            )
+            
+            # Print the file contents to terminal
+            print("\n" + "="*70)
+            print(f"REDSHIFT SAVED TO: {os.path.basename(filepath)}")
+            print("="*70)
+            print(content)
+            print("="*70 + "\n")
             
             # Cleanup highlighting and reset Calculate dropdown
             self._cleanup_redshift_highlighting()
             self.reset_calculate_dropdown()
-            print(f"Redshift result saved to {filename}. Exiting redshift estimation mode.")
+            print("Exiting redshift estimation mode.")
         else:
             print("No line selected.")
     
@@ -4725,6 +5462,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
 
     # Main function to perform the fit
     def fit_voigt_profiles(self, x_data, y_data, bound_pairs):
+        import lmfit  # Lazy import for voigt fitting
         params = lmfit.Parameters()
         
         # Set up parameters for each Voigt profile component
@@ -5543,7 +6281,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         """Redraw the total line if it's currently displayed. Called when fits change."""
         if self.show_total_line and (self.continuum_fits or self.voigt_fits or self.gaussian_fits or self.listfit_fits):
             # Remove existing total line
-            total_lines = [line for line in self.ax.get_lines() if line.get_label() == "Total Line"]
+            total_lines = [line for line in self.ax.get_lines() if line.get_label() == "Total"]
             for line in total_lines:
                 line.remove()
             
@@ -5553,6 +6291,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
     
     def draw_total_line(self):
         """Draw the total line from all fitted profiles."""
+        # Lazy imports for drawing total line
+        from scipy.interpolate import interp1d
+        
+        # Remove any existing total lines first to avoid duplicates
+        existing_total_lines = [line for line in self.ax.get_lines() if line.get_label() == "Total"]
+        for line in existing_total_lines:
+            line.remove()
+        
         # Generate x values for plotting
         x_plot = np.linspace(self.x_data.min(), self.x_data.max(), 10000)
 
@@ -5568,9 +6314,22 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Combine Gaussian fits
         total_gaussian = np.zeros_like(x_plot)
         for fit in self.gaussian_fits:
-            fit_x = fit['line'].get_xdata()
-            fit_y = fit['line'].get_ydata()
-            left_bound, right_bound = min(fit_x), max(fit_x)
+            # Handle both loaded fits (no 'line' object) and normal fits (with 'line' object)
+            if 'line' in fit and fit['line'] is not None:
+                fit_x = fit['line'].get_xdata()
+                fit_y = fit['line'].get_ydata()
+                left_bound, right_bound = min(fit_x), max(fit_x)
+            else:
+                # Reconstruct from Gaussian parameters for loaded fits
+                left_bound, right_bound = fit.get('bounds', (0, 0))
+                if left_bound == 0 and right_bound == 0:
+                    continue  # Skip if no bounds
+                fit_x = np.linspace(left_bound, right_bound, 500)
+                # Reconstruct Gaussian: A * exp(-(x - mean)^2 / (2 * stddev^2))
+                amplitude = fit.get('amp', 1.0)
+                mean = fit.get('mean', (left_bound + right_bound) / 2)
+                stddev = fit.get('stddev', 1.0)
+                fit_y = amplitude * np.exp(-((fit_x - mean) ** 2) / (2 * stddev ** 2))
             
             # Get continuum coefficients and interpolate to fit line's x values
             existing_continuum_vals, a, b = self.get_existing_continuum(left_bound, right_bound)
@@ -5582,22 +6341,39 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             else:
                 existing_continuum = np.zeros_like(fit_y)
             
-            if fit['is_velocity_mode'] and self.is_velocity_mode:
+            fit_is_velocity = fit.get('is_velocity_mode', False)
+            if fit_is_velocity and self.is_velocity_mode:
                 profile_interp = interp1d(fit_x, fit_y - existing_continuum, bounds_error=False, fill_value=0)
-            elif not fit['is_velocity_mode'] and not self.is_velocity_mode:
+            elif not fit_is_velocity and not self.is_velocity_mode:
                 profile_interp = interp1d(fit_x, fit_y - existing_continuum, bounds_error=False, fill_value=0)
-            elif not fit['is_velocity_mode'] and self.is_velocity_mode:
-                profile_interp = interp1d(self.wav_to_vel(fit_x, fit['rest_wavelength'], z=self.redshift), fit_y - existing_continuum, bounds_error=False, fill_value=0)
-            elif fit['is_velocity_mode'] and not self.is_velocity_mode:
-                profile_interp = interp1d(self.vel_to_wav(fit_x, fit['rest_wavelength'], z=self.redshift), fit_y - existing_continuum, bounds_error=False, fill_value=0)
+            elif not fit_is_velocity and self.is_velocity_mode:
+                profile_interp = interp1d(self.wav_to_vel(fit_x, fit.get('rest_wavelength'), z=self.redshift), fit_y - existing_continuum, bounds_error=False, fill_value=0)
+            elif fit_is_velocity and not self.is_velocity_mode:
+                profile_interp = interp1d(self.vel_to_wav(fit_x, fit.get('rest_wavelength'), z=self.redshift), fit_y - existing_continuum, bounds_error=False, fill_value=0)
             total_gaussian += profile_interp(x_plot)
 
         # Combine Voigt fits
         total_voigt = np.zeros_like(x_plot)
         for fit in self.voigt_fits:
-            fit_x = fit['line'].get_xdata()
-            fit_y = fit['line'].get_ydata()
-            left_bound, right_bound = min(fit_x), max(fit_x)
+            # Handle both loaded fits (no 'line' object) and normal fits (with 'line' object)
+            if 'line' in fit and fit['line'] is not None:
+                fit_x = fit['line'].get_xdata()
+                fit_y = fit['line'].get_ydata()
+                left_bound, right_bound = min(fit_x), max(fit_x)
+            else:
+                # Reconstruct from Voigt parameters for loaded fits
+                left_bound, right_bound = fit.get('bounds', (0, 0))
+                if left_bound == 0 and right_bound == 0:
+                    continue  # Skip if no bounds
+                fit_x = np.linspace(left_bound, right_bound, 500)
+                # Reconstruct Voigt profile
+                from scipy.special import wofz
+                amplitude = fit.get('amplitude', 1.0)
+                center = fit.get('center', (left_bound + right_bound) / 2)
+                sigma = fit.get('sigma', 1.0)
+                gamma = fit.get('gamma', 1.0)
+                z = ((fit_x - center) + 1j * gamma) / (sigma * np.sqrt(2.0))
+                fit_y = amplitude * wofz(z).real / (sigma * np.sqrt(2.0 * np.pi))
             
             # Get continuum coefficients and interpolate to fit line's x values
             existing_continuum_vals, a, b = self.get_existing_continuum(left_bound, right_bound)
@@ -5609,17 +6385,18 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             else:
                 existing_continuum = np.zeros_like(fit_y)
             
-            if fit['is_velocity_mode'] and self.is_velocity_mode:
+            fit_is_velocity = fit.get('is_velocity_mode', False)
+            if fit_is_velocity and self.is_velocity_mode:
                 profile_interp = interp1d(fit_x, fit_y - existing_continuum, bounds_error=False, fill_value=0)
-            elif not fit['is_velocity_mode'] and not self.is_velocity_mode:
+            elif not fit_is_velocity and not self.is_velocity_mode:
                 profile_interp = interp1d(fit_x, fit_y - existing_continuum, bounds_error=False, fill_value=0)
-            elif not fit['is_velocity_mode'] and self.is_velocity_mode:
-                profile_interp = interp1d(self.wav_to_vel(fit_x, fit['rest_wavelength'], z=self.redshift), fit_y - existing_continuum, bounds_error=False, fill_value=0)
-            elif fit['is_velocity_mode'] and not self.is_velocity_mode:
-                profile_interp = interp1d(self.vel_to_wav(fit_x, fit['rest_wavelength'], z=self.redshift), fit_y - existing_continuum, bounds_error=False, fill_value=0)
+            elif not fit_is_velocity and self.is_velocity_mode:
+                profile_interp = interp1d(self.wav_to_vel(fit_x, fit.get('rest_wavelength'), z=self.redshift), fit_y - existing_continuum, bounds_error=False, fill_value=0)
+            elif fit_is_velocity and not self.is_velocity_mode:
+                profile_interp = interp1d(self.vel_to_wav(fit_x, fit.get('rest_wavelength'), z=self.redshift), fit_y - existing_continuum, bounds_error=False, fill_value=0)
             total_voigt += profile_interp(x_plot)
 
-        # Combine Listfit fits - extract and add all components including polynomials
+        # Combine Listfit fits - only extract polynomials (gaussians/voigts already in their respective lists)
         total_listfit = np.zeros_like(x_plot)
         for fit in self.listfit_fits:
             left_bound, right_bound = fit.get('bounds', (0, 0))
@@ -5628,32 +6405,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 components = fit.get('components', [])
                 result = fit.get('result')
                 
-                # Calculate Gaussian components from the listfit
-                gauss_count = 0
-                for comp in components:
-                    if comp['type'] == 'gaussian':
-                        prefix = f'g{gauss_count}_'
-                        g_amp = result.params[f'{prefix}amp'].value
-                        g_mean = result.params[f'{prefix}mean'].value
-                        g_stddev = result.params[f'{prefix}stddev'].value
-                        y_gauss = self.gaussian(x_plot[mask], g_amp, g_mean, g_stddev)
-                        total_listfit[mask] += y_gauss
-                        gauss_count += 1
-                
-                # Calculate Voigt components from the listfit
-                voigt_count = 0
-                for comp in components:
-                    if comp['type'] == 'voigt':
-                        prefix = f'v{voigt_count}_'
-                        v_amp = result.params[f'{prefix}amp'].value
-                        v_center = result.params[f'{prefix}center'].value
-                        v_sigma = result.params[f'{prefix}sigma'].value
-                        v_gamma = result.params[f'{prefix}gamma'].value
-                        y_voigt = self.voigt(x_plot[mask], v_amp, v_center, v_sigma, v_gamma)
-                        total_listfit[mask] += y_voigt
-                        voigt_count += 1
-                
-                # Calculate polynomial components from the listfit
+                # Calculate polynomial components from the listfit only
+                # (Gaussians and Voigts are already counted via gaussian_fits and voigt_fits lists)
                 poly_count = 0
                 for comp in components:
                     if comp['type'] == 'polynomial':
@@ -5674,9 +6427,62 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
 
         total_y = total_continuum + total_gaussian + total_voigt + total_listfit
 
-        # Plot the total line
-        self.ax.plot(x_plot, total_y, label="Total Line", color='#0ed8ca', linestyle='-')
-        self.ax.legend(loc='upper right')
+        # Plot the total line using the configured color
+        total_line_cfg = self.colors['profiles']['total_line']
+        self.ax.plot(x_plot, total_y, label="Total", color=total_line_cfg['color'], 
+                     linestyle=total_line_cfg['linestyle'], linewidth=total_line_cfg['linewidth'])
+        self.update_legend()
+
+    def update_legend(self):
+        """Update the legend to show only profile lines (one per type) and special lines like Total."""
+        handles, labels = self.ax.get_legend_handles_labels()
+        
+        if not handles:
+            # No legend entries
+            self.ax.legend(loc='upper right')
+            return
+        
+        # Create a filtered list keeping only the first occurrence of each label
+        seen_labels = set()
+        filtered_handles_labels = []
+        
+        for handle, label in zip(handles, labels):
+            # Keep lines with labels (profile types) only if we haven't seen them before
+            # Also keep special lines like "Total", "Total Listfit", etc.
+            if label and (label not in seen_labels or label.startswith('Total')):
+                filtered_handles_labels.append((handle, label))
+                if not label.startswith('Total'):  # Total appears multiple times, don't track it
+                    seen_labels.add(label)
+        
+        if filtered_handles_labels:
+            filtered_handles, filtered_labels = zip(*filtered_handles_labels)
+        else:
+            filtered_handles, filtered_labels = [], []
+        
+        self.ax.legend(filtered_handles, filtered_labels, loc='upper right')
+
+    def _update_legend_profile_types(self):
+        """Update the legend_profile_types set based on which profile types still have fits."""
+        # Check which profile types still have instances
+        has_gaussian = len(self.gaussian_fits) > 0
+        has_voigt = len(self.voigt_fits) > 0
+        has_continuum = len(self.continuum_fits) > 0
+        
+        # Update the legend_profile_types set to reflect current state
+        if has_gaussian:
+            self.legend_profile_types.add('gaussian')
+        else:
+            self.legend_profile_types.discard('gaussian')
+        
+        if has_voigt:
+            self.legend_profile_types.add('voigt')
+        else:
+            self.legend_profile_types.discard('voigt')
+        
+        if has_continuum:
+            self.legend_profile_types.add('continuum')
+        else:
+            self.legend_profile_types.discard('continuum')
 
     # Function for handling key events
     def on_key(self, event):
@@ -5833,8 +6639,6 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             if self.continuum_mode:
                 # Already in continuum mode, so pressing 'm' again exits it
                 self.continuum_mode = False
-                self.label_poly_order.hide()
-                self.input_poly_order.hide()
                 self.continuum_regions = []  # Clear any defined regions
                 # Update dropdown to blank
                 self.continuum_mode_dropdown.blockSignals(True)
@@ -5844,14 +6648,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             else:
                 # Enter continuum mode
                 self.continuum_mode = True
-                self.label_poly_order.show()
-                self.input_poly_order.show()
                 # Update dropdown to show active mode
                 self.continuum_mode_dropdown.blockSignals(True)
                 self.continuum_mode_dropdown.setCurrentText("Continuum Region(s)")
                 self.continuum_mode_dropdown.blockSignals(False)
                 self.continuum_enter_button.setEnabled(True)
-                print("Continuum fitting mode: Use the spacebar to define regions.")
+                print("Continuum fitting mode: Use the spacebar to define the left bound and then the right bound of a continuum region.")
+                print("You can define multiple continuum regions by selecting multiple pairs of bounds.")
+                print("When the regions are set, hit Enter or Return to fit a polynomial (the order of the polynomial is configurable in Options).")
                 print(f"Current polynomial order: {self.poly_order}")
 
         if event.key == 'enter' and self.continuum_mode:
@@ -5866,8 +6670,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # Check if we have valid continuum regions
             if not self.continuum_regions:
                 self.continuum_mode = False
-                self.label_poly_order.hide()
-                self.input_poly_order.hide()
+                # Reset dropdown to blank
+                self.continuum_mode_dropdown.blockSignals(True)
+                self.continuum_mode_dropdown.setCurrentIndex(0)
+                self.continuum_mode_dropdown.blockSignals(False)
+                self.continuum_enter_button.setEnabled(False)
                 print('Exiting continuum mode.')
                 return
             
@@ -5891,8 +6698,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 region_bounds = (min(region[0] for region in self.continuum_regions), max(region[1] for region in self.continuum_regions))
             except (ValueError, TypeError) as e:
                 self.continuum_mode = False
-                self.label_poly_order.hide()
-                self.input_poly_order.hide()
+                # Reset dropdown to blank
+                self.continuum_mode_dropdown.blockSignals(True)
+                self.continuum_mode_dropdown.setCurrentIndex(0)
+                self.continuum_mode_dropdown.blockSignals(False)
+                self.continuum_enter_button.setEnabled(False)
                 print('Exiting continuum mode due to error.')
                 return
 
@@ -5918,7 +6728,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             continuum_line, = self.ax.plot(x_plot, continuum_full, color=continuum_cfg['color'], linestyle=continuum_cfg['linestyle'], alpha=0.8)
             if self.is_residual_shown:
                 self.calculate_and_plot_residuals()
-            plt.legend(loc='upper right')
+            self.update_legend()
             # Force immediate redraw of the canvas
             self.ax.figure.canvas.draw()
             QtWidgets.QApplication.processEvents()  # Process Qt events to ensure redraw
@@ -5926,6 +6736,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # Add continuum fit
             continuum_fit = {
                 'bounds': region_bounds,  # Tuple (left_bound, right_bound)
+                'individual_regions': list(self.continuum_regions),  # Store each region separately
                 'coeffs': coeffs,               # Polynomial coefficients
                 'coeffs_err': perr,             # Coefficient errors
                 'poly_order': self.poly_order,  # Polynomial order
@@ -5943,10 +6754,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # Record action for undo/redo
             self.record_action('fit_continuum', f'Fit Continuum (order {self.poly_order})')
             
+            # Save fit to .qsap file and print
+            self.save_and_print_qsap_fit(continuum_fit, 'Continuum', 'Single')
+            
             self.continuum_regions = [] # Clear continuum_regions
             self.continuum_mode = False # Exit continuum mode
-            self.label_poly_order.hide()
-            self.input_poly_order.hide()
+            # Reset dropdown to blank
+            self.continuum_mode_dropdown.blockSignals(True)
+            self.continuum_mode_dropdown.setCurrentIndex(0)
+            self.continuum_mode_dropdown.blockSignals(False)
+            self.continuum_enter_button.setEnabled(False)
             print('Exiting continuum mode.')
         elif event.key == ' ' and self.continuum_mode:
             if event.xdata is None:
@@ -6187,6 +7004,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     initial_guess[2] = min(stddev_guess, sigma_max * 0.5)
                     
                     # curve_fit with optional sigma (errors) and constrained sigma bounds
+                    # Lazy import of scipy for curve fitting
+                    from scipy.optimize import curve_fit
                     if comp_err is not None:
                         params, pcov = curve_fit(self.gaussian, comp_x, continuum_subtracted_y, sigma=comp_err, p0=initial_guess, bounds=([-np.inf, -np.inf, 0], [np.inf, np.inf, sigma_max]))
                     else:
@@ -6205,6 +7024,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     else:
                         chi2 = np.sum(residuals ** 2) # Chi2 without errors
                     chi2_nu = chi2 / (len(x_fit) - len(params))# Calculate chi2 d.o.f.
+                    
+                    # Lazy import of scipy for interpolation
+                    from scipy.interpolate import interp1d
                     interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
                     x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                     y_plt = interpolator(x_plt)
@@ -6216,6 +7038,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     'is_velocity_mode': self.is_velocity_mode,
                     'chi2': chi2,
                     'chi2_nu': chi2_nu,
+                    'has_errors': comp_err is not None,
                     'component_id': self.component_id,
                     'amp': amp, 'amp_err': amp_err, 'mean': mean, 'mean_err': mean_err, 'stddev': stddev, 'stddev_err': stddev_err,
                     'bounds': (left_bound, right_bound),
@@ -6235,24 +7058,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     # Record action for undo/redo
                     self.record_action('fit_gaussian', f'Fit Gaussian at λ={mean:.2f} Å')
                     
-                    print(f"  Fit ID: {self.fit_id}")
-                    print(f"  Component ID: {self.component_id}")
-                    print(f"  Velocity mode: {self.is_velocity_mode}")
-                    print(f"  Line ID: {line_id}")
-                    print(f"  Line Wavelength: {line_wavelength}")
-                    print(f"  Amplitude: {amp}+-{amp_err}")
-                    print(f"  Mean: {mean}+-{mean_err}")
-                    print(f"  Std_dev: {stddev}+-{stddev_err}")
-                    print(f"  Bounds: ({left_bound}, {right_bound})")
-                    print(f"  Chi-squared: {chi2}")
-                    print(f"  Chi-squared_nu: {chi2_nu}")
-                    print(f"  Line Object: {fit_line}\n")
+                    # Save fit to .qsap file and print
+                    self.save_and_print_qsap_fit(self.gaussian_fits[-1], 'Gaussian', 'Single')
 
                     self.component_id += 1
                     # Force immediate redraw of the canvas
                     self.ax.figure.canvas.draw()
                     QtWidgets.QApplication.processEvents()  # Process Qt events to ensure redraw
-                    print(f"Fitted parameters: Amplitude = {amp}+-{amp_err}, Mean = {mean}+-{mean_err}, Std Dev = {stddev}+-{stddev_err}")
                     # Update residual display if shown
                     if self.is_residual_shown:
                         self.calculate_and_plot_residuals()
@@ -6263,6 +7075,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 self.bound_lines.clear()  # Clear the list of bound lines
                 self.bounds = []
                 self.ax.figure.canvas.draw_idle()  # Redraw to show bound lines removed
+                # Deactivate Gaussian mode and reset dropdown
+                self.gaussian_mode = False
+                self.gaussian_mode_dropdown.blockSignals(True)
+                self.gaussian_mode_dropdown.setCurrentIndex(0)
+                self.gaussian_mode_dropdown.blockSignals(False)
+                self.gaussian_enter_button.setEnabled(False)
+                print('Exiting Gaussian mode.')
                 self.fit_id += 1
 
         # Perform multi-Gaussian fit if Enter is pressed in multi-Gaussian mode
@@ -6349,8 +7168,18 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     lower_bounds[i * 3 + 2] = 0  # sigma >= 0
                     upper_bounds[i * 3 + 2] = sigma_max  # sigma <= sigma_max
                 
+                # Lazy import of scipy for curve fitting
+                from scipy.optimize import curve_fit
+                from scipy.interpolate import interp1d
                 params, pcov = curve_fit(self.multi_gaussian, comp_xs, continuum_subtracted_ys, sigma=sigma_param, p0=initial_guesses, bounds=(lower_bounds, upper_bounds)) # NOT SHARED SIGMA
                 perr = np.sqrt(np.diag(pcov))
+                
+                # Track component boundaries in concatenated arrays for later chi2 calculation
+                component_boundaries = []
+                cumulative_idx = 0
+                for comp_x in [self.x_data[(self.x_data >= left_bound) & (self.x_data <= right_bound)] for left_bound, right_bound in bound_pairs]:
+                    component_boundaries.append((cumulative_idx, cumulative_idx + len(comp_x)))
+                    cumulative_idx += len(comp_x)
                 for i in range(0, len(params), 3):
                     amp, mean, stddev = params[i:i+3]
                     amp_err, mean_err, stddev_err = perr[i:i+3]
@@ -6358,8 +7187,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     y_fit = self.gaussian(x_fit, amp, mean, stddev) + continuum_ys[i // 3]
                     continuum_sub_data = comp_ys[i // 3] - continuum_ys[i // 3]
                     residuals = continuum_sub_data - self.gaussian(x_fit, amp, mean, stddev)
-                    # Calculate chi2 (simpler without errors since they're concatenated)
-                    chi2 = np.sum(residuals ** 2)  # Chi2 without decomposed errors
+                    # Calculate chi2 or SSR depending on whether errors are available
+                    if sigma_param is not None and i // 3 < len(component_boundaries):
+                        start_idx, end_idx = component_boundaries[i // 3]
+                        component_errors = sigma_param[start_idx:end_idx]
+                        chi2 = np.sum((residuals / component_errors) ** 2)  # Proper chi-squared
+                    else:
+                        chi2 = np.sum(residuals ** 2)  # SSR without errors
                     chi2_nu = chi2 / (len(x_fit) - 3)  # 3 params per component
                     interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
                     x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
@@ -6372,6 +7206,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     'is_velocity_mode': self.is_velocity_mode,
                     'chi2': chi2,
                     'chi2_nu': chi2_nu,
+                    'has_errors': sigma_param is not None,  # Track if errors were available
                     'component_id': self.component_id,
                     'amp': amp, 'amp_err': amp_err, 'mean': mean, 'mean_err': mean_err, 'stddev': stddev, 'stddev_err': stddev_err,
                     'bounds': (left_bound, right_bound),
@@ -6393,18 +7228,19 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     if i == len(params) - 3:  # Last component
                         self.record_action('fit_multi_gaussian', f'Fit {len(bound_pairs)} Gaussians')
                     
-                    print(f"  Fit ID: {self.fit_id}")
-                    print(f"  Component ID: {self.component_id}")
-                    print(f"  Velocity mode: {self.is_velocity_mode}")
-                    print(f"  Line ID: {line_id}")
-                    print(f"  Line Wavelength: {line_wavelength}")
-                    print(f"  Amplitude: {amp}+-{amp_err}")
-                    print(f"  Mean: {mean}+-{mean_err}")
-                    print(f"  Std_dev: {stddev}+-{stddev_err}")
-                    print(f"  Bounds: ({left_bound}, {right_bound})")
-                    print(f"  Chi-squared: {chi2}")
-                    print(f"  Chi-squared_nu: {chi2_nu}")
-                    print(f"  Line Object: {fit_line}\n")
+                    # Component details now printed in .qsap file output below
+                    # print(f"  Fit ID: {self.fit_id}")
+                    # print(f"  Component ID: {self.component_id}")
+                    # print(f"  Velocity mode: {self.is_velocity_mode}")
+                    # print(f"  Line ID: {line_id}")
+                    # print(f"  Line Wavelength: {line_wavelength}")
+                    # print(f"  Amplitude: {amp}+-{amp_err}")
+                    # print(f"  Mean: {mean}+-{mean_err}")
+                    # print(f"  Std_dev: {stddev}+-{stddev_err}")
+                    # print(f"  Bounds: ({left_bound}, {right_bound})")
+                    # print(f"  Chi-squared: {chi2}")
+                    # print(f"  Chi-squared_nu: {chi2_nu}")
+                    # print(f"  Line Object: {fit_line}\n")
 
                     self.component_id += 1
 
@@ -6418,8 +7254,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 self.bound_lines.clear()
                 self.bounds = []
                 self.ax.figure.canvas.draw_idle()  # Redraw to show bound lines removed
-                for i in range(0, len(params), 3):
-                    print(f"Simultaneous Gaussian fit parameters:\nGaussian {i//3 + 1}: Amplitude = {amp}+-{amp_err}, Mean = {mean}+-{mean_err}, Std Dev = {stddev}+-{stddev_err}")
+
+                # Save multi-gaussian fit to .qsap file
+                multi_gaussian_components = [g for g in self.gaussian_fits if g.get('fit_id') == self.fit_id - 1]
+                if multi_gaussian_components:
+                    self.save_and_print_qsap_fit(multi_gaussian_components, 'Gaussian', 'Multi-Gaussian')
 
         # Enter Voigt fit mode
         if event.key == 'n':
@@ -6434,6 +7273,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         line.remove()
                 self.bound_lines.clear()  # Clear the list of bound lines
                 print("Voigt fit mode: Press space to set left and right bounds.")
+                print("When a pair of bounds are set, a single Voigt profile will be fitted automatically within those bounds.")
                 plt.draw()  # Update the plot to remove old lines
 
         if event.key == ' ' and self.voigt_mode:  # Set bounds with space for Voigt fit
@@ -6511,6 +7351,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 initial_params.add('sigma', value=np.std(comp_x)/10, min=0, max=sigma_max)  # Constrain sigma with upper bound
                 initial_params.add('gamma', value=np.std(comp_x)/10, min=0, max=sigma_max)  # Constrain gamma similarly
 
+                # Lazy imports for lmfit model fitting
+                from lmfit import Model, Parameters
                 # Create the Voigt model and perform the fit
                 voigt_model = Model(self.voigt)
                 test_output = voigt_model.eval(params=initial_params, x=comp_x)
@@ -6536,6 +7378,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 else:
                     chi2 = np.sum(residuals ** 2) # Chi2 without errors
                 chi2_nu = chi2 / (len(x_fit) - len(result.params)) # Calculate chi2 d.o.f.
+                from scipy.interpolate import interp1d
                 interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
                 x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                 y_plt = interpolator(x_plt)
@@ -6551,6 +7394,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     'is_velocity_mode': self.is_velocity_mode,
                     'chi2': result.chisqr,
                     'chi2_nu': result.redchi,
+                    'has_errors': comp_err is not None,  # Track if errors were available
                     'component_id': self.component_id,
                     'bounds': (left_bound, right_bound),
                     'line_id': line_id if line_id else None,
@@ -6583,17 +7427,12 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 # Record action for undo/redo
                 self.record_action('fit_voigt', f'Fit Voigt at λ={fit_results.get("center", fit_results.get("mean", 0)):.2f} Å')
                 
+                # Save fit to .qsap file and print
+                self.save_and_print_qsap_fit(fit_results, 'Voigt', 'Single')
+                
                 # Reset Advanced dropdown if Bayes mode was active
                 if self.bayes_mode:
                     self.reset_advanced_dropdown()
-                
-                print(f"  Fit ID: {self.fit_id}")
-                print(f"  Component ID: {self.component_id}")
-                print(f"  Velocity mode: {self.is_velocity_mode}")
-                print(f"  Line ID: {line_id}")
-                print(f"  Line Wavelength: {line_wavelength}")
-                for name, param in result.params.items():
-                    print(f"  {name}: {param.value}+-{param.stderr}")
                     if name == 'sigma':
                         print(f" b: {b}")
                         print(f" logT_eff: {np.log10(T_eff)}")
@@ -6604,7 +7443,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 print(f"  Line Object: {fit_line}\n")
                 self.fit_id += 1
                 self.component_id += 1
-                self.ax.legend(loc='upper right')
+                self.update_legend()
                 # Force immediate redraw of the canvas
                 self.ax.figure.canvas.draw()
                 QtWidgets.QApplication.processEvents()  # Process Qt events to ensure redraw
@@ -6626,6 +7465,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     line.remove()
             self.bound_lines.clear()  # Clear the list of bound lines
             print("Multi Voigt fit mode: Press space to set left and right bounds.")
+            print("When a pair of bounds are set, a single Voigt profile will be fitted automatically within those bounds.")
             plt.draw()  # Update the plot to remove old lines
             self.voigt_comps = []
             self.component_id = 0
@@ -6657,6 +7497,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 self.current_bounds = (left_bound, right_bound)
 
         elif event.key == 'enter' and self.multi_voigt_mode and len(self.bounds) >= 2 and len(self.bounds) % 2 == 0:
+            # Lazy imports for lmfit model fitting
+            from lmfit import Model, Parameters
             # Extract bound pairs for each Voigt component
             bound_pairs = [(self.bounds[i], self.bounds[i + 1]) for i in range(0, len(self.bounds), 2)]
             combined_model = None
@@ -6767,6 +7609,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 # Generate data for plotting
                 x_fit = np.linspace(left_bound, right_bound, len(existing_continuum))
                 y_fit = self.voigt(x_fit, amp, center, sigma, gamma) + existing_continuum
+                from scipy.interpolate import interp1d
                 interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
                 # Higher resolution for smooth plotting
                 x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
@@ -6851,7 +7694,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             for line in self.bound_lines:
                 line.remove()
             self.bound_lines.clear()
-            self.ax.legend(loc='upper right')
+            self.update_legend()
             plt.draw()  # Update the plot with the fitted profiles
 
             # Clear multi-Voigt mode settings
@@ -6883,6 +7726,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     line.remove()
             self.bound_lines.clear()  # Clear the list of bound lines
             print("Multi Gaussian fit mode: Press space to set left and right bounds.")
+            print("When a pair of bounds are set, a single Gaussian will be fitted automatically within those bounds.")
             plt.draw()  # Update the plot to remove old lines
             self.gaussian_comps = []
             print("self.bounds:", self.bounds)
@@ -6917,6 +7761,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 self.current_bounds = (left_bound, right_bound)
 
         elif event.key == 'enter' and self.multi_gaussian_mode and len(self.bounds) >= 2 and len(self.bounds) % 2 == 0:
+            # Lazy imports for lmfit model fitting
+            from lmfit import Model, Parameters
             # Extract bound pairs for each Voigt component
             bound_pairs = [(self.bounds[i], self.bounds[i + 1]) for i in range(0, len(self.bounds), 2)]
             combined_model = None
@@ -7016,6 +7862,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 # Generate data for plotting
                 x_fit = np.linspace(left_bound, right_bound, len(existing_continuum))
                 y_fit = self.gaussian(x_fit, amp, mean, stddev) + existing_continuum
+                from scipy.interpolate import interp1d
                 interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
                 # Higher resolution for smooth plotting
                 x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
@@ -7093,12 +7940,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             for line in self.bound_lines:
                 line.remove()
             self.bound_lines.clear()
-            self.ax.legend(loc='upper right')
+            self.update_legend()
             plt.draw()  # Update the plot with the fitted profiles
 
-            # Clear multi-Voigt mode settings
+            # Clear multi-Gaussian mode settings
             self.gaussian_mode = False
             self.multi_gaussian_mode = False
+            # Reset dropdown to blank
+            self.gaussian_mode_dropdown.blockSignals(True)
+            self.gaussian_mode_dropdown.setCurrentIndex(0)
+            self.gaussian_mode_dropdown.blockSignals(False)
 
 
         # Check if the cursor is within the axes bounds
@@ -7336,39 +8187,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 self.update_marker_and_label_positions()
 
         elif event.key == ';':
-            # Toggle the total line for ALL fitted profiles (single, multi-gaussian, voigt, continuum, listfit)
-            self.show_total_line = not self.show_total_line
-            if self.show_total_line:
-                # Ensure there is data to sum and plot
-                if self.continuum_fits or self.voigt_fits or self.gaussian_fits or self.listfit_fits:
-                    self.draw_total_line()
-                    self.ax.figure.canvas.draw()
-                else:
-                    print("Warning: No fits available to sum for total line.")
-                    self.show_total_line = not self.show_total_line
-            
-            # Clear the total line if toggled off
-            else:
-                total_lines = [line for line in self.ax.get_lines() if line.get_label() == "Total Line"]
-                for line in total_lines:
-                    line.remove()
-                # Regenerate the legend to exclude removed lines
-                handles, labels = self.ax.get_legend_handles_labels()
-                filtered_handles_labels = [
-                    (handle, label) for handle, label in zip(handles, labels) if label != "Total Line"
-                ]
-                if filtered_handles_labels:
-                    filtered_handles, filtered_labels = zip(*filtered_handles_labels)
-                else:
-                    filtered_handles, filtered_labels = [], []
-
-                self.ax.legend(filtered_handles, filtered_labels, loc='upper right')
-                self.ax.figure.canvas.draw()
+            # Toggle the total line for ALL fitted profiles
+            self.toggle_total_line()
 
         # Enter Gaussian fit mode
         elif event.key == 'd':
-            if self.gaussian_mode:
+            if self.gaussian_mode or self.multi_gaussian_mode_old:
                 self.gaussian_mode = False
+                self.multi_gaussian_mode_old = False
                 # Update dropdown to blank
                 self.gaussian_mode_dropdown.blockSignals(True)
                 self.gaussian_mode_dropdown.setCurrentIndex(0)
@@ -7385,9 +8211,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 self.bound_lines.clear()  # Clear the list of bound lines
                 # Update dropdown to show active mode
                 self.gaussian_mode_dropdown.blockSignals(True)
-                self.gaussian_mode_dropdown.setCurrentText("Single Gaussian")
+                self.gaussian_mode_dropdown.setCurrentText("Single Gaussian     [g]")
                 self.gaussian_mode_dropdown.blockSignals(False)
                 print("Gaussian fit mode: Press space to set left and right bounds.")
+                print("When a pair of bounds are set, a single Gaussian will be fitted automatically within those bounds.")
                 plt.draw()  # Update the plot to remove old lines
 
         # Enable multi-Gaussian fit mode with '|'
@@ -7403,7 +8230,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 for line in self.bound_lines:
                     line.remove()
                 self.bound_lines.clear()
-                print("Multi-Gaussian fit mode: Press space to set multiple bounds, enter to fit.")
+                print("Multi-Gaussian fit mode: Press space to set multiple bounds, enter to fit multiple Gaussians simultaneously.")
+                print("The bounds are set in pairs: (left, right) for each profile. A minimum of two pairs of bounds are required to fit.")
                 plt.draw()
 
         # Delete Gaussian or Voigt fit with 'w' if cursor is within its bounds
@@ -7573,183 +8401,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     print(f"Bayes fit bounds set: {self.bayes_bounds}")
                     self.prompt_bayes_fit()
 
-        # Save all fits to a single consolidated file
-        elif event.key == 'S':
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            all_fits = []
-            
-            # Collect Gaussian fits
-            for fit in self.gaussian_fits:
-                fit_entry = {'type': 'gaussian'}
-                fit_entry.update(fit)
-                # Find and save the tracker name for this fit
-                for item_id, item_info in self.item_id_map.items():
-                    if item_info.get('fit_dict') is fit:
-                        fit_entry['tracker_name'] = item_info.get('name', '')
-                        break
-                # Handle tuple bounds - convert to min/max
-                if 'bounds' in fit_entry and isinstance(fit_entry['bounds'], (tuple, list)):
-                    bounds = fit_entry.pop('bounds')
-                    fit_entry['bounds_min'] = bounds[0]
-                    fit_entry['bounds_max'] = bounds[1]
-                all_fits.append(fit_entry)
-            
-            # Collect Voigt fits
-            for fit in self.voigt_fits:
-                fit_entry = {'type': 'voigt'}
-                fit_entry.update(fit)
-                # Find and save the tracker name for this fit
-                for item_id, item_info in self.item_id_map.items():
-                    if item_info.get('fit_dict') is fit:
-                        fit_entry['tracker_name'] = item_info.get('name', '')
-                        break
-                # Handle tuple bounds - convert to min/max
-                if 'bounds' in fit_entry and isinstance(fit_entry['bounds'], (tuple, list)):
-                    bounds = fit_entry.pop('bounds')
-                    fit_entry['bounds_min'] = bounds[0]
-                    fit_entry['bounds_max'] = bounds[1]
-                all_fits.append(fit_entry)
-            
-            # Collect Continuum fits
-            for fit in self.continuum_fits:
-                fit_entry = {'type': 'continuum'}
-                fit_entry.update(fit)
-                # Find and save the tracker name for this fit
-                for item_id, item_info in self.item_id_map.items():
-                    if item_info.get('fit_dict') is fit:
-                        fit_entry['tracker_name'] = item_info.get('name', '')
-                        break
-                # Handle tuple bounds - convert to min/max
-                if 'bounds' in fit_entry and isinstance(fit_entry['bounds'], (tuple, list)):
-                    bounds = fit_entry.pop('bounds')
-                    fit_entry['bounds_min'] = bounds[0]
-                    fit_entry['bounds_max'] = bounds[1]
-                all_fits.append(fit_entry)
-            
-            # Collect Listfit data
-            for listfit in self.listfit_fits:
-                bounds = listfit.get('bounds', (None, None))
-                components = listfit.get('components', [])
-                result = listfit.get('result')
-                initial_guesses = listfit.get('initial_guesses', {})
-                constraints = listfit.get('constraints', {})
-                
-                fit_entry = {
-                    'type': 'listfit',
-                    'bounds_min': bounds[0],
-                    'bounds_max': bounds[1],
-                    'components': str(components),  # Store as string representation
-                    'initial_guesses': str(initial_guesses),
-                    'constraints': str(constraints),
-                    'chi_squared': result.chisqr if result else None,
-                    'redchi': result.redchi if result else None,
-                    'aic': result.aic if result else None,
-                    'bic': result.bic if result else None,
-                }
-                
-                # Find and save the tracker name for this listfit
-                for item_id, item_info in self.item_id_map.items():
-                    if item_info.get('fit_dict') is listfit:
-                        fit_entry['tracker_name'] = item_info.get('name', '')
-                        break
-                
-                # Add all result parameters - including polynomial coefficients
-                if result:
-                    for param_name, param in result.params.items():
-                        fit_entry[f'param_{param_name}'] = param.value
-                    # Debug output to verify parameters are being captured
-                    param_names = [p for p in result.params.keys()]
-                    if param_names:
-                        print(f"[DEBUG] Listfit parameters saved: {', '.join(param_names[:5])}{'...' if len(param_names) > 5 else ''}")
-                
-                all_fits.append(fit_entry)
-            
-            if all_fits:
-                # Create DataFrame and save
-                df = pd.DataFrame(all_fits)
-                # Drop non-serializable columns
-                df.drop(columns=['line', 'patches'], inplace=True, errors='ignore')
-                
-                filename = f"qsap_fits_{timestamp}.csv"
-                df.to_csv(filename, index=False)
-                print(f"Saved {len(all_fits)} fits to {filename}")
-                print(f"  - Gaussian: {sum(1 for f in all_fits if f['type'] == 'gaussian')}")
-                print(f"  - Voigt: {sum(1 for f in all_fits if f['type'] == 'voigt')}")
-                print(f"  - Polynomial: {sum(1 for f in all_fits if f['type'] == 'continuum')}")
-                print(f"  - Listfit: {sum(1 for f in all_fits if f['type'] == 'listfit')}")
-            else:
-                print("No fits to save. Fit some profiles first (Gaussian, Voigt, Polynomial, or Listfit).")
 
-        # Load fit file with 'a' key
-        elif event.key == 'a':
-            self.load_fit_file()
-
-        elif event.key == 'K':
-            file_path, _ = QFileDialog.getOpenFileName(
-                parent=self,  # 'self' refers to the main widget of your application
-                caption="Select a file to load",  # Window title
-                directory='',  # Start in the current directory
-                filter="CSV Files (*.csv);;All Files (*)"  # File filters
-            )
-
-            try:
-                # Determine the file type based on the first few rows of the file
-                df = pd.read_csv(file_path)
-                # Convert 'bounds' column from string to tuple
-                df['bounds'] = df['bounds'].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)
-                fit_type = None
-
-                # Check column presence to infer fit type
-                if {'amp', 'mean', 'stddev'}.issubset(df.columns):
-                    fit_type = 'gaussian'
-                elif {'a', 'b'}.issubset(df.columns):
-                    fit_type = 'continuum'
-                elif {'gamma', 'sigma'}.issubset(df.columns):
-                    fit_type = 'voigt'
-                else:
-                    raise ValueError("Unrecognized file format. Ensure the file contains valid fit parameters.")
-
-                # Process the loaded fits
-                if fit_type == 'continuum':
-                    self.continuum_fits = df.to_dict(orient='records')
-                    for fit in self.continuum_fits:
-                        fit['line'] = None  # Reinitialize the line object
-                        # Reconstruct the continuum lines
-                        x_plot = np.linspace(fit['bounds'][0], fit['bounds'][1], 100)
-                        y_plot = fit['a'] * x_plot + fit['b']
-                        continuum_cfg = self.colors['profiles']['continuum_line']
-                        fit['line'], = self.ax.plot(x_plot, y_plot, color=continuum_cfg['color'], linestyle=continuum_cfg['linestyle'])
-
-                elif fit_type == 'gaussian':
-                    print(df.to_dict(orient='records'))
-                    self.gaussian_fits = df.to_dict(orient='records')
-                    for fit in self.gaussian_fits:
-                        fit['line'] = None  # Reinitialize the line object
-                        # Reconstruct the plot for each fit
-                        x_plot = np.linspace(fit['bounds'][0], fit['bounds'][1], 100)
-                        _, a, b = self.get_existing_continuum(fit['bounds'][0], fit['bounds'][1])
-                        existing_continuum = self.continuum_model(x_plot, a, b)
-                        y_plot = self.gaussian(x_plot, fit['amp'], fit['mean'], fit['stddev']) + existing_continuum
-                        gaussian_cfg = self.colors['profiles']['gaussian']
-                        fit['line'], = self.ax.plot(x_plot, y_plot, color=gaussian_cfg['color'], linestyle=gaussian_cfg['linestyle'])
-
-                elif fit_type == 'voigt':
-                    self.voigt_fits = df.to_dict(orient='records')
-                    for fit in self.voigt_fits:
-                        fit['line'] = None  # Reinitialize the line object
-                        # Reconstruct the plot for each Voigt profile
-                        x_plot = np.linspace(fit['bounds'][0], fit['bounds'][1], 100)
-                        _, a, b = self.get_existing_continuum(fit['bounds'][0], fit['bounds'][1])
-                        existing_continuum = self.continuum_model(x_plot, a, b)
-                        y_plot = self.voigt(x_plot, fit['amp'], fit['center'], fit['sigma'], fit['gamma']) + existing_continuum
-                        voigt_cfg = self.colors['profiles']['voigt']
-                        fit['line'], = self.ax.plot(x_plot, y_plot, color=voigt_cfg['color'], linestyle=voigt_cfg['linestyle'])
-
-                self.ax.legend(loc='upper right')
-                print(f"Successfully loaded {fit_type.capitalize()} fits from {file_path}.")
-
-            except Exception as e:
-                print(f"Failed to load fits: {e}")
 
         # Save a pdf of the current plot
         if event.key == '`':
@@ -7920,7 +8572,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             return
         
         # Build the composite model
-        composite_model = self.build_composite_model(components, x_fit_masked, y_fit_masked, err_fit_masked)
+        try:
+            composite_model = self.build_composite_model(components, x_fit_masked, y_fit_masked, err_fit_masked)
+        except Exception as e:
+            print(f"Error building composite model: {e}")
+            import traceback
+            traceback.print_exc()
+            return
         
         if composite_model is None:
             print("Error: Could not build composite model")
@@ -7974,33 +8632,199 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             print(result.fit_report())
         
         # Check fit quality and warn if poor
-        self._check_listfit_quality(result, y_fit)
+        self._check_listfit_quality(result, y_fit, err_fit)
         
         # Plot the components (pass all components so masks can be visualized)
-        self.plot_listfit_components(result, components, x_fit, y_fit, err_fit, left_bound, right_bound)
+        print("[DEBUG] About to plot listfit components...")
+        try:
+            self.plot_listfit_components(result, components, x_fit, y_fit, err_fit, left_bound, right_bound)
+            print("[DEBUG] Successfully plotted listfit components")
+        except Exception as e:
+            print(f"[DEBUG] Error plotting listfit components: {e}")
+            import traceback
+            traceback.print_exc()
+            return
         
         # Update residual display if shown
         if self.is_residual_shown:
-            self.calculate_and_plot_residuals()
+            print("[DEBUG] Updating residual display...")
+            try:
+                self.calculate_and_plot_residuals()
+                print("[DEBUG] Successfully updated residual display")
+            except Exception as e:
+                print(f"[DEBUG] Error updating residual display: {e}")
+                import traceback
+                traceback.print_exc()
         
         # Extract initial guesses and constraints for storage
-        initial_guesses = self._extract_listfit_initial_guesses(result, components)
-        constraints_info = self._extract_listfit_constraints(components)
+        print("[DEBUG] Extracting fit information...")
+        try:
+            initial_guesses = self._extract_listfit_initial_guesses(result, components)
+            constraints_info = self._extract_listfit_constraints(components)
+            print("[DEBUG] Successfully extracted fit information")
+        except Exception as e:
+            print(f"[DEBUG] Error extracting fit information: {e}")
+            import traceback
+            traceback.print_exc()
+            initial_guesses = {}
+            constraints_info = {}
         
         # Store the fit
-        self.listfit_fits.append({
-            'bounds': (left_bound, right_bound),
-            'components': components,
-            'result': result,
-            'x_data': x_fit,
-            'y_data': y_fit,
-            'err_data': err_fit,
-            'initial_guesses': initial_guesses,
-            'constraints': constraints_info
-        })
+        print("[DEBUG] Storing fit results...")
+        try:
+            self.listfit_fits.append({
+                'bounds': (left_bound, right_bound),
+                'components': components,
+                'result': result,
+                'x_data': x_fit,
+                'y_data': y_fit,
+                'err_data': err_fit,
+                'initial_guesses': initial_guesses,
+                'constraints': constraints_info
+            })
+            print("[DEBUG] Successfully stored fit results")
+        except Exception as e:
+            print(f"[DEBUG] Error storing fit results: {e}")
+            import traceback
+            traceback.print_exc()
+            return
         
         # Record action for undo/redo
         self.record_action('perform_listfit', f'Perform Listfit ({len(self.listfit_fits)} total fits)')
+        
+        # Extract fit data for .qsap file (store components separately)
+        listfit_fit_data = []
+        
+        # Track component counters to match what build_composite_model uses
+        gauss_count = 0
+        voigt_count = 0
+        poly_count = 0
+        
+        for comp in components:
+            comp_dict = {'type': comp['type']}
+            
+            if comp['type'] == 'gaussian':
+                # Use counter-based naming to match build_composite_model
+                prefix = f'g{gauss_count}_'
+                amp_name = f'{prefix}amp'
+                mean_name = f'{prefix}mean'
+                sigma_name = f'{prefix}stddev'
+                
+                if all(name in result.params for name in [amp_name, mean_name, sigma_name]):
+                    # Store initial guess values
+                    comp_dict['amp_initial'] = result.params[amp_name].init_value
+                    comp_dict['mean_initial'] = result.params[mean_name].init_value
+                    comp_dict['stddev_initial'] = result.params[sigma_name].init_value
+                    
+                    # Store best fit parameters with errors
+                    comp_dict['amp'] = result.params[amp_name].value
+                    comp_dict['amp_err'] = result.params[amp_name].stderr
+                    comp_dict['mean'] = result.params[mean_name].value
+                    comp_dict['mean_err'] = result.params[mean_name].stderr
+                    comp_dict['stddev'] = result.params[sigma_name].value
+                    comp_dict['stddev_err'] = result.params[sigma_name].stderr
+                    comp_dict['bounds'] = (left_bound, right_bound)
+                    comp_dict['is_velocity_mode'] = self.is_velocity_mode
+                
+                gauss_count += 1
+            
+            elif comp['type'] == 'voigt':
+                # Use counter-based naming to match build_composite_model
+                prefix = f'v{voigt_count}_'
+                amp_name = f'{prefix}amp'
+                mean_name = f'{prefix}center'
+                sigma_name = f'{prefix}sigma'
+                gamma_name = f'{prefix}gamma'
+                
+                if all(name in result.params for name in [amp_name, mean_name, sigma_name, gamma_name]):
+                    # Store initial guess values
+                    comp_dict['amplitude_initial'] = result.params[amp_name].init_value
+                    comp_dict['mean_initial'] = result.params[mean_name].init_value
+                    comp_dict['sigma_initial'] = result.params[sigma_name].init_value
+                    comp_dict['gamma_initial'] = result.params[gamma_name].init_value
+                    
+                    # Store best fit parameters with errors
+                    comp_dict['amplitude'] = result.params[amp_name].value
+                    comp_dict['amplitude_err'] = result.params[amp_name].stderr
+                    comp_dict['mean'] = result.params[mean_name].value
+                    comp_dict['mean_err'] = result.params[mean_name].stderr
+                    comp_dict['sigma'] = result.params[sigma_name].value
+                    comp_dict['sigma_err'] = result.params[sigma_name].stderr
+                    comp_dict['gamma'] = result.params[gamma_name].value
+                    comp_dict['gamma_err'] = result.params[gamma_name].stderr
+                    comp_dict['bounds'] = (left_bound, right_bound)
+                    comp_dict['is_velocity_mode'] = self.is_velocity_mode
+                
+                voigt_count += 1
+            
+            elif comp['type'] == 'polynomial':
+                # Use counter-based naming to match build_composite_model
+                prefix = f'p{poly_count}_'
+                coeffs_initial = []
+                coeffs = []
+                coeffs_err = []
+                order = comp.get('order', 1)
+                for i in range(order + 1):
+                    coeff_name = f'{prefix}c{i}'
+                    if coeff_name in result.params:
+                        coeffs_initial.append(result.params[coeff_name].init_value)
+                        coeffs.append(result.params[coeff_name].value)
+                        coeffs_err.append(result.params[coeff_name].stderr)
+                
+                if coeffs:
+                    comp_dict['poly_order'] = order
+                    comp_dict['coeffs_initial'] = coeffs_initial
+                    comp_dict['coeffs'] = coeffs
+                    comp_dict['coeffs_err'] = coeffs_err
+                    comp_dict['bounds'] = (left_bound, right_bound)
+                
+                poly_count += 1
+            
+            elif comp['type'] == 'polynomial_guess_mask':
+                # Store mask parameters as-is (no fit results needed)
+                comp_dict['min_lambda'] = comp.get('min_lambda')
+                comp_dict['max_lambda'] = comp.get('max_lambda')
+            
+            elif comp['type'] == 'data_mask':
+                # Store mask parameters as-is (no fit results needed)
+                comp_dict['min_lambda'] = comp.get('min_lambda')
+                comp_dict['max_lambda'] = comp.get('max_lambda')
+            
+            # Only add non-empty component dictionaries
+            if len(comp_dict) > 1:  # More than just 'type'
+                listfit_fit_data.append(comp_dict)
+        
+        # Add fit diagnostics as a special metadata entry
+        diagnostics_dict = {
+            'type': 'fit_diagnostics',
+            'ssr': float(np.sum(result.residual ** 2)) if result.residual is not None else None,
+            'ssr_nu': result.redchi if result.redchi is not None else None,
+            'chi2': float(result.chisqr) if hasattr(result, 'chisqr') and result.chisqr is not None else None,
+            'chi2_reduced': result.redchi if result.redchi is not None else None,
+            'akaike_info_criterion': result.aic if hasattr(result, 'aic') and result.aic is not None else None,
+            'bayesian_info_criterion': result.bic if hasattr(result, 'bic') and result.bic is not None else None,
+            'r_squared': None,  # Calculate if we have data
+            'n_data_points': result.ndata if hasattr(result, 'ndata') else None,
+            'n_parameters': result.nvarys if hasattr(result, 'nvarys') else None,
+            'n_degrees_freedom': result.nfree if hasattr(result, 'nfree') else None,
+            'fit_success': result.success if hasattr(result, 'success') else None
+        }
+        
+        # Calculate R-squared if possible
+        try:
+            ss_res = np.sum(result.residual ** 2) if result.residual is not None else np.sum((y_fit - result.best_fit) ** 2)
+            ss_tot = np.sum((y_fit - np.mean(y_fit)) ** 2)
+            r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+            diagnostics_dict['r_squared'] = float(r_squared)
+        except:
+            pass
+        
+        # Add diagnostics to fit data
+        listfit_fit_data.append(diagnostics_dict)
+        
+        # Save fit to .qsap file
+        if listfit_fit_data:
+            self.save_and_print_qsap_fit(listfit_fit_data, 'Listfit', 'Listfit')
         
         # Clear listfit mode
         self.listfit_mode = False
@@ -8017,6 +8841,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
     def build_composite_model(self, components, x_fit, y_fit, err_fit):
         """Build a composite lmfit Model from component list with improved initial guesses for blended profiles"""
         from scipy.signal import find_peaks
+        from lmfit import Model, Parameters
         
         model = None
         gauss_count = 0
@@ -8047,6 +8872,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 
                 try:
                     # Create a temporary polynomial model and fit it
+                    from lmfit.models import PolynomialModel
                     poly_model = PolynomialModel(degree=order, prefix=prefix, independent_vars=['x'])
                     for i in range(order + 1):
                         param_name = f'{prefix}c{i}'
@@ -8075,6 +8901,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         num_voigts = len([c for c in components if c['type'] == 'voigt'])
         num_line_components = num_gaussians + num_voigts
         
+        print(f"[DEBUG] Peak detection starting... num_gaussians={num_gaussians}, num_voigts={num_voigts}")
+        
         y_abs = np.abs(y_fit)
         signal_mean = np.mean(y_abs)
         signal_std = np.std(y_abs)
@@ -8094,7 +8922,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 sorted_indices = np.argsort(-properties['peak_heights'])
                 peaks = peaks[sorted_indices]
         
+        print(f"[DEBUG] Peak detection completed. Found {len(peaks)} peaks")
+        
         peak_index_for_component = 0  # Track which peak to use next
+        
+        print(f"[DEBUG] Processing {len(components)} components...")
         
         for comp in components:
             # Skip mask features - they're not fitted, only used for polynomial guess or data exclusion
@@ -8168,6 +9000,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 order = comp.get('order', 1)
                 prefix = f'p{poly_count}_'
                 # Create polynomial model using lmfit's built-in PolynomialModel
+                from lmfit.models import PolynomialModel
                 poly_model = PolynomialModel(degree=order, prefix=prefix, independent_vars=['x'])
                 
                 # **Use pre-fitted polynomial parameters if available (Stage 1 results)**
@@ -8374,10 +9207,33 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         print(report)
         print(explanation)
 
-    def _check_listfit_quality(self, result, y_fit):
-        """Check the quality of the Listfit and warn user if fit is poor"""
+    def _check_listfit_quality(self, result, y_fit, err_fit=None):
+        """Check the quality of the Listfit and warn user if fit is poor
+        
+        Args:
+            result: lmfit fit result object
+            y_fit: the fitted data
+            err_fit: error spectrum (None if not available)
+        """
         warnings = []
         
+        # Check if error spectrum is actually available (not None and not empty)
+        has_error_spectrum = err_fit is not None and len(err_fit) > 0
+        
+        # If there's NO error spectrum, show a different warning
+        if not has_error_spectrum:
+            print("\n" + "="*70)
+            print("WARNING: NO ERROR SPECTRUM USED FOR FIT")
+            print("="*70)
+            # Calculate SSR from residuals
+            ssr = np.sum(result.residual ** 2) if result.residual is not None else np.sum((y_fit - result.best_fit) ** 2)
+            print(f"  • No error spectrum provided for fit. Consider refitting with error spectrum.")
+            print(f"  • Sum of Squared Residuals (SSR) = {ssr:.3e}")
+            print("  • SSR alone is difficult to interpret without knowing typical noise levels.")
+            print("="*70 + "\n")
+            return
+        
+        # If there IS an error spectrum, use chi-squared based warnings
         # Criterion 1: Reduced chi-square
         # For a good fit, reduced chi-square should be close to 1
         # Much > 1 indicates poor fit (underfitting or bad initial guesses)
@@ -8769,6 +9625,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             
             if comp_type == 'gaussian':
                 prefix = f'g{gauss_count}_'
+                
+                # Check if this component's parameters are in the fit result
+                if f'{prefix}amp' not in params:
+                    print(f"[DEBUG] Warning: Gaussian component {gauss_count} not found in fit result. Skipping...")
+                    gauss_count += 1
+                    continue
+                
                 g_amp = params[f'{prefix}amp'].value
                 g_mean = params[f'{prefix}mean'].value
                 g_stddev = params[f'{prefix}stddev'].value
@@ -8779,7 +9642,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 g_stddev_err = params[f'{prefix}stddev'].stderr if params[f'{prefix}stddev'].stderr is not None else 0.0
                 
                 y_component = self.gaussian(x_smooth, g_amp, g_mean, g_stddev)
-                line, = self.ax.plot(x_smooth, y_component, color=color, linestyle=gaussian_cfg['linestyle'], linewidth=gaussian_cfg['linewidth'])
+                # Add label only for the first listfit gaussian
+                label = 'Gaussian' if 'gaussian' not in self.legend_profile_types else None
+                line, = self.ax.plot(x_smooth, y_component, color=color, linestyle=gaussian_cfg['linestyle'], linewidth=gaussian_cfg['linewidth'], label=label)
+                if label:
+                    self.legend_profile_types.add('gaussian')
                 
                 # Add to gaussian_fits for redshift mode
                 gaussian_fit = {
@@ -8807,6 +9674,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             
             elif comp_type == 'voigt':
                 prefix = f'v{voigt_count}_'
+                
+                # Check if this component's parameters are in the fit result
+                if f'{prefix}amp' not in params:
+                    print(f"[DEBUG] Warning: Voigt component {voigt_count} not found in fit result. Skipping...")
+                    voigt_count += 1
+                    continue
+                
                 v_amp = params[f'{prefix}amp'].value
                 v_center = params[f'{prefix}center'].value
                 v_sigma = params[f'{prefix}sigma'].value
@@ -8819,7 +9693,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 v_gamma_err = params[f'{prefix}gamma'].stderr if params[f'{prefix}gamma'].stderr is not None else 0.0
                 
                 y_component = self.voigt(x_smooth, v_amp, v_center, v_sigma, v_gamma)
-                line, = self.ax.plot(x_smooth, y_component, color=color, linestyle=voigt_cfg['linestyle'], linewidth=voigt_cfg['linewidth'])
+                # Add label only for the first listfit voigt
+                label = 'Voigt' if 'voigt' not in self.legend_profile_types else None
+                line, = self.ax.plot(x_smooth, y_component, color=color, linestyle=voigt_cfg['linestyle'], linewidth=voigt_cfg['linewidth'], label=label)
+                if label:
+                    self.legend_profile_types.add('voigt')
                 
                 # Add to voigt_fits for redshift mode
                 voigt_fit = {
@@ -8849,13 +9727,24 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             elif comp_type == 'polynomial':
                 prefix = f'p{poly_count}_'
                 order = comp.get('order', 1)
+                
+                # Check if this component's parameters are in the fit result
+                if f'{prefix}c0' not in params:
+                    print(f"[DEBUG] Warning: Polynomial component {poly_count} not found in fit result. Skipping...")
+                    poly_count += 1
+                    continue
+                
                 poly_coeffs = []
                 for i in range(order + 1):
                     poly_coeffs.append(params[f'{prefix}c{i}'].value)
                 # Reverse coefficients for np.polyval (expects highest order first)
                 poly_coeffs = poly_coeffs[::-1]
                 y_component = np.polyval(poly_coeffs, x_smooth)
-                line, = self.ax.plot(x_smooth, y_component, color=color, linestyle=continuum_cfg['linestyle'], linewidth=continuum_cfg['linewidth'])
+                # Add label only for the first listfit polynomial
+                label = 'Continuum' if 'continuum' not in self.legend_profile_types else None
+                line, = self.ax.plot(x_smooth, y_component, color=color, linestyle=continuum_cfg['linestyle'], linewidth=continuum_cfg['linewidth'], label=label)
+                if label:
+                    self.legend_profile_types.add('continuum')
                 # Register with ItemTracker - store metadata for deletion handling
                 position_str = f"λ: {left_bound:.2f}-{right_bound:.2f} Å"
                 poly_fit_dict = {
@@ -8866,22 +9755,6 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 item_id = self.register_item('polynomial', f'Polynomial (order={order})', fit_dict=poly_fit_dict, line_obj=line,
                                            position=position_str, color=color)
                 poly_count += 1
-        
-        # Plot the total fit result (for visualization only, NOT included in draw_total_line to avoid double-counting)
-        y_total_fit = result.eval(x=x_smooth)
-        total_color = self.colors['profiles']['total_line']
-        line, = self.ax.plot(x_smooth, y_total_fit, label='Total Listfit', color=total_color['color'], linestyle=total_color['linestyle'], linewidth=total_color['linewidth'])
-        
-        # Register Total Listfit with ItemTracker
-        position_str = f"λ: {left_bound:.2f}-{right_bound:.2f} Å"
-        total_fit_dict = {
-            'listfit_bounds': (left_bound, right_bound),
-            'is_total_fit': True
-        }
-        self.register_item('listfit_total', f'Total Listfit', fit_dict=total_fit_dict, line_obj=line,
-                          position=position_str, color=total_color['color'])
-        
-        self.ax.legend(loc='upper right')
 
 
 

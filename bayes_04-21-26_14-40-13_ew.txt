@@ -1,0 +1,6 @@
+# Equivalent Width Posterior Medians (Observed and Rest-frame)
+Type,Frame,16th,50th,84th
+Gaussian,Observed,417.0486,423.8599,430.1794
+Total,Observed,-63.4855,-50.8911,-37.7100
+Gaussian,Rest-frame,123.7533,125.7744,127.6497
+Total,Rest-frame,-18.8384,-15.1012,-11.1899
