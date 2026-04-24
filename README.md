@@ -728,7 +728,7 @@ Example: `fit_20260424_143022_gaussian_single_sample_spectrum.qsap`
 
 ## Monte Carlo Estimation of Uncertainties
 
-QSAP uses Monte Carlo sampling to estimate uncertainties on derived quantities like equivalent width (EW) and redshift. This approach generates thousands of synthetic spectra by randomly perturbing fitted parameters within their uncertainties, providing robust confidence intervals.
+QSAP uses Monte Carlo sampling to estimate uncertainties on derived quantities equivalent width (EW) and redshift. This approach generates thousands of synthetic spectra by randomly perturbing fitted parameters within their uncertainties, providing robust confidence intervals.
 
 ### How It Works
 
@@ -768,7 +768,7 @@ Two checkboxes control MC behavior (in Options Panel → Calculate section):
 
 **Calculation** (using equivalent width as example):
 1. Compute EW for each of N MC samples → distribution of EW values
-2. Find median: 50th percentile = best estimate
+2. Find median: 50th percentile
 3. Calculate 1-sigma: 
    - Lower bound = median − 16th percentile
    - Upper bound = 84th percentile − median
