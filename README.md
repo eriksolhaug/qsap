@@ -756,7 +756,7 @@ Two checkboxes control MC behavior (in Options Panel → Calculate section):
 
 ### Confidence Interval Calculation
 
-**Important Clarification:** Confidence intervals are derived from the **distribution of MC samples** using **symmetric percentiles around the median**, not the mean.
+**Important Clarification:** QSAP reports credible intervals (Bayesian-style) centered on the median, not classical confidence intervals centered on the mean. This approach is more robust for non-Gaussian distributions produced by Monte Carlo sampling.
 
 **Sigma Levels Definition (68%–95%–99.7% rule):**
 
@@ -768,7 +768,7 @@ Two checkboxes control MC behavior (in Options Panel → Calculate section):
 
 **Calculation** (using equivalent width as example):
 1. Compute EW for each of N MC samples → distribution of EW values
-2. Find median: 50th percentile
+2. Find median
 3. Calculate 1-sigma: 
    - Lower bound = median − 16th percentile
    - Upper bound = 84th percentile − median
