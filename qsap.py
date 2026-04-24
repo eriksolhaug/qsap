@@ -37,7 +37,6 @@ Examples:
   python qsap.py spectrum.fits                    # Auto-detect format
   python qsap.py spectrum.fits --detect          # Show detected formats
   python qsap.py spectrum.fits --fmt fits:image1d # Force format
-  python qsap.py spectrum.fits --lsf 15.5        # Apply LSF (15.5 km/s)
         """
     )
     
@@ -50,9 +49,9 @@ Examples:
     parser.add_argument('--redshift', type=float, default=0.0,
                         help='Redshift value')
     
-    # LSF handling
-    parser.add_argument('--lsf', type=str, default=None,
-                        help='Line Spread Function: FWHM in km/s or path to LSF file')
+    # # LSF handling (commented out - in development)
+    # parser.add_argument('--lsf', type=str, default=None,
+    #                     help='Line Spread Function: FWHM in km/s or path to LSF file')
     
     parser.add_argument('--version', action='version',
                         version=f'QSAP v{_get_version()}')
@@ -147,16 +146,16 @@ Examples:
             print(f"Flux range: {np.min(spec):.2e} - {np.max(spec):.2e}")
             print(f"Source: {meta.get('source', 'unknown')}")
             
-            # Apply LSF if requested
-            if args.lsf:
-                try:
-                    lsf_fwhm = SpectrumAnalysis.parse_lsf_spec(args.lsf)
-                    # print(f"Applying LSF (FWHM: {lsf_fwhm:.2f} km/s)...")
-                    spec = SpectrumAnalysis.apply_lsf(wav, spec, lsf_fwhm)
-                    # print("LSF applied successfully")
-                except Exception as e:
-                    print(f"Error applying LSF: {e}")
-                    sys.exit(1)
+            # # Apply LSF if requested (commented out - in development)
+            # if args.lsf:
+            #     try:
+            #         lsf_fwhm = SpectrumAnalysis.parse_lsf_spec(args.lsf)
+            #         # print(f"Applying LSF (FWHM: {lsf_fwhm:.2f} km/s)...")
+            #         spec = SpectrumAnalysis.apply_lsf(wav, spec, lsf_fwhm)
+            #         # print("LSF applied successfully")
+            #     except Exception as e:
+            #         print(f"Error applying LSF: {e}")
+            #         sys.exit(1)
             
             # Apply redshift to wavelength array if requested
             if args.redshift != 0.0:
@@ -215,7 +214,7 @@ Use the 'Open' button in the control panel to load a spectrum.
         redshift=args.redshift,
         zoom_factor=0.1,
         file_flag=file_flag,
-        lsf=args.lsf or "10"
+        lsf="10"  # LSF functionality commented out - in development
     )
     
     # Load spectrum data if available
