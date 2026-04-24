@@ -79,6 +79,11 @@ import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use('Qt5Agg')
+
+# Configure matplotlib to handle exceptions gracefully
+import matplotlib as mpl
+mpl.rcParams['figure.raise_window'] = False
+
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -86,6 +91,9 @@ import matplotlib.cm as cm
 from matplotlib import font_manager
 from astropy.io import fits
 import os
+
+# Suppress matplotlib deprecation warnings
+warnings.filterwarnings('ignore', category=DeprecationWarning, module='matplotlib')
 
 # Register Computer Modern Unicode fonts from local fonts/ directory (qsap/fonts/)
 fonts_dir = os.path.join(os.path.dirname(__file__), '..', 'fonts')
@@ -423,12 +431,19 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.listfit_components = []
         self.listfit_fits = []  # Stores completed listfit results
         self.listfit_component_lines = {}  # Store plotted component lines by component ID
+        self.listfit_polynomials = {}  # Store polynomial data for listfit
         self.deleted_listfit_polynomials = set()  # Track deleted polynomial item_ids for residual calculation
 
         self.redshift_estimation_mode = False
         self.rest_wavelength = None  # Set to `None` if no initial rest wavelength
         self.rest_id = None
         self.wavelength_unit = "Å"  # Current wavelength unit (Å, nm, or µm)
+
+        # Equivalent Width Calculation Mode
+        self.calculate_ew_enabled = True  # Checkbox: "Calculate EW automatically" (ON by default)
+        self.plot_mc_profiles_enabled = False  # Checkbox: "Plot MC Profiles"
+        self.mc_profile_lines_current = []  # Store MC profile line objects for removal
+        self.calculate_ew_selection_mode = False  # Mode for selecting profiles via spacebar/mouse click
 
         self.x_upper_bound = None
         self.x_lower_bound = None
@@ -532,6 +547,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Active line lists tracking (resources_dir and line_list_selector already initialized earlier)
         self.active_line_lists = []  # {linelist: LineList, color: str}
         self.current_linelist_lines = []  # Store plotted linelist lines for removal
+        # Line list annotation offsets (normalized 0-1 relative to plotting window)
+        self.linelist_x_offset = 0.02  # Default 2% offset in x direction (positive = right)
+        self.linelist_y_offset = 0.02  # Default 2% offset in y direction (positive = up)
         
         # Load color configuration
         self.colors = self._load_color_config()
@@ -1182,10 +1200,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.load_spectrum_data(wav, spec, err, meta, file_path)
             
             # Redraw the plot
-            self.clear_plot_and_reset()
-            self.plot_spectrum()
-            
-            print(f"Loaded: {file_path}")
+            try:
+                self.clear_plot_and_reset()
+                self.plot_spectrum()
+                print(f"Loaded: {file_path}")
+            except Exception as plot_error:
+                print(f"Error during plot: {plot_error}")
+                import traceback
+                traceback.print_exc()
             
         except Exception as e:
             print(f"Error loading spectrum: {e}")
@@ -1588,6 +1610,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         if coeffs:
             fit_dict['coeffs'] = np.array(coeffs)
             fit_dict['coeffs_err'] = np.array(coeffs_err)
+            
+            # Reconstruct covariance matrix from coefficient errors (diagonal approximation)
+            # When loading from .qsap file, we only have coefficient errors, not full covariance
+            # Create diagonal covariance matrix from coefficient errors squared
+            if all(err is not None for err in coeffs_err):
+                pcov = np.diag(np.array(coeffs_err) ** 2)
+                fit_dict['covariance'] = pcov
         
         # Mode information
         if 'VELOCITY_MODE' in comp_dict:
@@ -2070,7 +2099,6 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.continuum_fits.clear()
         self.listfit_fits.clear()
         self.continuum_patches.clear()
-        self.deleted_listfit_polynomials.clear()
         
         # Clear item tracker
         self.item_tracker.clear_all()
@@ -2112,9 +2140,77 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         return f"Wavelength ({self.wavelength_unit})"
 
     def quit_application(self):
-        """Quit the QSAP application"""
-        QtWidgets.QApplication.quit()
-
+        """Quit the QSAP application gracefully"""
+        try:
+            # Show goodbye message in terminal
+            message = "Quitting QSAP. Bye!"
+            box_width = len(message)
+            print("\n" + "╔" + "═" * (box_width) + "╗")
+            print("║" + message + "║")
+            print("╚" + "═" * (box_width) + "╝\n")
+            
+            # Close all child windows
+            if hasattr(self, 'help_window') and self.help_window is not None:
+                try:
+                    self.help_window.close()
+                except:
+                    pass
+            if hasattr(self, 'item_tracker') and self.item_tracker is not None:
+                try:
+                    self.item_tracker.close()
+                except:
+                    pass
+            if hasattr(self, 'fit_information_window') and self.fit_information_window is not None:
+                try:
+                    self.fit_information_window.close()
+                except:
+                    pass
+            if hasattr(self, 'linelist_selector') and self.linelist_selector is not None:
+                try:
+                    self.linelist_selector.close()
+                except:
+                    pass
+            
+            # Close main window
+            self.close()
+            
+            # Quit the application
+            QtWidgets.QApplication.quit()
+        except Exception as e:
+            print(f"Error during quit: {e}")
+            import sys
+            sys.exit(0)
+    
+    def closeEvent(self, event):
+        """Handle window close event gracefully"""
+        try:
+            # Close all child windows
+            if hasattr(self, 'help_window') and self.help_window is not None:
+                try:
+                    self.help_window.close()
+                except:
+                    pass
+            if hasattr(self, 'item_tracker') and self.item_tracker is not None:
+                try:
+                    self.item_tracker.close()
+                except:
+                    pass
+            if hasattr(self, 'fit_information_window') and self.fit_information_window is not None:
+                try:
+                    self.fit_information_window.close()
+                except:
+                    pass
+            if hasattr(self, 'linelist_selector') and self.linelist_selector is not None:
+                try:
+                    self.linelist_selector.close()
+                except:
+                    pass
+            
+            # Accept the close event
+            event.accept()
+        except Exception as e:
+            print(f"Error during window close: {e}")
+            event.accept()
     def clear_plot_and_reset(self):
         """Clear the current plot and reset all fitting data and item tracker."""
         # Clear the axis if it exists
@@ -2368,13 +2464,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Plot the spectrum
         data_cfg = self.colors['spectrum']['data']
         error_cfg = self.colors['spectrum']['error']
-        self.step_spec, = self.ax.step(self.x_data, self.spec, label='Data', color=data_cfg['color'], where='mid')
-        self.line_spec, = self.ax.plot(self.x_data, self.spec, color=data_cfg['color'], visible=False)
+        self.step_spec, = self.ax.step(self.x_data, self.spec, label='Data', color=data_cfg['color'], where='mid', zorder=0)
+        self.line_spec, = self.ax.plot(self.x_data, self.spec, color=data_cfg['color'], visible=False, zorder=0)
         
         # Only plot error if errors exist
         if self.err is not None:
-            self.step_error, = self.ax.step(self.x_data, self.err, color=error_cfg['color'], linestyle=error_cfg['linestyle'], alpha=error_cfg['alpha'], label='Error', where='mid')
-            self.line_error, = self.ax.plot(self.x_data, self.err, color=error_cfg['color'], linestyle=error_cfg['linestyle'], alpha=error_cfg['alpha'], visible=False)
+            self.step_error, = self.ax.step(self.x_data, self.err, color=error_cfg['color'], linestyle=error_cfg['linestyle'], alpha=error_cfg['alpha'], label='Error', where='mid', zorder=0)
+            self.line_error, = self.ax.plot(self.x_data, self.err, color=error_cfg['color'], linestyle=error_cfg['linestyle'], alpha=error_cfg['alpha'], visible=False, zorder=0)
             self.error_line = self.step_error if self.is_step_plot else self.line_error
         else:
             self.step_error = None
@@ -2411,6 +2507,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.item_tracker.item_individually_deselected.connect(self.on_item_individually_deselected_from_tracker)
         self.item_tracker.item_deselected.connect(self.on_item_deselected_from_tracker)
         self.item_tracker.estimate_redshift.connect(self.on_estimate_redshift_from_tracker)
+        self.item_tracker.calculate_ew.connect(self.on_calculate_ew_from_tracker)
         # Connect visibility changes to update the View menu if signal available
         if hasattr(self.item_tracker, 'visibilityChanged'):
             self.item_tracker.visibilityChanged.connect(self.on_window_visibility_changed)
@@ -2617,6 +2714,48 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         plot_total_line_layout.addWidget(self.plot_total_line_button)
         plot_total_line_layout.addStretch()
         calculate_layout.addLayout(plot_total_line_layout)
+        
+        # --- EQUIVALENT WIDTH SUBSECTION ---
+        calculate_layout.addSpacing(8)
+        ew_label = QtWidgets.QLabel("Equivalent Width")
+        ew_label.setStyleSheet("font-weight: bold; font-size: 10px;")
+        calculate_layout.addWidget(ew_label)
+        
+        ew_sub_layout = QtWidgets.QVBoxLayout()
+        ew_sub_layout.setContentsMargins(10, 5, 10, 5)
+        ew_sub_layout.setSpacing(4)
+        
+        # Dropdown for Calculate EW mode selection
+        calculate_ew_dropdown_layout = QtWidgets.QHBoxLayout()
+        self.calculate_ew_mode_dropdown = QtWidgets.QComboBox()
+        self.calculate_ew_mode_dropdown.addItem("")  # Empty (inactive)
+        self.calculate_ew_mode_dropdown.addItem("Calculate Equivalent Width     [v]")
+        self.calculate_ew_mode_dropdown.currentTextChanged.connect(self.on_calculate_ew_mode_changed)
+        calculate_ew_dropdown_layout.addWidget(self.calculate_ew_mode_dropdown)
+        calculate_ew_dropdown_layout.addStretch()
+        ew_sub_layout.addLayout(calculate_ew_dropdown_layout)
+        
+        # Checkbox: Calculate EW automatically (on by default)
+        self.calculate_ew_auto_checkbox = QtWidgets.QCheckBox("Calculate EW automatically")
+        self.calculate_ew_auto_checkbox.setChecked(True)
+        self.calculate_ew_auto_checkbox.stateChanged.connect(self.on_calculate_ew_auto_toggled)
+        ew_sub_layout.addWidget(self.calculate_ew_auto_checkbox)
+        
+        # Checkbox: Plot MC Profiles Automatically
+        self.plot_mc_profiles_checkbox = QtWidgets.QCheckBox("Plot MC Profiles Automatically")
+        self.plot_mc_profiles_checkbox.setChecked(False)
+        self.plot_mc_profiles_checkbox.stateChanged.connect(self.on_plot_mc_profiles_toggled)
+        ew_sub_layout.addWidget(self.plot_mc_profiles_checkbox)
+        
+        # Button: Delete All MC Profiles
+        delete_mc_button_layout = QtWidgets.QHBoxLayout()
+        self.delete_all_mc_profiles_button = QtWidgets.QPushButton("Delete All MC Profiles")
+        self.delete_all_mc_profiles_button.clicked.connect(self.delete_all_mc_profiles)
+        delete_mc_button_layout.addWidget(self.delete_all_mc_profiles_button)
+        delete_mc_button_layout.addStretch()
+        ew_sub_layout.addLayout(delete_mc_button_layout)
+        
+        calculate_layout.addLayout(ew_sub_layout)
         
         main_layout.addLayout(calculate_layout)
         
@@ -2886,6 +3025,34 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 self.record_action('deactivate_velocity_mode', 'Deactivated Velocity Mode')
                 plt.draw()
 
+    def on_calculate_ew_mode_changed(self, mode_text):
+        """Handle change in Calculate Equivalent Width mode from dropdown"""
+        # Strip keystroke indicator for comparison
+        mode_clean = mode_text.split("     [")
+        if len(mode_clean) > 1:
+            mode_text = mode_clean[0]
+        else:
+            mode_text = mode_clean[0]
+        
+        if mode_text == "":
+            # Deactivated - exit EW selection mode
+            if self.calculate_ew_selection_mode:
+                self.calculate_ew_selection_mode = False
+                print('Calculate Equivalent Width mode deactivated from Options panel')
+        elif mode_text == "Calculate Equivalent Width":
+            # Activate EW selection mode (same as pressing 'v')
+            if self.calculate_ew_selection_mode:
+                self.calculate_ew_selection_mode = False
+                print('Exiting Calculate Equivalent Width mode.')
+                # Update dropdown back to empty
+                self.calculate_ew_mode_dropdown.blockSignals(True)
+                self.calculate_ew_mode_dropdown.setCurrentIndex(0)
+                self.calculate_ew_mode_dropdown.blockSignals(False)
+            else:
+                self.calculate_ew_selection_mode = True
+                print('Calculate Equivalent Width mode: Use spacebar to select a profile for EW calculation, or use Item Tracker context menu.')
+                self.record_action('activate_calculate_ew_mode', 'Activated Calculate Equivalent Width Mode')
+
     def on_poly_order_minus(self):
         """Handle minus button for polynomial order"""
         try:
@@ -2951,8 +3118,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         combined_err = np.array(combined_err) if combined_err else None
 
         # Fit the continuum
-        continuum, coeffs, perr = self.fit_continuum(combined_wav, combined_spec, combined_err, 
-                                                      poly_order=self.poly_order)
+        continuum, coeffs, perr, pcov = self.fit_continuum(combined_wav, combined_spec, combined_err, 
+                                                            poly_order=self.poly_order)
 
         # Plot the fitted continuum
         x_plot = np.linspace(region_bounds[0], region_bounds[1], 500)
@@ -2972,6 +3139,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             'individual_regions': individual_regions,  # Store each region separately
             'coeffs': coeffs,
             'coeffs_err': perr,
+            'covariance': pcov,  # Store full covariance matrix
             'poly_order': self.poly_order,
             'patches': self.continuum_patches,
             'line': continuum_line,
@@ -3039,7 +3207,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         gaussian_cfg = self.colors['profiles']['gaussian']
                         fit['line'].set_color(gaussian_cfg['color'])
                         fit['line'].set_linewidth(gaussian_cfg['linewidth'])
-                        fit['line'].set_zorder(1)  # Reset z-order
+                        fit['line'].set_zorder(2)  # Reset z-order to bring back above data
                         break
             if hasattr(self, 'voigt_fits'):
                 for fit in self.voigt_fits:
@@ -3047,7 +3215,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         voigt_cfg = self.colors['profiles']['voigt']
                         fit['line'].set_color(voigt_cfg['color'])
                         fit['line'].set_linewidth(voigt_cfg['linewidth'])
-                        fit['line'].set_zorder(1)  # Reset z-order
+                        fit['line'].set_zorder(2)  # Reset z-order to bring back above data
                         break
             self.redshift_selected_line = None
         
@@ -3274,6 +3442,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 chi2 = np.sum(residuals ** 2)  # Chi2 without decomposed errors
                 chi2_nu = chi2 / (len(x_fit) - 3)  # 3 params per component
                 
+                # Extract this component's covariance from the full covariance matrix
+                comp_cov_indices = [i, i+1, i+2]
+                comp_cov = pcov[np.ix_(comp_cov_indices, comp_cov_indices)]
+                
+                # DEBUG: Verify covariance structure
+                print(f"[DEBUG] Multi-Gaussian component {self.component_id}: comp_cov shape = {comp_cov.shape}, has_data = {comp_cov is not None}")
+                
                 # Lazy import of scipy for interpolation
                 from scipy.interpolate import interp1d
                 interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
@@ -3296,8 +3471,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 'line': fit_line,
                 'rest_wavelength': self.rest_wavelength,
                 'rest_id': self.rest_id,
-                'z_sys': self.redshift
+                'z_sys': self.redshift,
+                'covariance': comp_cov.tolist()  # Store covariance matrix as list
                 }
+                # DEBUG: Verify gaussian_fit has covariance
+                print(f"[DEBUG] gaussian_fit created with covariance={('covariance' in gaussian_fit)}, bounds={gaussian_fit.get('bounds')}")
                 self.gaussian_fits.append(gaussian_fit)
                 # Register with ItemTracker
                 position_str = f"λ: {mean:.2f} Å"
@@ -3319,6 +3497,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # Get all gaussians for this fit_id
             multi_gaussian_components = [g for g in self.gaussian_fits if g.get('fit_id') == self.fit_id]
             if multi_gaussian_components:
+                # DEBUG: Verify structure before saving
+                for idx, comp in enumerate(multi_gaussian_components):
+                    has_bounds = 'bounds' in comp
+                    has_covariance = 'covariance' in comp
+                    print(f"[DEBUG] Multi-Gaussian component {idx}: has_bounds={has_bounds}, has_covariance={has_covariance}")
                 self.save_and_print_qsap_fit(multi_gaussian_components, 'Gaussian', 'Multi-Gaussian')
             
             self.fit_id += 1
@@ -3786,7 +3969,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 coeffs = continuum_fit['coeffs']
                 continuum_sum[mask] = np.polyval(coeffs, comp_x)
 
-        # Add Listfit polynomial components to residuals (skip deleted polynomials)
+        # Add Listfit polynomial components to residuals (all active components)
         listfit_poly_sum = np.zeros_like(self.spec)
         if self.listfit_fits:
             for listfit in self.listfit_fits:
@@ -3801,31 +3984,20 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 components = listfit['components']
                 result = listfit['result']
                 
-                # Find and add polynomial components from the listfit (skip deleted ones)
+                # Add polynomial components from the listfit (already filtered - deleted ones removed)
                 poly_count = 0
                 for comp in components:
                     if comp['type'] == 'polynomial':
-                        # Check if this polynomial was deleted
-                        is_deleted = False
-                        for item_id, item_info in self.item_id_map.items():
-                            if (item_info.get('type') == 'polynomial' and 
-                                item_info.get('fit_dict', {}).get('listfit_bounds') == (left_bound, right_bound) and
-                                item_info.get('fit_dict', {}).get('poly_index') == poly_count):
-                                if item_id in self.deleted_listfit_polynomials:
-                                    is_deleted = True
-                                break
-                        
-                        if not is_deleted:
-                            order = comp.get('order', 1)
-                            prefix = f'p{poly_count}_'
-                            poly_coeffs = []
-                            for i in range(order + 1):
-                                coeff_val = result.params[f'{prefix}c{i}'].value
-                                poly_coeffs.append(coeff_val)
-                            # Reverse coefficients for np.polyval (expects highest order first)
-                            poly_coeffs = poly_coeffs[::-1]
-                            y_poly = np.polyval(poly_coeffs, comp_x)
-                            listfit_poly_sum[mask] += y_poly
+                        order = comp.get('order', 1)
+                        prefix = f'p{poly_count}_'
+                        poly_coeffs = []
+                        for i in range(order + 1):
+                            coeff_val = result.params[f'{prefix}c{i}'].value
+                            poly_coeffs.append(coeff_val)
+                        # Reverse coefficients for np.polyval (expects highest order first)
+                        poly_coeffs = poly_coeffs[::-1]
+                        y_poly = np.polyval(poly_coeffs, comp_x)
+                        listfit_poly_sum[mask] += y_poly
                         poly_count += 1
 
         # Calculate residual as (spectrum - fitted Gaussians - Voigts - continuum - listfit polynomials)
@@ -4215,12 +4387,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             else:
                 coeffs = coeffs_with_cov
                 perr = np.ones(poly_order + 1)
+                pcov = None
 
             # Return the final continuum and parameters
-            return continuum, coeffs, perr
+            return continuum, coeffs, perr, pcov
         except RuntimeError as e:
             print(f"Error in fitting continuum: {e}")
-            return None, None, None
+            return None, None, None, None
 
     # Function to clear all continuum regions
     def clear_continuum_regions(self):
@@ -4494,12 +4667,26 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 if xlim[0] <= shifted_wl_display <= xlim[1]:
                     # Draw the vertical line
                     vline = self.ax.axvline(shifted_wl_display, color=color, linestyle='--', alpha=0.7)
-                    label = self.ax.text(shifted_wl_display, 0, line.name,
+                    
+                    # Create a mixed coordinate annotation:
+                    # x: data coordinates (wavelength), y: normalized axes coordinates (0-1)
+                    # This way the annotation stays at the same relative position even when panning/zooming
+                    from matplotlib.transforms import blended_transform_factory
+                    trans = blended_transform_factory(self.ax.transData, self.ax.transAxes)
+                    
+                    # Apply offset to the normalized y position
+                    y_position = self.linelist_y_offset
+                    
+                    label = self.ax.text(shifted_wl_display + (self.linelist_x_offset * (xlim[1] - xlim[0])), 
+                                        y_position, line.name,
                                         rotation=90, verticalalignment='bottom', 
-                                        color=color, fontsize=8)
+                                        color=color, fontsize=8,
+                                        transform=trans)
                     self.current_linelist_lines.append((vline, label))
         
-        plt.draw()
+        # Use canvas.draw_idle() instead of plt.draw() to ensure proper update
+        if self.ax and self.ax.figure:
+            self.ax.figure.canvas.draw_idle()
 
     def clear_linelist(self):
         """Remove all displayed line lists from the plot"""
@@ -4533,12 +4720,18 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         """Handle change in selected line lists"""
         self.active_line_lists = line_lists_with_colors
         
+        # Update line list annotation offsets from the selector
+        if self.line_list_selector:
+            self.linelist_x_offset = self.line_list_selector.linelist_x_offset
+            self.linelist_y_offset = self.line_list_selector.linelist_y_offset
+        
         # Redisplay line lists
         if self.active_line_lists:
             self.display_linelist()
         else:
             self.clear_linelist()
-            plt.draw()
+            if self.ax and self.ax.figure:
+                self.ax.figure.canvas.draw_idle()
 
     def on_close_linelist(self):
         """Remove the Gaussian plot when LineListWindow is closed."""
@@ -4622,22 +4815,81 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         Returns:
             Tuple of (filepath, file_content)
         """
-        # Calculate equivalent width if applicable - IN DEVELOPMENT
-        ### EQUIVALENT WIDTH - Uncomment block to enable during fitting
-        if fit_type in ['Gaussian', 'Voigt']:
-            ew_result = None
+        # Calculate equivalent width using Monte Carlo error propagation
+        # Only if "Calculate EW automatically" checkbox is enabled
+        if self.calculate_ew_enabled and fit_type in ['Gaussian', 'Voigt', 'Listfit']:
+            # Get the continuum fit to use for EW calculation
+            continuum_fit_dict = None
+            if self.continuum_fits:
+                # Use the most recent continuum fit
+                continuum_fit_dict = self.continuum_fits[-1]
+            
             if isinstance(fit_data, list):
                 for fit in fit_data:
-                    ew_result = self._calculate_equivalent_width(fit, fit_type.lower())
-                    if ew_result:
-                        fit['equivalent_width'] = ew_result['ew']
-                        fit['equivalent_width_err'] = ew_result.get('ew_err')
+                    # For Listfit, extract the actual profile type from the component
+                    if fit_type == 'Listfit':
+                        component_type = fit.get('type', '').lower()
+                        # Skip non-profile components (polynomial, masks, diagnostics)
+                        if component_type not in ['gaussian', 'voigt']:
+                            continue
+                        component_fit_type = component_type
+                    else:
+                        # For multi-Gaussian or multi-Voigt, use the provided fit_type
+                        component_fit_type = fit_type.lower()
+                    
+                    # DEBUG: Check structure of fit dict
+                    component_id = fit.get('component_id', '?')
+                    has_bounds = 'bounds' in fit
+                    has_covariance = 'covariance' in fit
+                    print(f"[DEBUG] Component {component_id}: has_bounds={has_bounds}, has_covariance={has_covariance}")
+                    
+                    try:
+                        ew_result = self._calculate_equivalent_width_monte_carlo(
+                            fit, continuum_fit_dict, component_fit_type
+                        )
+                        if ew_result:
+                            # Store best, median, mean
+                            fit['ew_best'] = ew_result.get('ew_best')
+                            fit['ew_median'] = ew_result.get('ew_median')
+                            fit['ew_mean'] = ew_result.get('ew_mean')
+                            # Store for file output (backward compatibility)
+                            fit['equivalent_width'] = ew_result['ew']
+                            fit['equivalent_width_1sigma_lower'] = ew_result.get('ew_1sigma_lower')
+                            fit['equivalent_width_1sigma_upper'] = ew_result.get('ew_1sigma_upper')
+                            fit['equivalent_width_2sigma_lower'] = ew_result.get('ew_2sigma_lower')
+                            fit['equivalent_width_2sigma_upper'] = ew_result.get('ew_2sigma_upper')
+                            fit['equivalent_width_3sigma_lower'] = ew_result.get('ew_3sigma_lower')
+                            fit['equivalent_width_3sigma_upper'] = ew_result.get('ew_3sigma_upper')
+                            print(f"[EW] Calculated for component {component_id}")
+                            
+                            # Plot MC profiles if enabled
+                            if self.plot_mc_profiles_enabled:
+                                self.plot_mc_profiles(fit, ew_result, component_fit_type)
+                        else:
+                            print(f"[EW] No result for component {component_id}")
+                    except Exception as e:
+                        print(f"[EW] Error calculating EW for component {component_id}: {e}")
             else:
-                ew_result = self._calculate_equivalent_width(fit_data, fit_type.lower())
+                ew_result = self._calculate_equivalent_width_monte_carlo(
+                    fit_data, continuum_fit_dict, fit_type.lower()
+                )
                 if ew_result:
+                    # Store best, median, mean
+                    fit_data['ew_best'] = ew_result.get('ew_best')
+                    fit_data['ew_median'] = ew_result.get('ew_median')
+                    fit_data['ew_mean'] = ew_result.get('ew_mean')
+                    # Store for file output (backward compatibility)
                     fit_data['equivalent_width'] = ew_result['ew']
-                    fit_data['equivalent_width_err'] = ew_result.get('ew_err')
-        ### END EQUIVALENT WIDTH CALCULATION
+                    fit_data['equivalent_width_1sigma_lower'] = ew_result.get('ew_1sigma_lower')
+                    fit_data['equivalent_width_1sigma_upper'] = ew_result.get('ew_1sigma_upper')
+                    fit_data['equivalent_width_2sigma_lower'] = ew_result.get('ew_2sigma_lower')
+                    fit_data['equivalent_width_2sigma_upper'] = ew_result.get('ew_2sigma_upper')
+                    fit_data['equivalent_width_3sigma_lower'] = ew_result.get('ew_3sigma_lower')
+                    fit_data['equivalent_width_3sigma_upper'] = ew_result.get('ew_3sigma_upper')
+                    
+                    # Plot MC profiles if enabled
+                    if self.plot_mc_profiles_enabled:
+                        self.plot_mc_profiles(fit_data, ew_result, fit_type.lower())
         
         # Build spectrum info dict
         spectrum_info = {
@@ -4813,6 +5065,237 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             return None
         ### END EQUIVALENT WIDTH CALCULATION
     
+    def _get_profile_params_from_dict(self, fit_dict, fit_type):
+        """Extract profile parameters from fit dictionary based on fit type
+        
+        Returns tuple of (param_list, param_names)
+        """
+        fit_type = fit_type.lower()
+        
+        if fit_type == 'gaussian':
+            params = [fit_dict.get('amp'), fit_dict.get('mean'), fit_dict.get('stddev')]
+            names = ['amp', 'mean', 'stddev']
+        elif fit_type == 'voigt':
+            params = [fit_dict.get('amplitude'), fit_dict.get('center', fit_dict.get('mean')), 
+                     fit_dict.get('sigma'), fit_dict.get('gamma')]
+            names = ['amplitude', 'center', 'sigma', 'gamma']
+        else:
+            return None, None
+        
+        return params, names
+    
+    def _evaluate_profile(self, x, fit_type, params):
+        """Evaluate a profile at wavelength points x
+        
+        Args:
+            x: wavelength array
+            fit_type: 'gaussian', 'voigt', etc.
+            params: list of profile parameters in correct order
+        
+        Returns:
+            Profile values at x
+        """
+        fit_type = fit_type.lower()
+        
+        if fit_type == 'gaussian':
+            amp, mean, stddev = params
+            return self.gaussian(x, amp, mean, stddev)
+        elif fit_type == 'voigt':
+            amp, center, sigma, gamma = params
+            return self.voigt(x, amp, center, sigma, gamma)
+        else:
+            raise ValueError(f"Unknown fit type: {fit_type}")
+    
+    def _calculate_equivalent_width_monte_carlo(self, fit_dict, continuum_fit_dict, fit_type='gaussian', n_samples=1000):
+        """Calculate equivalent width using Monte Carlo error propagation
+        
+        This method samples from the joint posterior distribution of:
+        - Gaussian/Voigt profile parameters and their covariance
+        - Continuum polynomial and its covariance
+        
+        Then calculates EW, sigma, and 3-sigma credible intervals from the resulting distribution.
+        
+        Args:
+            fit_dict: Dictionary with fitted profile parameters and covariance
+            continuum_fit_dict: Dictionary with continuum polynomial coefficients and covariance
+            fit_type: 'gaussian', 'voigt', or profile function identifier
+            n_samples: Number of Monte Carlo samples (default 1000)
+            
+        Returns:
+            Dictionary with:
+            - 'ew': median EW
+            - 'ew_1sigma_lower', 'ew_1sigma_upper': 1-sigma credible interval bounds
+            - 'ew_2sigma_lower', 'ew_2sigma_upper': 2-sigma credible interval bounds
+            - 'ew_3sigma_lower', 'ew_3sigma_upper': 3-sigma credible interval bounds
+            - 'ew_samples': full array of samples (optional, for diagnostics)
+        """
+        try:
+            # Require continuum fit to proceed
+            if continuum_fit_dict is None or 'coeffs' not in continuum_fit_dict:
+                print("[MC] ERROR: Continuum fit required for MC EW calculation")
+                return None
+            
+            bounds = fit_dict.get('bounds')
+            if bounds[0] is None or bounds[1] is None:
+                return None
+            
+            # Get covariance matrices
+            profile_cov = fit_dict.get('covariance')
+            if profile_cov is None:
+                return None
+            if isinstance(profile_cov, list):
+                profile_cov = np.array(profile_cov)
+            
+            cont_cov = continuum_fit_dict.get('covariance') if continuum_fit_dict else None
+            
+            # Get continuum polynomial if available
+            cont_coeffs = None
+            if continuum_fit_dict and 'coeffs' in continuum_fit_dict:
+                cont_coeffs = np.array(continuum_fit_dict['coeffs'])
+                if isinstance(cont_cov, list):
+                    cont_cov = np.array(cont_cov)
+                
+                # Validate we have proper covariance matrix
+                if cont_cov is None:
+                    print("[MC] ERROR: Continuum covariance matrix is missing")
+                    return None
+            
+            # Integration grid
+            x_int = np.linspace(bounds[0], bounds[1], 200)
+            
+            ew_samples = []
+            profile_samples = []  # Store all realized profiles
+            continuum_samples = []  # Store all realized continua
+            
+            # Monte Carlo loop
+            for sample_idx in range(n_samples):
+                # Extract profile parameters based on fit_type
+                profile_params, param_names = self._get_profile_params_from_dict(fit_dict, fit_type)
+                if profile_params is None:
+                    return None
+                
+                # Sample profile parameters from multivariate normal
+                profile_sample = np.random.multivariate_normal(profile_params, profile_cov)
+                
+                # Evaluate profile at high resolution
+                profile = self._evaluate_profile(x_int, fit_type, profile_sample)
+                
+                # Sample continuum polynomial if available
+                if cont_coeffs is not None and cont_cov is not None:
+                    cont_sample = np.random.multivariate_normal(cont_coeffs, cont_cov)
+                    continuum = np.polyval(cont_sample, x_int)
+                else:
+                    # Cannot proceed without continuum if one was used in the fit
+                    print("[MC] ERROR: Cannot compute MC EW without continuum covariance matrix")
+                    return None
+                
+                # Ensure non-zero continuum to avoid division issues
+                continuum = np.maximum(continuum, 1e-10)
+                
+                # Store samples for later plotting
+                profile_samples.append(profile)
+                continuum_samples.append(continuum)
+                
+                # Calculate EW for this sample
+                # Note: profile is the residual (flux - continuum) from the fit
+                # EW = ∫(continuum - flux)/continuum dλ = -∫residual/continuum dλ
+                normalized = -profile / continuum
+                ew = np.trapz(normalized, x_int)
+                
+                ew_samples.append(ew)
+            
+            ew_samples = np.array(ew_samples)
+            profile_samples_array = np.array(profile_samples)
+            continuum_samples_array = np.array(continuum_samples)
+            
+            # Filter out NaN and inf values (numerical artifacts only)
+            valid_mask = np.isfinite(ew_samples)
+            valid_ew_samples = ew_samples[valid_mask]
+            valid_profile_samples = profile_samples_array[valid_mask]
+            valid_continuum_samples = continuum_samples_array[valid_mask]
+            
+            n_invalid = np.sum(~valid_mask)
+            if n_invalid > 0:
+                print(f"[MC] WARNING: {n_invalid} samples produced NaN/inf (numerical artifacts)")
+                if n_invalid > len(ew_samples) * 0.1:
+                    print("[MC]   This may indicate issues with the fit covariance matrix")
+                    print("[MC]   Consider: checking continuum fit quality, adjusting polynomial order")
+            
+            if len(valid_ew_samples) == 0:
+                print("[MC] ERROR: All samples are NaN/inf - cannot compute EW statistics")
+                return None
+            
+            # Calculate statistics from the distribution
+            median_ew = np.percentile(valid_ew_samples, 50)
+            mean_ew = np.mean(valid_ew_samples)
+            
+            # Calculate "best" EW from the fitted parameters (no MC)
+            profile_params, _ = self._get_profile_params_from_dict(fit_dict, fit_type)
+            best_profile = self._evaluate_profile(x_int, fit_type, profile_params)
+            if cont_coeffs is not None:
+                best_continuum = np.polyval(cont_coeffs, x_int)
+            else:
+                continuum_level = self._get_continuum_level_estimate(bounds)
+                if continuum_level is None or continuum_level <= 0:
+                    continuum_level = 1.0
+                best_continuum = np.ones_like(x_int) * continuum_level
+            best_continuum = np.maximum(best_continuum, 1e-10)
+            best_normalized = -best_profile / best_continuum
+            best_ew = np.trapz(best_normalized, x_int)
+            # Note: profile and best_profile are residuals (flux - continuum) from the fit
+            
+            # 1-sigma (16th-84th percentile)
+            p16_1 = np.percentile(valid_ew_samples, 16)
+            p84_1 = np.percentile(valid_ew_samples, 84)
+            
+            # 2-sigma (2.28th-97.72th percentile)
+            p228_2 = np.percentile(valid_ew_samples, 2.28)
+            p9772_2 = np.percentile(valid_ew_samples, 97.72)
+            
+            # 3-sigma (0.135th-99.865th percentile)
+            p0135_3 = np.percentile(valid_ew_samples, 0.135)
+            p99865_3 = np.percentile(valid_ew_samples, 99.865)
+            
+            return {
+                'ew_best': best_ew,
+                'ew_median': median_ew,
+                'ew_mean': mean_ew,
+                'ew': median_ew,  # Keep for backward compatibility
+                'ew_1sigma_lower': median_ew - p16_1,
+                'ew_1sigma_upper': p84_1 - median_ew,
+                'ew_2sigma_lower': median_ew - p228_2,
+                'ew_2sigma_upper': p9772_2 - median_ew,
+                'ew_3sigma_lower': median_ew - p0135_3,
+                'ew_3sigma_upper': p99865_3 - median_ew,
+                'ew_samples': valid_ew_samples,  # Keep only valid samples
+                'x_grid': x_int,  # Wavelength grid for plotting
+                'profile_samples': valid_profile_samples,  # Only valid realized profiles
+                'continuum_samples': valid_continuum_samples  # Only valid realized continua
+            }
+        except Exception as e:
+            print(f"[MC-EW] Monte Carlo EW calculation error: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _get_continuum_level_estimate(self, bounds):
+        """Estimate continuum level from data at boundaries"""
+        left_mask = (self.x_data >= bounds[0] - (bounds[1] - bounds[0]) * 0.1) & \
+                    (self.x_data <= bounds[0])
+        right_mask = (self.x_data >= bounds[1]) & \
+                     (self.x_data <= bounds[1] + (bounds[1] - bounds[0]) * 0.1)
+        
+        left_cont = np.nanmedian(self.spec[left_mask]) if np.any(left_mask) else np.nan
+        right_cont = np.nanmedian(self.spec[right_mask]) if np.any(right_mask) else np.nan
+        
+        if not np.isnan(left_cont) and not np.isnan(right_cont):
+            return (left_cont + right_cont) / 2.0
+        elif not np.isnan(left_cont):
+            return left_cont
+        elif not np.isnan(right_cont):
+            return right_cont
+        return None
+    
     def show_item_tracker(self):
         """Show the item tracker window"""
         self.item_tracker.item_deleted.connect(self.on_item_deleted_from_tracker)
@@ -4858,9 +5341,95 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                             # Remove from tracker (this will recursively call on_item_deleted_from_tracker)
                             self.item_tracker.unregister_item(remove_id)
         
-        # Handle polynomial deletion - mark it as deleted for residual calculation
+        # Handle polynomial deletion - remove from listfit components list
         if item_type == 'polynomial':
-            self.deleted_listfit_polynomials.add(item_id)
+            fit_dict = item_info.get('fit_dict', {})
+            listfit_bounds = fit_dict.get('listfit_bounds')
+            poly_index = fit_dict.get('poly_index')
+            
+            # Find the listfit this polynomial belongs to and remove the component
+            if listfit_bounds is not None and poly_index is not None:
+                for listfit in self.listfit_fits:
+                    if listfit.get('bounds') == listfit_bounds:
+                        # Remove the component from the listfit's components list
+                        components = listfit.get('components', [])
+                        # Remove components in reverse order by index to avoid index shifting
+                        for i, comp in enumerate(components):
+                            if (comp.get('type') == 'polynomial' and 
+                                comp.get('index') == poly_index):
+                                components.pop(i)
+                                break
+                        break
+        
+        # Handle Gaussian deletion - remove from listfit components list
+        elif item_type == 'gaussian':
+            fit_dict = item_info.get('fit_dict', {})
+            listfit_bounds = fit_dict.get('listfit_bounds')
+            gauss_index = fit_dict.get('gauss_index')
+            
+            if listfit_bounds is not None and gauss_index is not None:
+                for listfit in self.listfit_fits:
+                    if listfit.get('bounds') == listfit_bounds:
+                        components = listfit.get('components', [])
+                        for i, comp in enumerate(components):
+                            if comp.get('type') == 'gaussian' and comp.get('index') == gauss_index:
+                                components.pop(i)
+                                break
+                        break
+        
+        # Handle Voigt deletion - remove from listfit components list
+        elif item_type == 'voigt':
+            fit_dict = item_info.get('fit_dict', {})
+            listfit_bounds = fit_dict.get('listfit_bounds')
+            voigt_index = fit_dict.get('voigt_index')
+            
+            if listfit_bounds is not None and voigt_index is not None:
+                for listfit in self.listfit_fits:
+                    if listfit.get('bounds') == listfit_bounds:
+                        components = listfit.get('components', [])
+                        for i, comp in enumerate(components):
+                            if comp.get('type') == 'voigt' and comp.get('index') == voigt_index:
+                                components.pop(i)
+                                break
+                        break
+        
+        # Handle Polynomial Guess Mask deletion - remove from listfit
+        elif item_type == 'polynomial_guess_mask':
+            fit_dict = item_info.get('fit_dict', {})
+            listfit_bounds = fit_dict.get('listfit_bounds')
+            min_lambda = fit_dict.get('min_lambda')
+            max_lambda = fit_dict.get('max_lambda')
+            
+            if listfit_bounds is not None:
+                for listfit in self.listfit_fits:
+                    if listfit.get('bounds') == listfit_bounds:
+                        components = listfit.get('components', [])
+                        for i, comp in enumerate(components):
+                            if (comp.get('type') == 'polynomial_guess_mask' and 
+                                comp.get('min_lambda') == min_lambda and
+                                comp.get('max_lambda') == max_lambda):
+                                components.pop(i)
+                                break
+                        break
+        
+        # Handle Data Mask deletion - remove from listfit
+        elif item_type == 'data_mask':
+            fit_dict = item_info.get('fit_dict', {})
+            listfit_bounds = fit_dict.get('listfit_bounds')
+            min_lambda = fit_dict.get('min_lambda')
+            max_lambda = fit_dict.get('max_lambda')
+            
+            if listfit_bounds is not None:
+                for listfit in self.listfit_fits:
+                    if listfit.get('bounds') == listfit_bounds:
+                        components = listfit.get('components', [])
+                        for i, comp in enumerate(components):
+                            if (comp.get('type') == 'data_mask' and 
+                                comp.get('min_lambda') == min_lambda and
+                                comp.get('max_lambda') == max_lambda):
+                                components.pop(i)
+                                break
+                        break
         
         # Handle line objects (gaussian, voigt, continuum, polynomial, listfit_total)
         line_obj = item_info.get('line_obj')
@@ -5018,13 +5587,206 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 # Open line list window for line selection
                 self.open_linelist_window()
         
+    def on_calculate_ew_from_tracker(self, item_id):
+        """Handle calculate equivalent width action from ItemTracker context menu"""
+        if item_id not in self.item_id_map:
+            return
+        
+        item_info = self.item_id_map[item_id]
+        item_type = item_info.get('type')
+        fit_dict = item_info.get('fit_dict')
+        
+        if not fit_dict:
+            print("[EW] No fit dictionary found for this item")
+            return
+        
+        # Get the corresponding fit type
+        if item_type == 'gaussian':
+            fit_type = 'gaussian'
+        elif item_type == 'voigt':
+            fit_type = 'voigt'
+        else:
+            print(f"[EW] Cannot calculate EW for item type: {item_type}")
+            return
+        
+        # Get the continuum fit
+        continuum_fit_dict = self.continuum_fits[-1] if self.continuum_fits else None
+        
+        # Calculate EW
+        ew_result = self._calculate_equivalent_width_monte_carlo(fit_dict, continuum_fit_dict, fit_type)
+        
+        if ew_result:
+            print(f"\n[EW Calculation Results for {item_type.capitalize()}]")
+            print(f"  Best:    {ew_result['ew_best']:.6f}")
+            print(f"  Median:  {ew_result['ew_median']:.6f}")
+            print(f"  Mean:    {ew_result['ew_mean']:.6f}")
+            print(f"  1-sigma: -{ew_result['ew_1sigma_lower']:.6f}/+{ew_result['ew_1sigma_upper']:.6f}")
+            print(f"  2-sigma: -{ew_result['ew_2sigma_lower']:.6f}/+{ew_result['ew_2sigma_upper']:.6f}")
+            print(f"  3-sigma: -{ew_result['ew_3sigma_lower']:.6f}/+{ew_result['ew_3sigma_upper']:.6f}")
+            
+            # Store results in fit dict for later use
+            fit_dict['ew_best'] = ew_result['ew_best']
+            fit_dict['ew_median'] = ew_result['ew_median']
+            fit_dict['ew_mean'] = ew_result['ew_mean']
+            fit_dict['ew_1sigma_lower'] = ew_result['ew_1sigma_lower']
+            fit_dict['ew_1sigma_upper'] = ew_result['ew_1sigma_upper']
+            fit_dict['ew_2sigma_lower'] = ew_result['ew_2sigma_lower']
+            fit_dict['ew_2sigma_upper'] = ew_result['ew_2sigma_upper']
+            fit_dict['ew_3sigma_lower'] = ew_result['ew_3sigma_lower']
+            fit_dict['ew_3sigma_upper'] = ew_result['ew_3sigma_upper']
+            
+            # Save EW results to dedicated .qsap file
+            self.save_ew_qsap_file(ew_result, fit_dict, fit_type)
+            
+            # Plot MC profiles if enabled
+            if self.plot_mc_profiles_enabled:
+                self.plot_mc_profiles(fit_dict, ew_result, fit_type)
+        else:
+            print("[EW] Failed to calculate equivalent width")
+        
+    def on_calculate_ew_auto_toggled(self, state):
+        """Handle toggle of 'Calculate EW automatically' checkbox"""
+        self.calculate_ew_enabled = (state == QtCore.Qt.Checked)
+        status = "enabled" if self.calculate_ew_enabled else "disabled"
+        print(f"Automatic EW calculation {status}")
+        
+    def on_plot_mc_profiles_toggled(self, state):
+        """Handle toggle of 'Plot MC Profiles' checkbox"""
+        self.plot_mc_profiles_enabled = (state == QtCore.Qt.Checked)
+        status = "enabled" if self.plot_mc_profiles_enabled else "disabled"
+        print(f"MC Profile plotting {status}")
+    
+    def save_ew_qsap_file(self, ew_result, fit_dict, fit_type):
+        """Save Equivalent Width results to a dedicated .qsap file
+        
+        Args:
+            ew_result: Result dict from _calculate_equivalent_width_monte_carlo
+            fit_dict: Dictionary with fitted profile parameters
+            fit_type: 'gaussian' or 'voigt'
+        """
+        try:
+            # Build spectrum info dict
+            spectrum_info = {
+                'wavelength_unit': self.wavelength_unit,
+                'velocity_mode': self.is_velocity_mode,
+            }
+            if self.x_data is not None and len(self.x_data) > 0:
+                spectrum_info['wavelength_range'] = (self.x_data[0], self.x_data[-1])
+            
+            # Create .qsap file for EW results
+            filepath, content = self.qsap_handler.create_equivalent_width_qsap(
+                ew_result, fit_dict, fit_type.capitalize(), self.fits_file, spectrum_info
+            )
+            
+            # Print the file contents to output
+            print("\n" + "="*70)
+            print(f"EQUIVALENT WIDTH RESULTS SAVED TO: {os.path.basename(filepath)}")
+            print("="*70)
+            print(content)
+            print("="*70 + "\n")
+            
+        except Exception as e:
+            print(f"[EW] Error saving EW results to file: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def delete_all_mc_profiles(self):
+        """Delete all currently displayed MC profile lines"""
+        for line in self.mc_profile_lines_current:
+            try:
+                line.remove()
+            except (ValueError, AttributeError):
+                pass
+        self.mc_profile_lines_current.clear()
+        
+        # Redraw
+        if self.ax is not None:
+            self.ax.figure.canvas.draw_idle()
+        
+        print("[MC] Deleted all MC profile visualizations")
+    
+    def plot_mc_profiles(self, fit_dict, ew_result, fit_type, n_samples=1000):
+        """Plot Monte Carlo profile realizations as flux (residual profile + continuum)
+        
+        Args:
+            fit_dict: Dictionary with fitted profile parameters and covariance
+            ew_result: Result dict from _calculate_equivalent_width_monte_carlo (contains samples)
+            fit_type: 'gaussian', 'voigt', etc.
+            n_samples: Number of samples to plot (default 1000, limited by available samples)
+        """
+        try:
+            # Get pre-computed samples from ew_result
+            if 'profile_samples' not in ew_result or 'continuum_samples' not in ew_result:
+                print("[MC] No sample data available for plotting")
+                return
+            
+            x_grid = ew_result.get('x_grid')
+            profile_samples = ew_result.get('profile_samples')  # residual profile
+            continuum_samples = ew_result.get('continuum_samples')
+            
+            if x_grid is None or len(profile_samples) == 0:
+                print("[MC] Invalid sample data")
+                return
+            
+            # Limit to available samples
+            n_available = len(profile_samples)
+            n_plot = min(n_samples, n_available)
+            
+            # Get profile color from item_id_map (or use default)
+            profile_color = 'blue'
+            for item_id, item_info in self.item_id_map.items():
+                if item_info.get('fit_dict') == fit_dict:
+                    profile_color = item_info.get('color', 'blue')
+                    break
+            
+            # Get continuum color from colors config
+            continuum_color_dict = self.colors.get('profiles', {}).get('continuum_line', {})
+            continuum_color = continuum_color_dict.get('color', 'black')
+            
+            # First, plot all continuum realizations (in continuum color, underneath)
+            for sample_idx in range(n_plot):
+                continuum = continuum_samples[sample_idx]
+                line_cont, = self.ax.plot(x_grid, continuum, color=continuum_color, alpha=0.03, 
+                                         linewidth=0.5, linestyle='-', zorder=1)
+                self.mc_profile_lines_current.append(line_cont)
+            
+            # Then, plot all flux realizations on top (flux = residual + continuum)
+            for sample_idx in range(n_plot):
+                residual = profile_samples[sample_idx]
+                continuum = continuum_samples[sample_idx]
+                
+                # Compute flux for this realization: flux = continuum + residual
+                flux = continuum + residual
+                
+                # Plot flux (the actual realized spectrum) with low alpha
+                line_flux, = self.ax.plot(x_grid, flux, color=profile_color, alpha=0.01, 
+                                         linewidth=0.5, linestyle='-', zorder=2)
+                self.mc_profile_lines_current.append(line_flux)
+            
+            # Redraw
+            if self.ax is not None:
+                self.ax.figure.canvas.draw_idle()
+            
+            print(f"[MC] Plotted {n_plot} Monte Carlo profile realizations")
+            
+            
+            
+        except Exception as e:
+            print(f"[MC] Error plotting MC profiles: {e}")
+            import traceback
+            traceback.print_exc()
+        
     def estimate_redshift(self, selected_id, selected_wavelength):
         self.selected_id, self.selected_rest_wavelength = selected_id, selected_wavelength  # Store the selected wavelength
         if self.selected_id is not None and self.selected_rest_wavelength is not None:
+            # Capture the fit_dict early so we can use it throughout this method
+            selected_fit_dict = None
+            
             # Extract center from selected fit if not already set
             if not hasattr(self, 'center_profile') or self.center_profile is None:
                 # Try to get from selected Gaussian
                 if self.selected_gaussian:
+                    selected_fit_dict = self.selected_gaussian  # Capture it here
                     self.center_profile = self.selected_gaussian.get('mean')
                     self.center_profile_err = self.selected_gaussian.get('mean_err')
                     print(f"[DEBUG] Gaussian mean_err from fit dict: {self.center_profile_err}")
@@ -5035,6 +5797,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     print(f"Amplitude: {amp}, Mean: {mean}, Sigma: {stddev}")
                 # Try to get from selected Voigt
                 elif self.selected_voigt:
+                    selected_fit_dict = self.selected_voigt  # Capture it here
                     self.center_profile = self.selected_voigt.get('center')
                     self.center_profile_err = self.selected_voigt.get('center_err')
                     print(f"[DEBUG] Voigt center_err from fit dict: {self.center_profile_err}")
@@ -5048,12 +5811,31 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     print("Error: No Gaussian or Voigt selected for redshift estimation")
                     return
             
+            # Also capture if we already have center_profile set (from previous call)
+            if selected_fit_dict is None:
+                if self.selected_gaussian:
+                    selected_fit_dict = self.selected_gaussian
+                elif self.selected_voigt:
+                    selected_fit_dict = self.selected_voigt
+            
             # Print center info like in redshift mode
             print(f"Center of selected Gaussian: {self.center_profile:.6f}+-{self.center_profile_err:.6f}")
             
             est_redshift = (self.center_profile - self.selected_rest_wavelength) / self.selected_rest_wavelength
             est_redshift_err = self.center_profile_err / self.selected_rest_wavelength
             print(f"Estimated Redshift: {est_redshift:.6f}+-{est_redshift_err:.6f}")
+            
+            # Calculate MC redshift estimation using the captured fit_dict
+            mc_redshift_result = self._estimate_redshift_monte_carlo(
+                selected_fit_dict,
+                self.selected_rest_wavelength
+            )
+            
+            # Debug: Print MC result
+            print(f"[DEBUG] MC Redshift Result: {mc_redshift_result}")
+            if mc_redshift_result:
+                print(f"[DEBUG] MC z_best: {mc_redshift_result.get('z_best')}")
+                print(f"[DEBUG] MC z_median: {mc_redshift_result.get('z_median')}")
             
             # Prepare redshift data for .qsap file
             redshift_data = {
@@ -5064,27 +5846,43 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 'LINE_WAVELENGTH_OBSERVED_ERR': self.center_profile_err,
             }
             
+            # Add MC results if available
+            if mc_redshift_result:
+                redshift_data['REDSHIFT_BEST'] = mc_redshift_result['z_best']
+                redshift_data['REDSHIFT_MEDIAN'] = mc_redshift_result['z_median']
+                redshift_data['REDSHIFT_MEAN'] = mc_redshift_result['z_mean']
+                redshift_data['REDSHIFT_1SIGMA'] = f"-{mc_redshift_result['z_1sigma_lower']:.6f},+{mc_redshift_result['z_1sigma_upper']:.6f}"
+                redshift_data['REDSHIFT_2SIGMA'] = f"-{mc_redshift_result['z_2sigma_lower']:.6f},+{mc_redshift_result['z_2sigma_upper']:.6f}"
+                redshift_data['REDSHIFT_3SIGMA'] = f"-{mc_redshift_result['z_3sigma_lower']:.6f},+{mc_redshift_result['z_3sigma_upper']:.6f}"
+                print("[DEBUG] MC redshift parameters added to redshift_data")
+            else:
+                print("[DEBUG] MC redshift result is None - MC parameters NOT added")
+            
             # Get the parent gaussian/voigt fit ID if available
             parent_fit_id = None
-            if self.selected_gaussian:
-                parent_fit_id = self.selected_gaussian.get('fit_id')
-            elif self.selected_voigt:
-                parent_fit_id = self.selected_voigt.get('fit_id')
+            if selected_fit_dict:
+                parent_fit_id = selected_fit_dict.get('fit_id')
             
             # Save to .qsap file and print contents
-            filepath, content = self.qsap_handler.create_redshift_qsap(
-                redshift_data, 
-                self.fits_file,
-                parent_fit_id=parent_fit_id,
-                parent_component_id=self.component_id
-            )
-            
-            # Print the file contents to terminal
-            print("\n" + "="*70)
-            print(f"REDSHIFT SAVED TO: {os.path.basename(filepath)}")
-            print("="*70)
-            print(content)
-            print("="*70 + "\n")
+            try:
+                filepath, content = self.qsap_handler.create_redshift_qsap(
+                    redshift_data, 
+                    self.fits_file,
+                    parent_fit_id=parent_fit_id,
+                    parent_component_id=self.component_id
+                )
+                
+                # Print the file contents to terminal
+                print("\n" + "="*70)
+                print(f"REDSHIFT SAVED TO: {os.path.basename(filepath)}")
+                print("="*70)
+                print(content)
+                print("="*70 + "\n")
+            except Exception as e:
+                print(f"[ERROR] Failed to save redshift file: {e}")
+                import traceback
+                traceback.print_exc()
+                return
             
             # Cleanup highlighting and reset Calculate dropdown
             self._cleanup_redshift_highlighting()
@@ -5092,6 +5890,139 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             print("Exiting redshift estimation mode.")
         else:
             print("No line selected.")
+    
+    def _estimate_redshift_monte_carlo(self, fit_dict, rest_wavelength, n_samples=1000):
+        """Estimate redshift using Monte Carlo error propagation
+        
+        Args:
+            fit_dict: Dictionary with fitted profile parameters and covariance
+            rest_wavelength: Rest wavelength of the emission/absorption line
+            n_samples: Number of MC samples (default 1000)
+            
+        Returns:
+            Dictionary with redshift statistics, or None if calculation fails
+        """
+        try:
+            print("\n" + "="*70)
+            print("[MC-REDSHIFT] *** ENTERING MC REDSHIFT CALCULATION ***")
+            print("="*70)
+            print(f"[MC-REDSHIFT] fit_dict is None: {fit_dict is None}")
+            print(f"[MC-REDSHIFT] fit_dict type: {type(fit_dict)}")
+            
+            if fit_dict:
+                keys = list(fit_dict.keys())
+                print(f"[MC-REDSHIFT] fit_dict.keys(): {keys}")
+                print(f"[MC-REDSHIFT] 'covariance' in fit_dict: {'covariance' in fit_dict}")
+                print(f"[MC-REDSHIFT] 'mean' in fit_dict: {'mean' in fit_dict}")
+                print(f"[MC-REDSHIFT] 'center' in fit_dict: {'center' in fit_dict}")
+            
+            if fit_dict is None or 'covariance' not in fit_dict:
+                print(f"[MC-REDSHIFT] *** RETURNING NONE: fit_dict is None or no covariance ***")
+                print("="*70 + "\n")
+                return None
+            
+            # Get the center parameter and its index in the covariance matrix
+            # For Gaussian: [amplitude, mean, stddev]
+            # For Voigt: [amplitude, center, sigma, gamma]
+            if 'mean' in fit_dict:  # Gaussian
+                center = fit_dict.get('mean')
+                center_idx = 1  # mean is index 1
+                param_names = ['amplitude', 'mean', 'stddev']
+                print(f"[MC-REDSHIFT] Detected Gaussian fit, center={center}")
+            elif 'center' in fit_dict:  # Voigt
+                center = fit_dict.get('center')
+                center_idx = 1  # center is index 1
+                param_names = ['amplitude', 'center', 'sigma', 'gamma']
+                print(f"[MC-REDSHIFT] Detected Voigt fit, center={center}")
+            else:
+                print(f"[MC-REDSHIFT] *** RETURNING NONE: No 'mean' or 'center' found ***")
+                print("="*70 + "\n")
+                return None
+            
+            if center is None:
+                print(f"[MC-REDSHIFT] *** RETURNING NONE: center is None ***")
+                print("="*70 + "\n")
+                return None
+            
+            # Get the covariance matrix
+            cov = fit_dict.get('covariance')
+            print(f"[MC-REDSHIFT] covariance retrieved: {cov is not None}")
+            if cov is None:
+                print(f"[MC-REDSHIFT] *** RETURNING NONE: covariance is None ***")
+                print("="*70 + "\n")
+                return None
+            if isinstance(cov, list):
+                cov = np.array(cov)
+            
+            # We only need the uncertainty in the center parameter
+            # Extract the center variance from the covariance matrix
+            center_var = cov[center_idx, center_idx]
+            print(f"[MC-REDSHIFT] center_var: {center_var}, center_idx: {center_idx}")
+            if center_var <= 0:
+                print(f"[MC-REDSHIFT] *** RETURNING NONE: center_var <= 0 ***")
+                print("="*70 + "\n")
+                return None
+            
+            # Sample centers from the posterior distribution
+            z_samples = []
+            for sample_idx in range(n_samples):
+                # Sample center from univariate normal
+                center_sample = np.random.normal(center, np.sqrt(center_var))
+                
+                # Calculate redshift for this sample
+                z = (center_sample - rest_wavelength) / rest_wavelength
+                z_samples.append(z)
+            
+            z_samples = np.array(z_samples)
+            print(f"[MC-REDSHIFT] Generated {len(z_samples)} samples")
+            
+            # Filter out NaN/inf values (numerical artifacts only)
+            valid_mask = np.isfinite(z_samples)
+            valid_z_samples = z_samples[valid_mask]
+            print(f"[MC-REDSHIFT] Valid samples after filtering: {len(valid_z_samples)}")
+            
+            if len(valid_z_samples) == 0:
+                print(f"[MC-REDSHIFT] *** RETURNING NONE: no valid samples ***")
+                print("="*70 + "\n")
+                return None
+            
+            # Calculate statistics
+            z_best = (center - rest_wavelength) / rest_wavelength
+            z_median = np.percentile(valid_z_samples, 50)
+            z_mean = np.mean(valid_z_samples)
+            
+            # 1-sigma (16th-84th percentile)
+            p16_1 = np.percentile(valid_z_samples, 16)
+            p84_1 = np.percentile(valid_z_samples, 84)
+            
+            # 2-sigma (2.28th-97.72th percentile)
+            p228_2 = np.percentile(valid_z_samples, 2.28)
+            p9772_2 = np.percentile(valid_z_samples, 97.72)
+            
+            # 3-sigma (0.135th-99.865th percentile)
+            p0135_3 = np.percentile(valid_z_samples, 0.135)
+            p99865_3 = np.percentile(valid_z_samples, 99.865)
+            
+            result = {
+                'z_best': z_best,
+                'z_median': z_median,
+                'z_mean': z_mean,
+                'z_1sigma_lower': z_median - p16_1,
+                'z_1sigma_upper': p84_1 - z_median,
+                'z_2sigma_lower': z_median - p228_2,
+                'z_2sigma_upper': p9772_2 - z_median,
+                'z_3sigma_lower': z_median - p0135_3,
+                'z_3sigma_upper': p99865_3 - z_median,
+            }
+            print(f"[MC-REDSHIFT] *** SUCCESS! z_best={result['z_best']:.6f} ***")
+            print("="*70 + "\n")
+            return result
+        except Exception as e:
+            print(f"[MC-REDSHIFT] *** ERROR: {e} ***")
+            import traceback
+            traceback.print_exc()
+            print("="*70 + "\n")
+            return None
     
     def on_fit_info_item_selected(self, item_id):
         """Handle item selection from Fit Information window - sync with item tracker"""
@@ -6091,6 +7022,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             'continuum_regions': deepcopy(self.continuum_regions),
             'continuum_patches': continuum_patches_simplified,
             'listfit_fits': listfit_fits_simplified,
+            'listfit_polynomials': deepcopy(self.listfit_polynomials),
+            'deleted_listfit_polynomials': deepcopy(self.deleted_listfit_polynomials),
             'redshift': self.redshift,
             'fit_id': self.fit_id,
             'component_id': self.component_id,
@@ -6138,12 +7071,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.continuum_regions = deepcopy(state.get('continuum_regions', []))
         self.continuum_patches = state.get('continuum_patches', [])  # Don't deepcopy - will recreate patches below
         self.listfit_fits = deepcopy(state.get('listfit_fits', []))
+        self.listfit_polynomials = deepcopy(state.get('listfit_polynomials', {}))
         self.redshift = state.get('redshift', 0.0)
         self.fit_id = state.get('fit_id', 0)
         self.component_id = state.get('component_id', 0)
         
-        # Clear tracking sets
-        self.deleted_listfit_polynomials.clear()
+        # Clear tracking sets and restore deleted polynomials
+        self.deleted_listfit_polynomials = deepcopy(state.get('deleted_listfit_polynomials', set()))
         
         # Clear item tracker
         self.item_tracker.clear_all()
@@ -6559,81 +7493,120 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             plt.draw()  # Redraw to reflect changes
             print("Plot style toggled:", "Step plot" if self.is_step_plot else "Line plot")
 
-        if event.key == 'v':  # Use 'v' key to calculate equivalent width
+        # COMMENTED OUT: Old 'v' key EW calculation functionality
+        # Replaced with dropdown menu in Options panel and spacebar/right-click selection
+        # If users select a profile via spacebar or right-click context menu,
+        # they can calculate EW for that specific profile.
+        # See: on_calculate_ew_mode_changed() and on_calculate_ew_from_tracker()
+        #
+        # if event.key == 'v':  # Use 'v' key to calculate equivalent width
+        #     if event.xdata is None:
+        #         print("Please click inside the plot area to use this function.")
+        #         return
+        #     x_pos = event.xdata  # Get x position of mouse click
+        #
+        #     # Find the Gaussian fit corresponding to the selected x position
+        #     selected_gaussian = None
+        #     for fit in self.gaussian_fits:
+        #         left_bound, right_bound = fit['bounds']
+        #         if left_bound <= x_pos <= right_bound:
+        #             selected_gaussian = fit
+        #             print(f"Gaussian with parameters amp:{selected_gaussian['amp']}, mean: {selected_gaussian['mean']}, stddev: {selected_gaussian['stddev']} selected.")
+        #             break  # Select only the first Gaussian fit found within the bounds
+        #
+        #     # OR find the Voigt fit corresponding to the selected x position
+        #     selected_voigt = None
+        #     for fit in self.voigt_fits:
+        #         left_bound, right_bound = fit['bounds']
+        #         if left_bound <= x_pos <= right_bound:
+        #             selected_voigt = fit
+        #             print(f"Voigt with parameters amp: {selected_voigt['amp']}, center: {selected_voigt['center']}, sigma: {selected_voigt['sigma']}, gamma: {selected_voigt['gamma']}  selected.")
+        #             break  # Select only the first Gaussian fit found within the bounds
+        #     
+        #     if selected_gaussian or selected_voigt:
+        #         if selected_gaussian:
+        #             # Get Gaussian parameters for the selected fit
+        #             bounds = selected_gaussian['bounds']
+        #             amp = selected_gaussian['amp']
+        #             mean = selected_gaussian['mean']
+        #             stddev = selected_gaussian['stddev']
+        #             
+        #             # Define the Gaussian function based on selected parameters
+        #             gaussian_function = lambda x: self.gaussian(x, amp, mean, stddev)
+        #         if selected_voigt:
+        #             # Get Voigt parameters for the selected fit
+        #             bounds = selected_voigt['bounds']
+        #             amp = selected_voigt['amp']
+        #             center = selected_voigt['center']
+        #             gamma = selected_voigt['gamma']
+        #             sigma = selected_voigt['sigma']
+        #             
+        #             # Define the Voigt function based on selected parameters
+        #             voigt_function = lambda x: self.voigt(x, amp, center, sigma, gamma)
+        #
+        #         # Retrieve the fitted continuum over the Gaussian's bounds
+        #         continuum_within_bounds = self.get_existing_continuum(bounds[0], bounds[1])
+        #
+        #         if continuum_within_bounds is not None:
+        #             # Extract continuum values and parameters from returned data
+        #             _, a, b = continuum_within_bounds
+        #
+        #             # Calculate Equivalent Width
+        #             if selected_gaussian:
+        #                 ew = self.calculate_equivalent_width(gaussian_function, (a, b), bounds)
+        #                 # Plot the filled area between Gaussian and continuum
+        #                 x_fill = np.linspace(bounds[0], bounds[1], 100)
+        #                 y_gaussian = gaussian_function(x_fill)
+        #                 y_continuum = self.continuum_model(x_fill, a, b)
+        #             if selected_voigt:
+        #                 ew = self.calculate_equivalent_width(voigt_function, (a, b), bounds)
+        #                 # Plot the filled area between Gaussian and continuum
+        #                 x_fill = np.linspace(bounds[0], bounds[1], 100)
+        #                 y_gaussian = voigt_function(x_fill)
+        #                 y_continuum = self.continuum_model(x_fill, a, b)
+        #             
+        #             # Remove the previous fill region if it exists
+        #             if self.ew_fill:
+        #                 self.ew_fill.remove()
+        #             
+        #             # Create a new fill region and store its reference
+        #             self.ew_fill = self.ax.fill_between(x_fill, y_gaussian + y_continuum, y_continuum, color='cyan', alpha=0.7)
+        #             plt.draw()  # Redraw plot to show the filled area
+        #         else:
+        #             print("No continuum specified. Unable to calculate EW.")
+        
+        # NEW: 'v' key activates Calculate Equivalent Width selection mode
+        if event.key == 'v':
+            if self.calculate_ew_selection_mode:
+                self.calculate_ew_selection_mode = False
+                print('Exiting Calculate Equivalent Width mode.')
+            else:
+                self.calculate_ew_selection_mode = True
+                print('Calculate Equivalent Width mode: Use spacebar to select a profile, or right-click in Item Tracker to calculate EW.')
+        # If in EW selection mode and spacebar is pressed
+        elif self.calculate_ew_selection_mode and event.key == ' ':
             if event.xdata is None:
-                print("Please click inside the plot area to use this function.")
+                print("Please click inside the plot area to select a profile.")
                 return
-            x_pos = event.xdata  # Get x position of mouse click
-
-            # Find the Gaussian fit corresponding to the selected x position
-            selected_gaussian = None
+            x_pos = event.xdata
+            # Try to find Gaussian at this position
             for fit in self.gaussian_fits:
                 left_bound, right_bound = fit['bounds']
                 if left_bound <= x_pos <= right_bound:
-                    selected_gaussian = fit
-                    print(f"Gaussian with parameters amp:{selected_gaussian['amp']}, mean: {selected_gaussian['mean']}, stddev: {selected_gaussian['stddev']} selected.")
-                    break  # Select only the first Gaussian fit found within the bounds
-
-            # OR find the Voigt fit corresponding to the selected x position
-            selected_voigt = None
+                    # Find the corresponding item_id in item_tracker
+                    for item_id, item_info in self.item_id_map.items():
+                        if item_info.get('fit_dict') == fit and item_info.get('type') == 'gaussian':
+                            self.on_calculate_ew_from_tracker(item_id)
+                            return
+            # Try to find Voigt at this position
             for fit in self.voigt_fits:
                 left_bound, right_bound = fit['bounds']
                 if left_bound <= x_pos <= right_bound:
-                    selected_voigt = fit
-                    print(f"Voigt with parameters amp: {selected_voigt['amp']}, center: {selected_voigt['center']}, sigma: {selected_voigt['sigma']}, gamma: {selected_voigt['gamma']}  selected.")
-                    break  # Select only the first Gaussian fit found within the bounds
-            
-            if selected_gaussian or selected_voigt:
-                if selected_gaussian:
-                    # Get Gaussian parameters for the selected fit
-                    bounds = selected_gaussian['bounds']
-                    amp = selected_gaussian['amp']
-                    mean = selected_gaussian['mean']
-                    stddev = selected_gaussian['stddev']
-                    
-                    # Define the Gaussian function based on selected parameters
-                    gaussian_function = lambda x: self.gaussian(x, amp, mean, stddev)
-                if selected_voigt:
-                    # Get Voigt parameters for the selected fit
-                    bounds = selected_voigt['bounds']
-                    amp = selected_voigt['amp']
-                    center = selected_voigt['center']
-                    gamma = selected_voigt['gamma']
-                    sigma = selected_voigt['sigma']
-                    
-                    # Define the Voigt function based on selected parameters
-                    voigt_function = lambda x: self.voigt(x, amp, center, sigma, gamma)
-
-                # Retrieve the fitted continuum over the Gaussian's bounds
-                continuum_within_bounds = self.get_existing_continuum(bounds[0], bounds[1])
-
-                if continuum_within_bounds is not None:
-                    # Extract continuum values and parameters from returned data
-                    _, a, b = continuum_within_bounds
-
-                    # Calculate Equivalent Width
-                    if selected_gaussian:
-                        ew = self.calculate_equivalent_width(gaussian_function, (a, b), bounds)
-                        # Plot the filled area between Gaussian and continuum
-                        x_fill = np.linspace(bounds[0], bounds[1], 100)
-                        y_gaussian = gaussian_function(x_fill)
-                        y_continuum = self.continuum_model(x_fill, a, b)
-                    if selected_voigt:
-                        ew = self.calculate_equivalent_width(voigt_function, (a, b), bounds)
-                        # Plot the filled area between Gaussian and continuum
-                        x_fill = np.linspace(bounds[0], bounds[1], 100)
-                        y_gaussian = voigt_function(x_fill)
-                        y_continuum = self.continuum_model(x_fill, a, b)
-                    
-                    # Remove the previous fill region if it exists
-                    if self.ew_fill:
-                        self.ew_fill.remove()
-                    
-                    # Create a new fill region and store its reference
-                    self.ew_fill = self.ax.fill_between(x_fill, y_gaussian + y_continuum, y_continuum, color='cyan', alpha=0.7)
-                    plt.draw()  # Redraw plot to show the filled area
-                else:
-                    print("No continuum specified. Unable to calculate EW.")
+                    # Find the corresponding item_id in item_tracker
+                    for item_id, item_info in self.item_id_map.items():
+                        if item_info.get('fit_dict') == fit and item_info.get('type') == 'voigt':
+                            self.on_calculate_ew_from_tracker(item_id)
+                            return
 
         if event.key == 'm':
             if self.continuum_mode:
@@ -6712,7 +7685,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             combined_err = np.array(combined_err) if combined_err else None
 
             # Fit the continuum using the combined data
-            continuum, coeffs, perr = self.fit_continuum(combined_wav, combined_spec, combined_err, poly_order=self.poly_order)
+            continuum, coeffs, perr, pcov = self.fit_continuum(combined_wav, combined_spec, combined_err, poly_order=self.poly_order)
             
             # Print fit parameters
             poly_str = f"Continuum fit (order {self.poly_order}):"
@@ -6739,6 +7712,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 'individual_regions': list(self.continuum_regions),  # Store each region separately
                 'coeffs': coeffs,               # Polynomial coefficients
                 'coeffs_err': perr,             # Coefficient errors
+                'covariance': pcov,             # Full covariance matrix for MC sampling
                 'poly_order': self.poly_order,  # Polynomial order
                 'patches': self.continuum_patches,    # The patches object is for plotting
                 'line': continuum_line,            
@@ -7047,7 +8021,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     'line': fit_line,
                     'rest_wavelength': self.rest_wavelength,
                     'rest_id': self.rest_id,
-                    'z_sys': self.redshift
+                    'z_sys': self.redshift,
+                    'covariance': pcov.tolist()  # Store covariance matrix as list
                     })
                     # Register with ItemTracker
                     position_str = f"λ: {mean:.2f} Å"
@@ -7187,6 +8162,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     y_fit = self.gaussian(x_fit, amp, mean, stddev) + continuum_ys[i // 3]
                     continuum_sub_data = comp_ys[i // 3] - continuum_ys[i // 3]
                     residuals = continuum_sub_data - self.gaussian(x_fit, amp, mean, stddev)
+                    
+                    # Extract this component's covariance from the full covariance matrix
+                    comp_cov_indices = [i, i+1, i+2]
+                    comp_cov = pcov[np.ix_(comp_cov_indices, comp_cov_indices)]
+                    
                     # Calculate chi2 or SSR depending on whether errors are available
                     if sigma_param is not None and i // 3 < len(component_boundaries):
                         start_idx, end_idx = component_boundaries[i // 3]
@@ -7215,7 +8195,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     'line': fit_line,
                     'rest_wavelength': self.rest_wavelength,
                     'rest_id': self.rest_id,
-                    'z_sys': self.redshift
+                    'z_sys': self.redshift,
+                    'covariance': comp_cov.tolist()  # Store covariance matrix as list
                     }
                     self.gaussian_fits.append(gaussian_fit)
                     # Register with ItemTracker
@@ -7528,7 +8509,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     cont_y = existing_continuum
                     print("Using existing continuum for Voigt fit.")
                 else:
-                    overall_continuum, continuum_params, _ = self.fit_continuum(self.x_data, self.spec, self.err)
+                    overall_continuum, continuum_params, _, _ = self.fit_continuum(self.x_data, self.spec, self.err)
                     continuum_subtracted_y = comp_y - overall_continuum
                     cont_y = overall_continuum
                     print("No existing continuum found; fitted new continuum.")
@@ -7791,7 +8772,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     continuum_subtracted_y = comp_y - existing_continuum
                     print("Using existing continuum for Gaussian fit.")
                 else:
-                    overall_continuum, continuum_params, _ = self.fit_continuum(self.x_data, self.spec, self.err)
+                    overall_continuum, continuum_params, _, _ = self.fit_continuum(self.x_data, self.spec, self.err)
                     continuum_subtracted_y = comp_y - overall_continuum
                     print("No existing continuum found; fitted new continuum.")
 
@@ -7970,8 +8951,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                                 self.line_spec.set_visible(False)
                                 self.spectrum_line.set_visible(False)
                                 self.fig.canvas.draw_idle()
-                                self.step_spec, = self.ax.step(self.x_data, self.smoothed_spec, color='black', where='mid')
-                                self.line_spec, = self.ax.plot(self.x_data, self.smoothed_spec, color='black', visible=False)
+                                self.step_spec, = self.ax.step(self.x_data, self.smoothed_spec, color='black', where='mid', zorder=0)
+                                self.line_spec, = self.ax.plot(self.x_data, self.smoothed_spec, color='black', visible=False, zorder=0)
                                 # self.spectrum_line = self.step_spec if self.is_step_plot else self.line_spec
                                 # Make sure to hide the step/line plot
                                 if self.is_step_plot:
@@ -8002,8 +8983,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                             self.line_spec.set_visible(False)
                             self.spectrum_line.set_visible(False)
                             self.fig.canvas.draw_idle()
-                            self.step_spec, = self.ax.step(self.x_data, self.original_spec, color='black', where='mid')
-                            self.line_spec, = self.ax.plot(self.x_data, self.original_spec, color='black', visible=False)
+                            self.step_spec, = self.ax.step(self.x_data, self.original_spec, color='black', where='mid', zorder=0)
+                            self.line_spec, = self.ax.plot(self.x_data, self.original_spec, color='black', visible=False, zorder=0)
                             # self.spectrum_line = self.step_spec if self.is_step_plot else self.line_spec
                             # Make sure to hide the step/line plot
                             if self.is_step_plot:
@@ -8317,24 +9298,30 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # If in redshift estimation mode and spacebar is pressed
         elif self.redshift_estimation_mode and event.key == ' ':
             x_pos = event.xdata
+            # Try to find Gaussian at this position
             for fit in self.gaussian_fits:
                 left_bound, right_bound = fit['bounds']
                 if left_bound <= x_pos <= right_bound:
+                    self.selected_gaussian = fit  # Capture the fit dict
+                    self.selected_voigt = None
                     self.plot_redshift_gaussian(fit)
                     self.center_profile, self.center_profile_err = fit['mean'], fit['mean_err']
                     print(f"Center of selected Gaussian: {self.center_profile:.6f}+-{self.center_profile_err:.6f}")
                     self.open_linelist_window()
-                    break
+                    return
+            # Try to find Voigt at this position
             for fit in self.voigt_fits:
                 left_bound, right_bound = fit['bounds']
                 if left_bound <= x_pos <= right_bound:
+                    self.selected_voigt = fit  # Capture the fit dict
+                    self.selected_gaussian = None
                     self.plot_redshift_voigt(fit)
                     self.center_profile, self.center_profile_err = fit['center'], fit['center_err']
                     if self.center_profile_err is None:
                         raise ValueError(f"Error associated with the center of the Voigt profile is missing for x_pos = {self.center_profile:.6f}.")
                     print(f"Center of selected Voigt: {self.center_profile:.6f}+-{self.center_profile_err:.6f}")
                     self.open_linelist_window()
-                    break
+                    return
         elif event.key == 'z' and self.redshift_estimation_mode:
             self.redshift_estimation_mode = False
             print('Exiting redshift estimation mode.')

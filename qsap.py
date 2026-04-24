@@ -187,7 +187,9 @@ Examples:
     else:
         # Display welcome message with ASCII art
         version = _get_version()
-        title_line = f"WELCOME TO QSAP  v{version}"
+        # Add extra space if version is three characters (x.x format)
+        space_padding = "   " if len(version) == 3 else "  "
+        title_line = f"WELCOME TO QSAP{space_padding}v{version}"
         subtitle_line = "Quick Spectrum Analysis Program"
         welcome_art = f"""
 ╔══════════════════════════════════════════════════════════════╗

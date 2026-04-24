@@ -27,6 +27,7 @@ class ItemTracker(QtWidgets.QWidget):
     item_individually_deselected = pyqtSignal(str)  # Emits item_id when individually deselected from multi-selection
     item_deselected = pyqtSignal()   # Emits when no items are selected
     estimate_redshift = pyqtSignal(str)  # Emits item_id when estimate redshift is selected
+    calculate_ew = pyqtSignal(str)  # Emits item_id when calculate equivalent width is selected
     items_changed = pyqtSignal()  # Emits when items list is updated (added or removed)
     
     def __init__(self):
@@ -137,10 +138,12 @@ class ItemTracker(QtWidgets.QWidget):
         
         menu = QtWidgets.QMenu()
         
-        # Add estimate redshift option for Gaussians and Voigts
+        # Add estimate redshift and calculate EW options for Gaussians and Voigts
         estimate_redshift_action = None
+        calculate_ew_action = None
         if item_type in ['gaussian', 'voigt']:
             estimate_redshift_action = menu.addAction("Estimate Redshift")
+            calculate_ew_action = menu.addAction("Calculate Equivalent Width")
             menu.addSeparator()
         
         delete_action = menu.addAction("Delete")
@@ -150,6 +153,8 @@ class ItemTracker(QtWidgets.QWidget):
             self.delete_selected()
         elif estimate_redshift_action and action == estimate_redshift_action:
             self.estimate_redshift.emit(item_id)
+        elif calculate_ew_action and action == calculate_ew_action:
+            self.calculate_ew.emit(item_id)
     
     def on_selection_changed(self):
         """Handle item selection in the table - only emit for actual changes"""

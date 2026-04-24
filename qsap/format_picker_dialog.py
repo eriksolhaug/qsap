@@ -9,6 +9,8 @@ from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import QHeaderView
 from typing import Optional, Dict, Any, List, Tuple
+import numpy as np
+from pathlib import Path
 
 
 class FormatPickerDialog(QtWidgets.QDialog):
@@ -39,6 +41,10 @@ class FormatPickerDialog(QtWidgets.QDialog):
         self.candidates = candidates
         self.selected_format = None
         self.selected_options = None
+        self.detected_wave_unit = None  # Store detected unit from file
+        
+        # Try to detect wavelength unit from file
+        self._detect_file_wave_unit()
         
         self.setWindowTitle("Select Spectrum Format")
         self.setGeometry(100, 100, 600, 400)
@@ -48,6 +54,37 @@ class FormatPickerDialog(QtWidgets.QDialog):
         self.candidates.sort(key=lambda c: c["score"], reverse=True)
         
         self._init_ui()
+    
+    def _detect_file_wave_unit(self):
+        """Detect wavelength unit from FITS header if available."""
+        from pathlib import Path
+        path = Path(self.filepath)
+        
+        if path.suffix.lower() in (".fits", ".fit", ".fts"):
+            try:
+                from astropy.io import fits
+                with fits.open(path, memmap=True) as hdul:
+                    # Check primary HDU header
+                    if len(hdul) > 0:
+                        header = hdul[0].header
+                        cunit = header.get("CUNIT1", "").upper()
+                        if cunit:
+                            # Map common FITS wavelength units
+                            unit_map = {
+                                "ANGSTROM": "Ångström",
+                                "A": "Ångström",
+                                "NM": "Nanometer",
+                                "NANOMETER": "Nanometer",
+                                "UM": "Micron",
+                                "MICRON": "Micron",
+                                "µM": "Micron",
+                            }
+                            for key, val in unit_map.items():
+                                if key in cunit:
+                                    self.detected_wave_unit = val
+                                    return
+            except Exception:
+                pass
     
     def _init_ui(self):
         """Initialize the user interface."""
@@ -60,6 +97,12 @@ class FormatPickerDialog(QtWidgets.QDialog):
         file_label.setText(f"<b>File:</b> {self.filepath}")
         file_label.setStyleSheet("font-size: 10px;")
         layout.addWidget(file_label)
+        
+        # Detected wavelength unit info (always visible)
+        if self.detected_wave_unit:
+            unit_info_label = QtWidgets.QLabel(f"<i>Detected wavelength unit: <b>{self.detected_wave_unit}</b></i>")
+            unit_info_label.setStyleSheet("color: #666666; font-size: 9px;")
+            layout.addWidget(unit_info_label)
         
         # Format list label
         list_label = QtWidgets.QLabel("Detected formats:")
@@ -129,28 +172,7 @@ class FormatPickerDialog(QtWidgets.QDialog):
         self.col_err.setPlaceholderText("blank for none")
         ascii_layout.addWidget(self.col_err, 4, 1)
         
-        # Wavelength unit selection
-        ascii_layout.addWidget(QtWidgets.QLabel("Wavelength units:"), 5, 0)
-        
-        # Radio buttons for unit selection
-        unit_group = QtWidgets.QGroupBox()
-        unit_layout = QtWidgets.QHBoxLayout()
-        
-        self.unit_angstrom = QtWidgets.QRadioButton("Ångström (Å)")
-        self.unit_angstrom.setChecked(True)
-        unit_layout.addWidget(self.unit_angstrom)
-        
-        self.unit_nanometer = QtWidgets.QRadioButton("Nanometer (nm)")
-        unit_layout.addWidget(self.unit_nanometer)
-        
-        self.unit_micron = QtWidgets.QRadioButton("Micron (μm)")
-        unit_layout.addWidget(self.unit_micron)
-        
-        unit_layout.addStretch()
-        unit_group.setLayout(unit_layout)
-        ascii_layout.addWidget(unit_group, 5, 1, 1, 2)
-        
-        ascii_layout.addItem(QtWidgets.QSpacerItem(0, 0), 6, 0, 1, 3)
+        ascii_layout.addItem(QtWidgets.QSpacerItem(0, 0), 5, 0, 1, 3)
         ascii_group.setLayout(ascii_layout)
         layout.addWidget(ascii_group, 0)
         
@@ -186,6 +208,115 @@ class FormatPickerDialog(QtWidgets.QDialog):
         scaling_group.setLayout(scaling_layout)
         layout.addWidget(scaling_group)
         
+        # Replace Values Group
+        replace_values_group = QtWidgets.QGroupBox("Replace Values (NaN/Inf)")
+        replace_values_layout = QtWidgets.QGridLayout()
+        
+        # Status label (will be updated dynamically)
+        self.replace_values_status = QtWidgets.QLabel("Checking for NaN/Inf values...")
+        self.replace_values_status.setStyleSheet("color: #666; font-size: 10px;")
+        replace_values_layout.addWidget(self.replace_values_status, 0, 0, 1, 2)
+        
+        # Replacement value input (hidden by default)
+        replace_label = QtWidgets.QLabel("Replace with value:")
+        replace_values_layout.addWidget(replace_label, 1, 0)
+        
+        self.replace_values_input = QtWidgets.QLineEdit()
+        self.replace_values_input.setPlaceholderText("0.0")
+        self.replace_values_input.setText("0.0")
+        self.replace_values_input.setMaximumWidth(100)
+        replace_values_layout.addWidget(self.replace_values_input, 1, 1)
+        
+        # Initially hide the input
+        replace_label.hide()
+        self.replace_values_input.hide()
+        
+        self.replace_values_label = replace_label
+        
+        replace_values_layout.addItem(QtWidgets.QSpacerItem(0, 0), 2, 0, 1, 2)
+        replace_values_group.setLayout(replace_values_layout)
+        layout.addWidget(replace_values_group)
+        
+        self.replace_values_group = replace_values_group
+        
+        # Wavelength Unit Selection Group (always visible for all formats)
+        unit_group = QtWidgets.QGroupBox("Wavelength Units")
+        unit_layout = QtWidgets.QVBoxLayout()
+        
+        # Radio buttons in a horizontal layout
+        radio_layout = QtWidgets.QHBoxLayout()
+        
+        self.unit_angstrom = QtWidgets.QRadioButton("Ångström (Å)")
+        self.unit_angstrom.setChecked(True)
+        radio_layout.addWidget(self.unit_angstrom)
+        
+        self.unit_nanometer = QtWidgets.QRadioButton("Nanometer (nm)")
+        radio_layout.addWidget(self.unit_nanometer)
+        
+        self.unit_micron = QtWidgets.QRadioButton("Micron (μm)")
+        radio_layout.addWidget(self.unit_micron)
+        
+        radio_layout.addStretch()
+        unit_layout.addLayout(radio_layout)
+        
+        # Add detected unit label (small gray text)
+        if self.detected_wave_unit:
+            detected_label = QtWidgets.QLabel(f"File contains: {self.detected_wave_unit}")
+            detected_label.setStyleSheet("color: gray; font-size: 9px;")
+            unit_layout.addWidget(detected_label)
+            
+            # Pre-select the radio button based on detected unit
+            if self.detected_wave_unit == "Ångström":
+                self.unit_angstrom.setChecked(True)
+            elif self.detected_wave_unit == "Nanometer":
+                self.unit_nanometer.setChecked(True)
+            elif self.detected_wave_unit == "Micron":
+                self.unit_micron.setChecked(True)
+        else:
+            # Show message that unit was not detected
+            not_detected_label = QtWidgets.QLabel("File wavelength unit not detected, using Ångström")
+            not_detected_label.setStyleSheet("color: gray; font-size: 9px;")
+            unit_layout.addWidget(not_detected_label)
+        
+        unit_layout.addItem(QtWidgets.QSpacerItem(0, 0))
+        unit_group.setLayout(unit_layout)
+        layout.addWidget(unit_group)
+        
+        # Wavelength Conversion Group
+        wav_group = QtWidgets.QGroupBox("Wavelength Conversion")
+        wav_layout = QtWidgets.QVBoxLayout()
+        
+        conversion_button_layout = QtWidgets.QHBoxLayout()
+        
+        self.wav_none = QtWidgets.QRadioButton("No conversion")
+        self.wav_none.setChecked(True)
+        conversion_button_layout.addWidget(self.wav_none)
+        
+        self.wav_air_to_vac = QtWidgets.QRadioButton("Air → Vacuum (Å)")
+        conversion_button_layout.addWidget(self.wav_air_to_vac)
+        
+        self.wav_vac_to_air = QtWidgets.QRadioButton("Vacuum → Air (Å)")
+        conversion_button_layout.addWidget(self.wav_vac_to_air)
+        
+        conversion_button_layout.addStretch()
+        wav_layout.addLayout(conversion_button_layout)
+        
+        # Citation for the conversion formula
+        citation_label = QtWidgets.QLabel(
+            "Source: Donald Morton (2000, ApJ. Suppl., 130, 403)\n"
+            "https://www.astro.uu.se/valdwiki/Air-to-vacuum%20conversion"
+        )
+        citation_label.setStyleSheet("color: gray; font-size: 9px;")
+        citation_label.setOpenExternalLinks(True)
+        wav_layout.addWidget(citation_label)
+        
+        wav_layout.addItem(QtWidgets.QSpacerItem(0, 0))
+        wav_group.setLayout(wav_layout)
+        layout.addWidget(wav_group)
+        
+        # Trigger initial format selection check AFTER all UI elements are created
+        self._on_format_selected()
+        
         # Buttons
         button_layout = QtWidgets.QHBoxLayout()
         button_layout.addStretch()
@@ -209,6 +340,8 @@ class FormatPickerDialog(QtWidgets.QDialog):
         """Handle format selection from list."""
         self._update_ascii_visibility()
         self._update_columns_display()
+        self._check_and_auto_scale_spectrum()
+        self._check_for_nan_inf()
     
     def _update_columns_display(self):
         """Update the columns table based on selected format."""
@@ -310,6 +443,20 @@ class FormatPickerDialog(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.warning(self, "Error", "Scaling factor must be a number (e.g., 1.0, 1e17)")
                 return
         
+        # Handle NaN/Inf replacement value
+        if self.replace_values_input.isVisible():
+            replace_text = self.replace_values_input.text().strip()
+            if replace_text:
+                try:
+                    replace_value = float(replace_text)
+                    options["replace_nan_inf"] = replace_value
+                except ValueError:
+                    QtWidgets.QMessageBox.warning(self, "Error", "Replacement value must be a number (e.g., 0.0, -999.0)")
+                    return
+            else:
+                # If input is visible but empty, use default
+                options["replace_nan_inf"] = 0.0
+        
         # Handle ASCII options if needed
         if fmt.startswith("ascii:"):
             delim = self.delim_input.text().strip()
@@ -343,9 +490,200 @@ class FormatPickerDialog(QtWidgets.QDialog):
             # Force flexible reader if user edited mapping
             fmt = "ascii:flex"
         
+        # Handle wavelength conversion option
+        if self.wav_air_to_vac.isChecked():
+            options["wav_conversion"] = "air_to_vac"
+        elif self.wav_vac_to_air.isChecked():
+            options["wav_conversion"] = "vac_to_air"
+        # else: no conversion (default)
+        
+        # Handle wavelength unit for ALL formats (not just ASCII)
+        if self.unit_angstrom.isChecked():
+            options["wave_unit"] = "angstrom"
+        elif self.unit_nanometer.isChecked():
+            options["wave_unit"] = "nanometer"
+        elif self.unit_micron.isChecked():
+            options["wave_unit"] = "micron"
+        
         self.selected_format = fmt
         self.selected_options = options
         self.accept()
+    
+    def _check_and_auto_scale_spectrum(self):
+        """
+        Load a preview of the spectrum and auto-set scaling factor based on median flux.
+        
+        Process:
+        1. Iteratively reject 1-sigma outliers until convergence
+        2. If cleaned median is in range (0, 1e-6), calculate nearest 1eXX scaling factor
+        """
+        try:
+            if self.format_list.currentRow() < 0:
+                return
+            
+            current_idx = self.format_list.currentRow()
+            candidate = self.candidates[current_idx]
+            fmt_key = candidate["key"]
+            options = dict(candidate.get("options", {}))
+            
+            # Get current user selections
+            if fmt_key.startswith("ascii:"):
+                delim = self.delim_input.text().strip()
+                if delim == "":
+                    delim = options.get("delimiter", "\t")
+                
+                try:
+                    wave_col = self.col_wave.value()
+                    flux_col = self.col_flux.value()
+                    err_str = self.col_err.text().strip()
+                    err_col = int(err_str) if err_str else None
+                except ValueError:
+                    return
+                
+                options.update({
+                    "delimiter": delim,
+                    "colmap": {"wave": wave_col, "flux": flux_col, "err": err_col},
+                })
+                fmt_key = "ascii:flex"
+            
+            # Try to load spectrum preview
+            flux_data = self._load_spectrum_preview(self.filepath, fmt_key, options)
+            if flux_data is None or len(flux_data) == 0:
+                return
+            
+            # Get valid finite flux values
+            flux_valid = flux_data[np.isfinite(flux_data)]
+            if len(flux_valid) == 0:
+                return
+            
+            # Take absolute value
+            flux_abs = np.abs(flux_valid)
+            
+            # Iteratively reject 1-sigma outliers until convergence
+            flux_cleaned = flux_abs.copy()
+            prev_count = len(flux_cleaned)
+            
+            while True:
+                mean_flux = np.mean(flux_cleaned)
+                std_flux = np.std(flux_cleaned)
+                
+                # Mask for values within mean ± 1*std
+                one_sigma_mask = np.abs(flux_cleaned - mean_flux) <= std_flux
+                flux_cleaned = flux_cleaned[one_sigma_mask]
+                
+                # Check for convergence (no more values rejected)
+                if len(flux_cleaned) == prev_count:
+                    break
+                
+                prev_count = len(flux_cleaned)
+            
+            if len(flux_cleaned) == 0:
+                return
+            
+            # Calculate median of converged data
+            median_flux = np.median(flux_cleaned)
+            
+            # Check if scaling is needed: 0 < median < 1e-6
+            if median_flux > 0 and median_flux < 1e-6:
+                # Calculate power of 10 to bring median to ~1
+                # scaling_factor = 10^x where x makes median * 10^x ≈ 1
+                # So x ≈ -log10(median)
+                power_of_ten = -np.floor(np.log10(median_flux))
+                scaling_factor = f"1e{int(power_of_ten)}"
+                
+                self.scaling_input.setText(scaling_factor)
+                scaled_median = median_flux * (10 ** power_of_ten)
+                print(f"[Spectrum Loader] Median flux = {median_flux:.2e} (1σ-iterative), "
+                      f"scaling to {scaling_factor} → median becomes {scaled_median:.2f}")
+        
+        except Exception as e:
+            # Silently ignore errors during preview - don't interrupt user workflow
+            print(f"[Spectrum Loader] Preview calculation skipped: {e}")
+    
+    def _load_spectrum_preview(self, filepath: str, fmt: str, options: Dict[str, Any]) -> Optional[np.ndarray]:
+        """
+        Load a preview of spectrum flux data (first 1000 rows).
+        
+        Returns
+        -------
+        np.ndarray or None
+            Flux array if successful, None if failed
+        """
+        from qsap.spectrum_io import SpectrumIO
+        
+        try:
+            # Load spectrum using SpectrumIO
+            wav, spec, err, meta = SpectrumIO.read_spectrum(filepath, fmt=fmt, options=options)
+            return spec
+        except Exception as e:
+            print(f"[Spectrum Loader] Could not load preview: {e}")
+            return None
+    
+    def _check_for_nan_inf(self):
+        """
+        Check if loaded spectrum contains NaN or Inf values.
+        Update UI to show replacement controls if values exist.
+        """
+        try:
+            if self.format_list.currentRow() < 0:
+                return
+            
+            current_idx = self.format_list.currentRow()
+            candidate = self.candidates[current_idx]
+            fmt_key = candidate["key"]
+            options = dict(candidate.get("options", {}))
+            
+            # Get current user selections for ASCII formats
+            if fmt_key.startswith("ascii:"):
+                delim = self.delim_input.text().strip()
+                if delim == "":
+                    delim = options.get("delimiter", "\t")
+                
+                try:
+                    wave_col = self.col_wave.value()
+                    flux_col = self.col_flux.value()
+                    err_str = self.col_err.text().strip()
+                    err_col = int(err_str) if err_str else None
+                except ValueError:
+                    return
+                
+                options.update({
+                    "delimiter": delim,
+                    "colmap": {"wave": wave_col, "flux": flux_col, "err": err_col},
+                })
+                fmt_key = "ascii:flex"
+            
+            # Load spectrum preview
+            flux_data = self._load_spectrum_preview(self.filepath, fmt_key, options)
+            if flux_data is None:
+                self.replace_values_status.setText("Unable to preview spectrum for NaN/Inf check")
+                self.replace_values_label.hide()
+                self.replace_values_input.hide()
+                return
+            
+            # Check for NaN and Inf values
+            nan_count = np.isnan(flux_data).sum()
+            inf_count = np.isinf(flux_data).sum()
+            total_bad = nan_count + inf_count
+            
+            if total_bad > 0:
+                # Show message and input field
+                msg = f"Found {total_bad} bad values: {nan_count} NaN, {inf_count} Inf"
+                self.replace_values_status.setText(msg)
+                self.replace_values_label.show()
+                self.replace_values_input.show()
+            else:
+                # No bad values
+                self.replace_values_status.setText("No NaN/Inf values detected ✓")
+                self.replace_values_label.hide()
+                self.replace_values_input.hide()
+        
+        except Exception as e:
+            # Silently ignore errors during check
+            print(f"[Spectrum Loader] NaN/Inf check skipped: {e}")
+            self.replace_values_status.setText("Unable to check for NaN/Inf values")
+            self.replace_values_label.hide()
+            self.replace_values_input.hide()
     
     def get_selection(self) -> Optional[Tuple[str, Dict[str, Any]]]:
         """

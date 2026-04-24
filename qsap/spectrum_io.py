@@ -134,6 +134,11 @@ class SpectrumIO:
             Forced format key. If None, auto-detects
         options : dict, optional
             Reader options (delimiter, colmap, hdu, etc.)
+            Special options:
+            - replace_nan_inf : float
+              Replace NaN and Inf values with this value (e.g., 0.0)
+            - wav_conversion : str
+              Wavelength conversion: "air_to_vac", "vac_to_air", or None
             
         Returns
         -------
@@ -167,13 +172,13 @@ class SpectrumIO:
         
         # Dispatch to readers
         if fmt == "ascii:2col":
-            return SpectrumIO._read_ascii(filepath, delimiter=options.get("delimiter"),
+            wav, spec, err, meta = SpectrumIO._read_ascii(filepath, delimiter=options.get("delimiter"),
                                          colmap={"wave": 0, "flux": 1, "err": None},
                                          units=options.get("units"),
                                          wave_unit=options.get("wave_unit", 1.0))
         
         elif fmt == "ascii:3col":
-            return SpectrumIO._read_ascii(filepath, delimiter=options.get("delimiter"),
+            wav, spec, err, meta = SpectrumIO._read_ascii(filepath, delimiter=options.get("delimiter"),
                                          colmap={"wave": 0, "flux": 1, "err": 2},
                                          units=options.get("units"),
                                          wave_unit=options.get("wave_unit", 1.0))
@@ -184,15 +189,15 @@ class SpectrumIO:
             delim = options.get("delimiter")
             if delim is None:
                 delim, _ = SpectrumIO._peek_ascii_layout(filepath)
-            return SpectrumIO._read_ascii(filepath, delimiter=delim,
+            wav, spec, err, meta = SpectrumIO._read_ascii(filepath, delimiter=delim,
                                          colmap=cm, units=options.get("units"),
                                          wave_unit=options.get("wave_unit", 1.0))
         
         elif fmt == "fits:image1d":
-            return SpectrumIO._read_fits_image1d(filepath, hdu=options.get("hdu", 0))
+            wav, spec, err, meta = SpectrumIO._read_fits_image1d(filepath, hdu=options.get("hdu", 0))
         
         elif fmt == "fits:table:vector":
-            return SpectrumIO._read_fits_table_vector(
+            wav, spec, err, meta = SpectrumIO._read_fits_table_vector(
                 filepath,
                 hdu=options.get("hdu", 1),
                 wave_cols=options.get("wave_cols", ["WAVE", "wave", "lambda"]),
@@ -203,7 +208,7 @@ class SpectrumIO:
             )
         
         elif fmt == "fits:table:columns":
-            return SpectrumIO._read_fits_table_columns(
+            wav, spec, err, meta = SpectrumIO._read_fits_table_columns(
                 filepath,
                 hdu=options.get("hdu", 1),
                 wave_cols=options.get("wave_cols", ["WAVE", "wave", "lambda"]),
@@ -213,11 +218,44 @@ class SpectrumIO:
             )
         
         elif fmt == "fits:ext:spectrum":
-            return SpectrumIO._read_fits_named_spectrum(filepath, 
+            wav, spec, err, meta = SpectrumIO._read_fits_named_spectrum(filepath, 
                                                        extname=options.get("extname", "SPECTRUM"))
         
         else:
             raise ValueError(f"Unsupported format key: {fmt}")
+        
+        # Apply NaN/Inf replacement if requested
+        if "replace_nan_inf" in options:
+            replace_value = options["replace_nan_inf"]
+            spec, err = SpectrumIO._replace_nan_inf(spec, err, replace_value)
+        
+        # Apply wavelength conversion if requested
+        if "wav_conversion" in options and options["wav_conversion"]:
+            conversion = options["wav_conversion"]
+            if conversion == "air_to_vac":
+                wav = SpectrumIO.air_to_vacuum(wav)
+                print(f"[Spectrum I/O] Converted wavelengths from air to vacuum")
+            elif conversion == "vac_to_air":
+                wav = SpectrumIO.vac_to_air(wav)
+                print(f"[Spectrum I/O] Converted wavelengths from vacuum to air")
+        
+        # Store display wavelength unit in metadata (for display only, do NOT convert values)
+        # Internal wavelengths remain in Angstrom for all calculations
+        wave_unit_input = options.get("wave_unit")
+        if wave_unit_input:
+            wave_unit_lower = wave_unit_input.lower()
+            if wave_unit_lower == "nanometer":
+                meta["wave_unit"] = "nm"
+            elif wave_unit_lower == "micron":
+                meta["wave_unit"] = "µm"
+            else:
+                meta["wave_unit"] = "Å"
+        else:
+            # Default to Angstrom if not specified
+            if "wave_unit" not in meta:
+                meta["wave_unit"] = "Å"
+        
+        return wav, spec, err, meta
     
     # ===== ASCII readers =====
     
@@ -273,6 +311,96 @@ class SpectrumIO:
                 best_delim = delim
         
         return (best_delim, best_ncol)
+    
+    @staticmethod
+    def _replace_nan_inf(flux: np.ndarray, err: Optional[np.ndarray], 
+                        replace_value: float) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        Replace NaN and Inf values in flux and error arrays.
+        
+        Parameters
+        ----------
+        flux : np.ndarray
+            Flux array
+        err : np.ndarray or None
+            Error/uncertainty array
+        replace_value : float
+            Value to replace NaN/Inf with
+        
+        Returns
+        -------
+        tuple of (np.ndarray, np.ndarray or None)
+            Modified flux and error arrays
+        """
+        # Replace NaN and Inf in flux
+        flux = np.asarray(flux, dtype=float)
+        bad_mask = ~np.isfinite(flux)
+        num_replaced = bad_mask.sum()
+        
+        if num_replaced > 0:
+            flux[bad_mask] = replace_value
+            print(f"[Spectrum I/O] Replaced {num_replaced} NaN/Inf values in flux with {replace_value}")
+        
+        # Replace NaN and Inf in error array if present
+        if err is not None:
+            err = np.asarray(err, dtype=float)
+            bad_mask_err = ~np.isfinite(err)
+            num_replaced_err = bad_mask_err.sum()
+            
+            if num_replaced_err > 0:
+                err[bad_mask_err] = replace_value
+                print(f"[Spectrum I/O] Replaced {num_replaced_err} NaN/Inf values in error with {replace_value}")
+        
+        return flux, err
+    
+    @staticmethod
+    def air_to_vacuum(wav_air: np.ndarray) -> np.ndarray:
+        """
+        Convert air wavelengths to vacuum wavelengths.
+        
+        Uses the conversion formula from Donald Morton (2000, ApJ. Suppl., 130, 403)
+        See: https://www.astro.uu.se/valdwiki/Air-to-vacuum%20conversion
+        
+        Parameters
+        ----------
+        wav_air : np.ndarray
+            Wavelengths in air (Angstroms)
+        
+        Returns
+        -------
+        np.ndarray
+            Wavelengths in vacuum (Angstroms)
+        """
+        s2 = (1e4 / wav_air) ** 2
+        n = (1.0 + 0.00008336624212083 + 0.02408926869968 / (130.1065924522 - s2) 
+             + 0.0001599740894897 / (38.92568793293 - s2))
+        wav_vac = wav_air * n
+        return wav_vac
+    
+    @staticmethod
+    def vac_to_air(wav_vac: np.ndarray) -> np.ndarray:
+        """
+        Convert vacuum wavelengths to air wavelengths.
+        
+        Inverse of air_to_vacuum using iterative method.
+        
+        Parameters
+        ----------
+        wav_vac : np.ndarray
+            Wavelengths in vacuum (Angstroms)
+        
+        Returns
+        -------
+        np.ndarray
+            Wavelengths in air (Angstroms)
+        """
+        # Iterative method to invert the air_to_vacuum conversion
+        wav_air = wav_vac / 1.0001  # Initial guess
+        for _ in range(5):  # Usually converges in 2-3 iterations
+            wav_air = wav_vac / SpectrumIO.air_to_vacuum(wav_air) * wav_air
+        return wav_air
+    
+    # ===== ASCII readers =====
     
     @staticmethod
     def _read_ascii(path: Path, delimiter: Optional[str],

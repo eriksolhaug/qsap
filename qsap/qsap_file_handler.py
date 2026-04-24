@@ -8,12 +8,13 @@ in a human-readable, structured text format.
 import os
 from datetime import datetime
 import json
+import numpy as np
 
 
 class QSAPFileHandler:
     """Manages .qsap file creation and parsing for unified fit storage"""
     
-    FILE_FORMAT_VERSION = "1.0"
+    FILE_FORMAT_VERSION = "1.1"
     
     def __init__(self, save_directory=None):
         self.save_directory = save_directory or os.path.expanduser("~/QSAP_fits")
@@ -172,7 +173,7 @@ class QSAPFileHandler:
         filepath = self.generate_filename('Redshift', 'Single', spectrum_filename)
         
         content = "[METADATA]\n"
-        content += f"FILE_FORMAT_VERSION=1.0\n"
+        content += f"FILE_FORMAT_VERSION=1.1\n"
         content += f"TYPE=Redshift\n"
         content += f"SPECTRUM_FILE={os.path.basename(spectrum_filename)}\n"
         if parent_fit_id:
@@ -182,10 +183,129 @@ class QSAPFileHandler:
         content += f"DATE_TIME={datetime.now().isoformat()}\n"
         content += "\n" + "[REDSHIFT_DATA]\n"
         
-        # Add redshift parameters
+        # Define the order of keys for consistent output
+        # Basic parameters first
+        basic_keys = ['REDSHIFT', 'LINE_ID', 'LINE_WAVELENGTH_REST', 'LINE_WAVELENGTH_OBSERVED', 
+                      'LINE_WAVELENGTH_OBSERVED_ERR', 'RADIAL_VELOCITY', 'HELIOCENTRIC_VELOCITY', 
+                      'SYSTEMIC_VELOCITY', 'ERROR_REDSHIFT', 'ERROR_VELOCITY', 'METHOD']
+        # MC parameters (will be present if MC method was used)
+        mc_keys = ['REDSHIFT_BEST', 'REDSHIFT_MEDIAN', 'REDSHIFT_MEAN', 
+                   'REDSHIFT_1SIGMA', 'REDSHIFT_2SIGMA', 'REDSHIFT_3SIGMA']
+        
+        # Write basic parameters first
+        for key in basic_keys:
+            if key.lower() in redshift_data or key in redshift_data:
+                # Handle both lowercase and uppercase keys
+                actual_key = key.lower() if key.lower() in redshift_data else key
+                value = redshift_data[actual_key]
+                content += f"{key}={self._format_value(value)}\n"
+        
+        # Then write MC parameters if present
+        for key in mc_keys:
+            if key.lower() in redshift_data or key in redshift_data:
+                actual_key = key.lower() if key.lower() in redshift_data else key
+                value = redshift_data[actual_key]
+                content += f"{key}={self._format_value(value)}\n"
+        
+        # Write any remaining keys not in the predefined lists
         for key, value in redshift_data.items():
-            if key != 'type':  # Skip type indicator
-                content += f"{key.upper()}={self._format_value(value)}\n"
+            if key.upper() not in basic_keys and key.upper() not in mc_keys:
+                if key != 'type':  # Skip type indicator
+                    content += f"{key.upper()}={self._format_value(value)}\n"
+        
+        with open(filepath, 'w') as f:
+            f.write(content)
+        
+        return filepath, content
+    
+    def create_equivalent_width_qsap(self, ew_result, fit_dict, fit_type, spectrum_filename, spectrum_info=None):
+        """Create a .qsap file for Equivalent Width calculation results
+        
+        Args:
+            ew_result: Dict with EW calculation results from _calculate_equivalent_width_monte_carlo
+            fit_dict: Dict with fitted profile parameters
+            fit_type: 'Gaussian' or 'Voigt'
+            spectrum_filename: Path to spectrum file
+            spectrum_info: Dict with spectrum metadata
+            
+        Returns:
+            Path to created file, content as string
+        """
+        filepath = self.generate_filename('EquivalentWidth', 'Single', spectrum_filename)
+        
+        content = "[METADATA]\n"
+        content += f"FILE_FORMAT_VERSION={self.FILE_FORMAT_VERSION}\n"
+        content += f"TYPE=EquivalentWidth\n"
+        content += f"PROFILE_TYPE={fit_type}\n"
+        content += f"SPECTRUM_FILE={os.path.basename(spectrum_filename)}\n"
+        content += f"DATE_TIME={datetime.now().isoformat()}\n"
+        
+        if spectrum_info:
+            if 'wavelength_unit' in spectrum_info:
+                content += f"WAVELENGTH_UNIT={spectrum_info['wavelength_unit']}\n"
+            if 'wavelength_range' in spectrum_info:
+                wav_range = spectrum_info['wavelength_range']
+                content += f"WAVELENGTH_RANGE={wav_range[0]:.4f}-{wav_range[1]:.4f}\n"
+        
+        content += "\n[EQUIVALENT_WIDTH]\n"
+        
+        # EW results in CAPS with separate lines for credible intervals
+        if 'ew_best' in ew_result:
+            content += f"EQUIVALENT_WIDTH_BEST={ew_result['ew_best']:.6f}\n"
+        if 'ew_median' in ew_result:
+            content += f"EQUIVALENT_WIDTH_MEDIAN={ew_result['ew_median']:.6f}\n"
+        if 'ew_mean' in ew_result:
+            content += f"EQUIVALENT_WIDTH_MEAN={ew_result['ew_mean']:.6f}\n"
+        
+        # Credible intervals on separate lines
+        if 'ew_1sigma_lower' in ew_result and 'ew_1sigma_upper' in ew_result:
+            lower = ew_result['ew_1sigma_lower']
+            upper = ew_result['ew_1sigma_upper']
+            content += f"EQUIVALENT_WIDTH_1SIGMA=-{abs(lower):.6f},+{upper:.6f}\n"
+        
+        if 'ew_2sigma_lower' in ew_result and 'ew_2sigma_upper' in ew_result:
+            lower = ew_result['ew_2sigma_lower']
+            upper = ew_result['ew_2sigma_upper']
+            content += f"EQUIVALENT_WIDTH_2SIGMA=-{abs(lower):.6f},+{upper:.6f}\n"
+        
+        if 'ew_3sigma_lower' in ew_result and 'ew_3sigma_upper' in ew_result:
+            lower = ew_result['ew_3sigma_lower']
+            upper = ew_result['ew_3sigma_upper']
+            content += f"EQUIVALENT_WIDTH_3SIGMA=-{abs(lower):.6f},+{upper:.6f}\n"
+        
+        # Profile parameters that were used for calculation
+        content += "\n[PROFILE_PARAMETERS]\n"
+        fit_type_lower = fit_type.lower()
+        
+        if fit_type_lower == 'gaussian':
+            if 'amp' in fit_dict:
+                content += f"AMPLITUDE={fit_dict['amp']:.6f}\n"
+            if 'mean' in fit_dict:
+                content += f"MEAN={fit_dict['mean']:.6f}\n"
+            if 'stddev' in fit_dict:
+                content += f"STDDEV={fit_dict['stddev']:.6f}\n"
+            if 'bounds' in fit_dict:
+                content += f"BOUNDS={fit_dict['bounds'][0]:.6f}-{fit_dict['bounds'][1]:.6f}\n"
+        elif fit_type_lower == 'voigt':
+            if 'amplitude' in fit_dict:
+                content += f"AMPLITUDE={fit_dict['amplitude']:.6f}\n"
+            if 'center' in fit_dict:
+                content += f"CENTER={fit_dict['center']:.6f}\n"
+            elif 'mean' in fit_dict:
+                content += f"CENTER={fit_dict['mean']:.6f}\n"
+            if 'sigma' in fit_dict:
+                content += f"SIGMA={fit_dict['sigma']:.6f}\n"
+            if 'gamma' in fit_dict:
+                content += f"GAMMA={fit_dict['gamma']:.6f}\n"
+            if 'bounds' in fit_dict:
+                content += f"BOUNDS={fit_dict['bounds'][0]:.6f}-{fit_dict['bounds'][1]:.6f}\n"
+        
+        # Quality metrics if available
+        if fit_dict.get('chi2') is not None:
+            content += f"\n[FIT_QUALITY]\n"
+            content += f"CHI_SQUARED={fit_dict.get('chi2'):.6f}\n"
+            if fit_dict.get('chi2_nu'):
+                content += f"CHI_SQUARED_NU={fit_dict.get('chi2_nu'):.6f}\n"
         
         with open(filepath, 'w') as f:
             f.write(content)
@@ -271,9 +391,42 @@ class QSAPFileHandler:
             else:
                 content += f"SSR_NU={fit['chi2_nu']}\n"  # SSR per degree of freedom
         
-        # Equivalent width (if calculated)
+        # Equivalent width (if calculated) - Gaussian component
         if 'equivalent_width' in fit:
-            content += f"EQUIVALENT_WIDTH={self._format_param(fit.get('equivalent_width'), fit.get('equivalent_width_err'))}\n"
+            ew = fit.get('equivalent_width')
+            # Check if we have Monte Carlo credible intervals with best/median/mean
+            if ('ew_best' in fit and 'ew_median' in fit and 'ew_mean' in fit and
+                'equivalent_width_1sigma_lower' in fit and 
+                'equivalent_width_1sigma_upper' in fit):
+                # New format with best, median, mean, and credible intervals on separate lines
+                ew_best = fit.get('ew_best')
+                ew_median = fit.get('ew_median')
+                ew_mean = fit.get('ew_mean')
+                ew_1s_lower = fit.get('equivalent_width_1sigma_lower')
+                ew_1s_upper = fit.get('equivalent_width_1sigma_upper')
+                ew_2s_lower = fit.get('equivalent_width_2sigma_lower')
+                ew_2s_upper = fit.get('equivalent_width_2sigma_upper')
+                ew_3s_lower = fit.get('equivalent_width_3sigma_lower')
+                ew_3s_upper = fit.get('equivalent_width_3sigma_upper')
+                content += f"EQUIVALENT_WIDTH_BEST={ew_best:.6f}\n"
+                content += f"EQUIVALENT_WIDTH_MEDIAN={ew_median:.6f}\n"
+                content += f"EQUIVALENT_WIDTH_MEAN={ew_mean:.6f}\n"
+                content += f"EQUIVALENT_WIDTH_1SIGMA=-{abs(ew_1s_lower):.6f},+{ew_1s_upper:.6f}\n"
+                content += f"EQUIVALENT_WIDTH_2SIGMA=-{abs(ew_2s_lower):.6f},+{ew_2s_upper:.6f}\n"
+                content += f"EQUIVALENT_WIDTH_3SIGMA=-{abs(ew_3s_lower):.6f},+{ew_3s_upper:.6f}\n"
+            elif ('equivalent_width_1sigma_lower' in fit and 
+                'equivalent_width_1sigma_upper' in fit):
+                # Old format with only credible intervals (backward compatible)
+                ew_1s_lower = fit.get('equivalent_width_1sigma_lower')
+                ew_1s_upper = fit.get('equivalent_width_1sigma_upper')
+                ew_2s_lower = fit.get('equivalent_width_2sigma_lower')
+                ew_2s_upper = fit.get('equivalent_width_2sigma_upper')
+                ew_3s_lower = fit.get('equivalent_width_3sigma_lower')
+                ew_3s_upper = fit.get('equivalent_width_3sigma_upper')
+                content += f"EQUIVALENT_WIDTH={ew:.4f} 1sigma: -{ew_1s_lower:.4f}/+{ew_1s_upper:.4f} 2sigma: -{ew_2s_lower:.4f}/+{ew_2s_upper:.4f} 3sigma: -{ew_3s_lower:.4f}/+{ew_3s_upper:.4f}\n"
+            else:
+                # Fallback to old format if no credible intervals
+                content += f"EQUIVALENT_WIDTH={self._format_param(ew, fit.get('equivalent_width_err'))}\n"
         
         # Mode information
         if 'is_velocity_mode' in fit:
@@ -282,6 +435,16 @@ class QSAPFileHandler:
         # System redshift
         if 'z_sys' in fit and fit['z_sys']:
             content += f"SYSTEM_REDSHIFT={fit['z_sys']}\n"
+        
+        # Covariance matrix (3x3 for Gaussian: amp, mean, stddev)
+        if 'covariance' in fit and fit['covariance']:
+            cov = fit['covariance']
+            if isinstance(cov, list):
+                cov = np.array(cov)
+            # Store as flattened 3x3 matrix
+            for i in range(3):
+                for j in range(3):
+                    content += f"COV_{i}_{j}={cov[i][j]}\n"
         
         content += "\n"
         return content
@@ -352,9 +515,42 @@ class QSAPFileHandler:
             else:
                 content += f"SSR_NU={fit['chi2_nu']}\n"  # SSR per degree of freedom
         
-        # Equivalent width (if calculated)
+        # Equivalent width (if calculated) - Voigt component
         if 'equivalent_width' in fit:
-            content += f"EQUIVALENT_WIDTH={self._format_param(fit.get('equivalent_width'), fit.get('equivalent_width_err'))}\n"
+            ew = fit.get('equivalent_width')
+            # Check if we have Monte Carlo credible intervals with best/median/mean
+            if ('ew_best' in fit and 'ew_median' in fit and 'ew_mean' in fit and
+                'equivalent_width_1sigma_lower' in fit and 
+                'equivalent_width_1sigma_upper' in fit):
+                # New format with best, median, mean, and credible intervals on separate lines
+                ew_best = fit.get('ew_best')
+                ew_median = fit.get('ew_median')
+                ew_mean = fit.get('ew_mean')
+                ew_1s_lower = fit.get('equivalent_width_1sigma_lower')
+                ew_1s_upper = fit.get('equivalent_width_1sigma_upper')
+                ew_2s_lower = fit.get('equivalent_width_2sigma_lower')
+                ew_2s_upper = fit.get('equivalent_width_2sigma_upper')
+                ew_3s_lower = fit.get('equivalent_width_3sigma_lower')
+                ew_3s_upper = fit.get('equivalent_width_3sigma_upper')
+                content += f"EQUIVALENT_WIDTH_BEST={ew_best:.6f}\n"
+                content += f"EQUIVALENT_WIDTH_MEDIAN={ew_median:.6f}\n"
+                content += f"EQUIVALENT_WIDTH_MEAN={ew_mean:.6f}\n"
+                content += f"EQUIVALENT_WIDTH_1SIGMA=-{abs(ew_1s_lower):.6f},+{ew_1s_upper:.6f}\n"
+                content += f"EQUIVALENT_WIDTH_2SIGMA=-{abs(ew_2s_lower):.6f},+{ew_2s_upper:.6f}\n"
+                content += f"EQUIVALENT_WIDTH_3SIGMA=-{abs(ew_3s_lower):.6f},+{ew_3s_upper:.6f}\n"
+            elif ('equivalent_width_1sigma_lower' in fit and 
+                'equivalent_width_1sigma_upper' in fit):
+                # Old format with only credible intervals (backward compatible)
+                ew_1s_lower = fit.get('equivalent_width_1sigma_lower')
+                ew_1s_upper = fit.get('equivalent_width_1sigma_upper')
+                ew_2s_lower = fit.get('equivalent_width_2sigma_lower')
+                ew_2s_upper = fit.get('equivalent_width_2sigma_upper')
+                ew_3s_lower = fit.get('equivalent_width_3sigma_lower')
+                ew_3s_upper = fit.get('equivalent_width_3sigma_upper')
+                content += f"EQUIVALENT_WIDTH={ew:.4f} 1sigma: -{ew_1s_lower:.4f}/+{ew_1s_upper:.4f} 2sigma: -{ew_2s_lower:.4f}/+{ew_2s_upper:.4f} 3sigma: -{ew_3s_lower:.4f}/+{ew_3s_upper:.4f}\n"
+            else:
+                # Fallback to old format if no credible intervals
+                content += f"EQUIVALENT_WIDTH={self._format_param(ew, fit.get('equivalent_width_err'))}\n"
         
         # Mode information
         if 'is_velocity_mode' in fit:
@@ -363,6 +559,17 @@ class QSAPFileHandler:
         # System redshift
         if 'z_sys' in fit and fit['z_sys']:
             content += f"SYSTEM_REDSHIFT={fit['z_sys']}\n"
+        
+        # Covariance matrix (for Voigt: amplitude, center, sigma, gamma)
+        if 'covariance' in fit and fit['covariance']:
+            cov = fit['covariance']
+            if isinstance(cov, list):
+                cov = np.array(cov)
+            # Store as flattened matrix (handles both 3x3 and 4x4)
+            nparams = cov.shape[0]
+            for i in range(nparams):
+                for j in range(nparams):
+                    content += f"COV_{i}_{j}={cov[i][j]}\n"
         
         content += "\n"
         return content

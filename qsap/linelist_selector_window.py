@@ -20,6 +20,9 @@ class LineListSelector(QtWidgets.QWidget):
         self.resources_dir = resources_dir
         self.available_line_lists = get_available_line_lists(resources_dir)
         self.selected_line_lists = {}  # {linelist_name: {'linelist': LineList, 'color': str}}
+        # Default annotation offsets (normalized 0-1 relative to plotting window)
+        self.linelist_x_offset = 0.01  # 1% offset in x direction (positive = right)
+        self.linelist_y_offset = 0.02  # 2% offset in y direction (positive = up)
         self.init_ui()
     
     def init_ui(self):
@@ -48,9 +51,6 @@ class LineListSelector(QtWidgets.QWidget):
         
         layout.addWidget(self.linelist_table)
         
-        # Connect checkbox changes to auto-update
-        self.linelist_table.itemChanged.connect(self.on_checkbox_changed)
-        
         # Connect double-click to change color
         self.linelist_table.doubleClicked.connect(self.on_row_double_clicked)
         
@@ -68,6 +68,31 @@ class LineListSelector(QtWidgets.QWidget):
         button_layout.addWidget(self.btn_close)
         layout.addLayout(button_layout)
         
+        # Annotation offset controls
+        offset_group = QtWidgets.QGroupBox("Annotation Offsets")
+        offset_layout = QtWidgets.QGridLayout()
+        
+        # X offset
+        offset_layout.addWidget(QtWidgets.QLabel("X Offset (0-1):"), 0, 0)
+        self.x_offset_input = QtWidgets.QDoubleSpinBox()
+        self.x_offset_input.setRange(0.0, 1.0)
+        self.x_offset_input.setSingleStep(0.01)
+        self.x_offset_input.setValue(self.linelist_x_offset)
+        self.x_offset_input.valueChanged.connect(self.on_offset_changed)
+        offset_layout.addWidget(self.x_offset_input, 0, 1)
+        
+        # Y offset
+        offset_layout.addWidget(QtWidgets.QLabel("Y Offset (0-1):"), 1, 0)
+        self.y_offset_input = QtWidgets.QDoubleSpinBox()
+        self.y_offset_input.setRange(0.0, 1.0)
+        self.y_offset_input.setSingleStep(0.01)
+        self.y_offset_input.setValue(self.linelist_y_offset)
+        self.y_offset_input.valueChanged.connect(self.on_offset_changed)
+        offset_layout.addWidget(self.y_offset_input, 1, 1)
+        
+        offset_group.setLayout(offset_layout)
+        layout.addWidget(offset_group)
+        
         self.setLayout(layout)
     
     def populate_table(self):
@@ -82,6 +107,8 @@ class LineListSelector(QtWidgets.QWidget):
             name_widget = QtWidgets.QCheckBox(linelist.name)
             if linelist.name in self.selected_line_lists:
                 name_widget.setChecked(True)
+            # Connect checkbox state changes directly to update display
+            name_widget.stateChanged.connect(self.on_checkbox_state_changed)
             self.linelist_table.setCellWidget(row, 0, name_widget)
             
             # Lines count column
@@ -137,7 +164,7 @@ class LineListSelector(QtWidgets.QWidget):
         
         self.emit_changes()
     
-    def on_checkbox_changed(self, item):
+    def on_checkbox_state_changed(self, state):
         """Handle checkbox state changes - auto-toggle display"""
         self.toggle_linelist()
     
@@ -186,6 +213,13 @@ class LineListSelector(QtWidgets.QWidget):
         """Emit signal with current selected line lists"""
         line_lists_with_colors = list(self.selected_line_lists.values())
         self.line_lists_changed.emit(line_lists_with_colors)
+    
+    def on_offset_changed(self):
+        """Handle offset value changes"""
+        self.linelist_x_offset = self.x_offset_input.value()
+        self.linelist_y_offset = self.y_offset_input.value()
+        # Redisplay with new offsets
+        self.emit_changes()
     
     def close_window(self):
         """Close the window"""
