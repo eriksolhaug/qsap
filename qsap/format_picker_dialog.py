@@ -400,6 +400,21 @@ class FormatPickerDialog(QtWidgets.QDialog):
                 self.columns_table.setItem(i, 2, QtWidgets.QTableWidgetItem(import_name))
                 self.columns_table.setItem(i, 3, QtWidgets.QTableWidgetItem(used))
         
+        elif fmt_key == "fits:sdss:spec":
+            # SDSS COADD spectrum - show loglam, flux, and ivar columns
+            hdu = options.get("hdu", 1)
+            row_data = [
+                ("LOGLAM", f"HDU {hdu}", "wav", "✓"),
+                ("FLUX", f"HDU {hdu}", "flux", "✓"),
+                ("IVAR", f"HDU {hdu}", "err", "✓"),
+            ]
+            self.columns_table.setRowCount(len(row_data))
+            for i, (col_name, desc, import_name, used) in enumerate(row_data):
+                self.columns_table.setItem(i, 0, QtWidgets.QTableWidgetItem(col_name))
+                self.columns_table.setItem(i, 1, QtWidgets.QTableWidgetItem(desc))
+                self.columns_table.setItem(i, 2, QtWidgets.QTableWidgetItem(import_name))
+                self.columns_table.setItem(i, 3, QtWidgets.QTableWidgetItem(used))
+        
         elif "table" in fmt_key:
             # FITS table - show detected columns
             hdu = options.get("hdu", 1)

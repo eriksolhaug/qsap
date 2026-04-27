@@ -145,6 +145,7 @@ python qsap.py <spectrum.fits> --fmt fits:image1d
 | `fits:table:vector` | FITS table with wave/flux as vector arrays in rows |
 | `fits:table:columns` | FITS table with per-pixel columns |
 | `fits:ext:spectrum` | FITS SPECTRUM extension |
+| `fits:sdss:spec` | SDSS COADD spectrum (loglam wavelength, flux, ivar error) |
 
 ### Command-Line Options
 

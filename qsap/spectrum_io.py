@@ -136,6 +136,15 @@ class SpectrumIO:
                                 add("fits:ext:spectrum", 96, "HDU 'SPECTRUM'",
                                     {"extname": "SPECTRUM"})
                             
+                            # SDSS COADD extension?
+                            if extname == "COADD":
+                                has_loglam = any(c.lower() == "loglam" for c in cols)
+                                has_flux = any(c.lower() == "flux" for c in cols)
+                                has_ivar = any(c.lower() == "ivar" for c in cols)
+                                if has_loglam and has_flux and has_ivar:
+                                    add("fits:sdss:spec", 98, f"SDSS COADD spectrum HDU[{i}]",
+                                        {"hdu": i})
+                            
                             # Have wave/flux?
                             has_wave = any(k in lc for k in ("wave", "wav", "lambda", "wavelength"))
                             has_flux = any(k in lc for k in ("flux",))
@@ -268,6 +277,12 @@ class SpectrumIO:
         elif fmt == "fits:ext:spectrum":
             wav, spec, err, meta = SpectrumIO._read_fits_named_spectrum(filepath, 
                                                        extname=options.get("extname", "SPECTRUM"))
+        
+        elif fmt == "fits:sdss:spec":
+            wav, spec, err, meta = SpectrumIO._read_fits_sdss_spec(
+                filepath,
+                hdu=options.get("hdu", 1)
+            )
         
         else:
             raise ValueError(f"Unsupported format key: {fmt}")
@@ -766,6 +781,46 @@ class SpectrumIO:
             
             except Exception as e:
                 raise ValueError(f"Could not read SPECTRUM extension: {e}")
+    
+    @staticmethod
+    def _read_fits_sdss_spec(path: Path, hdu: int = 1) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
+        """Read SDSS COADD spectrum: loglam wavelength + flux + ivar error."""
+        with fits.open(path, memmap=True) as hdul:
+            h = hdul[hdu]
+            data = h.data
+            if data is None:
+                raise ValueError(f"HDU[{hdu}] has no data.")
+            
+            cols = list(h.columns.names or [])
+            
+            try:
+                # Get flux
+                fname = SpectrumIO._pick_name(["FLUX", "flux"], cols)
+                flux = np.asarray(data[fname], dtype=float)
+                
+                # Get loglam (log10 wavelength in Angstroms) and convert to linear wavelength
+                lname = SpectrumIO._pick_name(["LOGLAM", "loglam"], cols)
+                loglam = np.asarray(data[lname], dtype=float)
+                wav = 10.0 ** loglam  # Convert from log10 to linear wavelength
+                
+                # Get inverse variance and convert to error: err = 1/sqrt(ivar)
+                iname = SpectrumIO._pick_name(["IVAR", "ivar"], cols)
+                ivar = np.asarray(data[iname], dtype=float)
+                # Handle division by zero: where ivar <= 0, set error to large value
+                err = np.where(ivar > 0, np.sqrt(1.0 / ivar), 1e10)
+                
+                meta = {
+                    "source": "fits:sdss:spec",
+                    "path": str(path),
+                    "hdu": hdu,
+                    "extname": h.header.get("EXTNAME", "N/A"),
+                    "wave_unit": "Å",
+                    "flux_unit": "1e-17 erg/cm^2/s/Ang",
+                }
+                return wav, flux, err, meta
+            
+            except Exception as e:
+                raise ValueError(f"Could not read SDSS spectrum from HDU[{hdu}]: {e}")
     
     # ===== Utility readers =====
     
