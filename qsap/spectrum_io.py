@@ -74,11 +74,52 @@ class SpectrumIO:
         if ext in (".fits", ".fit", ".fts"):
             try:
                 with fits.open(path, memmap=True) as hdul:
+                    # Primary HDU has WCS but no data, with flux/error in extensions?
+                    primary = hdul[0] if len(hdul) > 0 else None
+                    has_primary_wcs = (primary and primary.header.get('CRVAL1') is not None)
+                    has_primary_data = primary and getattr(primary, 'data', None) is not None
+                    
+                    if has_primary_wcs and not has_primary_data and len(hdul) > 1:
+                        # Look for flux and error extensions
+                        flux_ext = None
+                        error_ext = None
+                        for i, h_ext in enumerate(hdul[1:], start=1):
+                            if not (hasattr(h_ext, 'data') and h_ext.data is not None):
+                                continue
+                            extname = (h_ext.header.get('EXTNAME') or '').upper()
+                            # Check for flux extension
+                            if flux_ext is None and any(n in extname for n in ('FLUX', 'SCI', 'SCIENCE')):
+                                if isinstance(h_ext.data, np.ndarray) and h_ext.data.ndim == 1:
+                                    flux_ext = i
+                            # Check for error extension
+                            if error_ext is None and any(n in extname for n in ('ERROR', 'ERR', 'VARIANCE', 'VAR', 'SIGMA')):
+                                if isinstance(h_ext.data, np.ndarray) and h_ext.data.ndim == 1:
+                                    error_ext = i
+                        
+                        if flux_ext is not None:
+                            notes = f"WCS header + FLUX ext[{flux_ext}]"
+                            if error_ext is not None:
+                                notes += f" + ERROR ext[{error_ext}]"
+                            add("fits:image1d:ext_data", 95 if error_ext else 90, notes, 
+                                {"hdu_flux": flux_ext, "hdu_error": error_ext})
+                    
                     # Primary 1D image?
                     if len(hdul) > 0 and getattr(hdul[0], "data", None) is not None:
                         data = hdul[0].data
                         if isinstance(data, np.ndarray) and data.ndim == 1:
-                            add("fits:image1d", 95, "Primary HDU contains 1D image", {"hdu": 0})
+                            # Check for ERROR extension
+                            has_error_ext = False
+                            for h_ext in hdul[1:]:
+                                if hasattr(h_ext, 'data') and h_ext.data is not None:
+                                    extname = (h_ext.header.get('EXTNAME') or '').upper()
+                                    if any(name in extname for name in ('ERROR', 'ERR', 'VARIANCE', 'VAR', 'SIGMA')):
+                                        has_error_ext = True
+                                        break
+                            
+                            if has_error_ext:
+                                add("fits:image1d", 96, "Primary HDU 1D image with ERROR extension", {"hdu": 0})
+                            else:
+                                add("fits:image1d", 95, "Primary HDU contains 1D image", {"hdu": 0})
                     
                     # Check extensions
                     for i, h in enumerate(hdul):
@@ -96,14 +137,14 @@ class SpectrumIO:
                                     {"extname": "SPECTRUM"})
                             
                             # Have wave/flux?
-                            has_wave = any(k in lc for k in ("wave", "lambda", "wavelength"))
+                            has_wave = any(k in lc for k in ("wave", "wav", "lambda", "wavelength"))
                             has_flux = any(k in lc for k in ("flux",))
                             has_errivar = any(k in lc for k in ("err", "ivar"))
                             
                             if has_wave and has_flux and has_errivar:
                                 try:
                                     rec0 = h.data[0]
-                                    wname = SpectrumIO._pick_name(["WAVE", "wave", "lambda"], cols)
+                                    wname = SpectrumIO._pick_name(["WAVE", "wave", "wav", "lambda"], cols)
                                     fname = SpectrumIO._pick_name(["FLUX", "flux"], cols)
                                     arrish = (hasattr(rec0[wname], "__len__") and 
                                              hasattr(rec0[fname], "__len__"))
@@ -196,11 +237,18 @@ class SpectrumIO:
         elif fmt == "fits:image1d":
             wav, spec, err, meta = SpectrumIO._read_fits_image1d(filepath, hdu=options.get("hdu", 0))
         
+        elif fmt == "fits:image1d:ext_data":
+            wav, spec, err, meta = SpectrumIO._read_fits_image1d_with_extensions(
+                filepath,
+                hdu_flux=options.get("hdu_flux", 1),
+                hdu_error=options.get("hdu_error")
+            )
+        
         elif fmt == "fits:table:vector":
             wav, spec, err, meta = SpectrumIO._read_fits_table_vector(
                 filepath,
                 hdu=options.get("hdu", 1),
-                wave_cols=options.get("wave_cols", ["WAVE", "wave", "lambda"]),
+                wave_cols=options.get("wave_cols", ["WAVE", "wave", "wav", "lambda"]),
                 flux_cols=options.get("flux_cols", ["FLUX", "flux"]),
                 err_cols=options.get("err_cols", ["ERR", "err"]),
                 ivar_cols=options.get("ivar_cols", ["IVAR", "ivar"]),
@@ -211,7 +259,7 @@ class SpectrumIO:
             wav, spec, err, meta = SpectrumIO._read_fits_table_columns(
                 filepath,
                 hdu=options.get("hdu", 1),
-                wave_cols=options.get("wave_cols", ["WAVE", "wave", "lambda"]),
+                wave_cols=options.get("wave_cols", ["WAVE", "wave", "wav", "lambda"]),
                 flux_cols=options.get("flux_cols", ["FLUX", "flux"]),
                 err_cols=options.get("err_cols", ["ERR", "err"]),
                 ivar_cols=options.get("ivar_cols", ["IVAR", "ivar"])
@@ -496,7 +544,7 @@ class SpectrumIO:
     
     @staticmethod
     def _read_fits_image1d(path: Path, hdu: int = 0) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
-        """Read 1D image from FITS HDU."""
+        """Read 1D image from FITS HDU, optionally including error extension."""
         with fits.open(path, memmap=True) as hdul:
             h = hdul[hdu]
             spec = np.asarray(h.data, dtype=float).flatten()
@@ -508,8 +556,21 @@ class SpectrumIO:
             cdelt1 = header.get('CDELT1', 1)
             wav = crval1 + (np.arange(len(spec)) - (crpix1 - 1)) * cdelt1
             
-            # No automatic error creation - leave as None
+            # Look for error extension (named "ERROR" or "VARIANCE" or similar)
             err = None
+            err_source = None
+            for i, h_ext in enumerate(hdul[1:], start=1):
+                if not hasattr(h_ext, 'data') or h_ext.data is None:
+                    continue
+                extname = (h_ext.header.get('EXTNAME') or '').upper()
+                # Check for common error extension names
+                if any(name in extname for name in ('ERROR', 'ERR', 'VARIANCE', 'VAR', 'SIGMA')):
+                    try:
+                        err = np.asarray(h_ext.data, dtype=float).flatten()
+                        err_source = f"extension {i} (EXTNAME={extname})"
+                        break
+                    except Exception:
+                        continue
             
             meta = {
                 "source": "fits:image1d",
@@ -518,6 +579,51 @@ class SpectrumIO:
                 "wave_unit": "Å",
                 "flux_unit": "adu",
             }
+            if err_source:
+                meta["error_source"] = err_source
+            
+            return wav, spec, err, meta
+    
+    @staticmethod
+    def _read_fits_image1d_with_extensions(path: Path, hdu_flux: int = 1, hdu_error: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
+        """Read 1D spectrum where WCS is in primary header, flux and error in separate extensions."""
+        with fits.open(path, memmap=True) as hdul:
+            # Get WCS from primary header
+            primary = hdul[0]
+            header = primary.header
+            crpix1 = header.get('CRPIX1', 1)
+            crval1 = header.get('CRVAL1', 0)
+            cdelt1 = header.get('CDELT1', 1)
+            
+            # Read flux from specified extension
+            flux_hdu = hdul[hdu_flux]
+            spec = np.asarray(flux_hdu.data, dtype=float).flatten()
+            
+            # Derive wavelength array
+            wav = crval1 + (np.arange(len(spec)) - (crpix1 - 1)) * cdelt1
+            
+            # Read error from specified extension if provided
+            err = None
+            err_source = None
+            if hdu_error is not None:
+                try:
+                    err_hdu = hdul[hdu_error]
+                    err = np.asarray(err_hdu.data, dtype=float).flatten()
+                    err_source = f"extension {hdu_error} (EXTNAME={err_hdu.header.get('EXTNAME', 'N/A')})"
+                except Exception:
+                    pass
+            
+            meta = {
+                "source": "fits:image1d:ext_data",
+                "path": str(path),
+                "hdu_flux": hdu_flux,
+                "hdu_error": hdu_error,
+                "wave_unit": "Å",
+                "flux_unit": "adu",
+            }
+            if err_source:
+                meta["error_source"] = err_source
+            
             return wav, spec, err, meta
     
     @staticmethod

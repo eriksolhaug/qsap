@@ -7442,6 +7442,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 self.on_deactivate_all()
                 return
 
+        # Guard: ensure bounds are initialized before processing other key events
+        if self.x_lower_bound is None or self.x_upper_bound is None or self.y_lower_bound is None or self.y_upper_bound is None:
+            return  # Bounds not yet initialized, skip key processing
+
         # Check if the cursor is within the axes bounds
         if hasattr(event, 'xdata') and hasattr(event, 'ydata'):
             if event.xdata is not None and event.ydata is not None:

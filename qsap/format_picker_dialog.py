@@ -377,12 +377,22 @@ class FormatPickerDialog(QtWidgets.QDialog):
                 self.columns_table.setItem(i, 2, QtWidgets.QTableWidgetItem(import_name))
                 self.columns_table.setItem(i, 3, QtWidgets.QTableWidgetItem(used))
         
-        elif fmt_key == "fits:image1d":
-            # FITS 1D image - show wavelength info
+        elif fmt_key == "fits:image1d" or fmt_key == "fits:image1d:ext_data":
+            # FITS 1D image - show wavelength info and error extension if present
             row_data = [
-                ("0", "Primary HDU", "wav", "✓"),
-                ("1", "Primary HDU", "flux", "✓"),
+                ("primary", "Primary HDU", "wav", "✓"),
+                (f"ext {options.get('hdu_flux', 1)}", f"Extension {options.get('hdu_flux', 1)}", "flux", "✓"),
             ]
+            # Check if error extension is mentioned in notes or options
+            notes = candidate.get("notes", "")
+            error_ext = options.get("hdu_error")
+            if error_ext is not None or "ERROR" in notes.upper():
+                error_ext_num = error_ext if error_ext is not None else None
+                if error_ext_num:
+                    row_data.append((f"ext {error_ext_num}", f"Extension {error_ext_num}", "err", "✓"))
+                else:
+                    row_data.append(("ext", "ERROR/VARIANCE extension", "err", "✓"))
+            
             self.columns_table.setRowCount(len(row_data))
             for i, (col_idx, desc, import_name, used) in enumerate(row_data):
                 self.columns_table.setItem(i, 0, QtWidgets.QTableWidgetItem(col_idx))

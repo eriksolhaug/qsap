@@ -140,7 +140,8 @@ python qsap.py <spectrum.fits> --fmt fits:image1d
 | `ascii:2col` | 2-column ASCII (wavelength, flux/transmission with optional # comments) |
 | `ascii:3col` | 3-column ASCII (wavelength, flux, error with optional # comments) |
 | `ascii:flex` | Flexible ASCII with custom column mapping |
-| `fits:image1d` | 1D FITS image with wavelength in header |
+| `fits:image1d` | 1D FITS image with wavelength in header (with optional ERROR extension) |
+| `fits:image1d:ext_data` | WCS wavelength in primary header, flux and error in separate extensions |
 | `fits:table:vector` | FITS table with wave/flux as vector arrays in rows |
 | `fits:table:columns` | FITS table with per-pixel columns |
 | `fits:ext:spectrum` | FITS SPECTRUM extension |
