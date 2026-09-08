@@ -29,6 +29,7 @@ class ItemTracker(QtWidgets.QWidget):
     estimate_redshift = pyqtSignal(str)  # Emits item_id when estimate redshift is selected
     calculate_ew = pyqtSignal(str)  # Emits item_id when calculate equivalent width is selected
     items_changed = pyqtSignal()  # Emits when items list is updated (added or removed)
+    item_display_toggled = pyqtSignal(str, bool)  # Emits (item_id, display_state) when Display checkbox is toggled
     
     def __init__(self):
         super().__init__()
@@ -51,18 +52,20 @@ class ItemTracker(QtWidgets.QWidget):
         
         # Table widget with columns
         self.item_table = QtWidgets.QTableWidget()
-        self.item_table.setColumnCount(4)
-        self.item_table.setHorizontalHeaderLabels(['Name', 'Type', 'Color', 'Position'])
+        self.item_table.setColumnCount(5)
+        self.item_table.setHorizontalHeaderLabels(['Display', 'Name', 'Type', 'Color', 'Position'])
         self.item_table.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
         self.item_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.item_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.item_table.customContextMenuRequested.connect(self.show_context_menu)
         self.item_table.itemSelectionChanged.connect(self.on_selection_changed)
+        self.item_table.itemChanged.connect(self.on_item_changed)  # Connect to handle checkbox changes
         self.item_table.horizontalHeader().setStretchLastSection(True)
-        self.item_table.setColumnWidth(0, 150)
-        self.item_table.setColumnWidth(1, 100)
+        self.item_table.setColumnWidth(0, 70)
+        self.item_table.setColumnWidth(1, 150)
         self.item_table.setColumnWidth(2, 100)
-        self.item_table.setColumnWidth(3, 150)
+        self.item_table.setColumnWidth(3, 100)
+        self.item_table.setColumnWidth(4, 150)
         layout.addWidget(self.item_table)
         
         # Buttons
@@ -84,7 +87,9 @@ class ItemTracker(QtWidgets.QWidget):
             'name': name,
             'position': position,
             'color': color,
-            'line_obj': line_obj
+            'line_obj': line_obj,
+            'displayed': True,  # Default to visible
+            'zorder': None  # Store original zorder to preserve it when toggling visibility
         }
         self.refresh_table()
         self.items_changed.emit()
@@ -98,28 +103,38 @@ class ItemTracker(QtWidgets.QWidget):
     
     def refresh_table(self):
         """Refresh the displayed table"""
+        self.item_table.blockSignals(True)  # Block signals while updating to avoid triggering changes
         self.item_table.setRowCount(0)
         for item_id, item_info in self.items.items():
             row = self.item_table.rowCount()
             self.item_table.insertRow(row)
             
-            # Name column
+            # Display checkbox column (column 0)
+            display_checkbox = QtWidgets.QTableWidgetItem()
+            display_checkbox.setCheckState(Qt.Checked if item_info.get('displayed', True) else Qt.Unchecked)
+            display_checkbox.setData(Qt.UserRole, item_id)
+            display_checkbox.setFlags(display_checkbox.flags() | Qt.ItemIsUserCheckable)
+            self.item_table.setItem(row, 0, display_checkbox)
+            
+            # Name column (column 1)
             name_item = QtWidgets.QTableWidgetItem(item_info['name'])
             name_item.setData(Qt.UserRole, item_id)
-            self.item_table.setItem(row, 0, name_item)
+            self.item_table.setItem(row, 1, name_item)
             
-            # Type column
+            # Type column (column 2)
             type_item = QtWidgets.QTableWidgetItem(item_info['type'])
-            self.item_table.setItem(row, 1, type_item)
+            self.item_table.setItem(row, 2, type_item)
             
-            # Color column
-            color_item = QtWidgets.QTableWidgetItem(item_info['color'])
+            # Color column (column 3)
+            color_item = QtWidgets.QTableWidgetItem('')  # Empty text, just show the color
             color_item.setBackground(QtGui.QColor(item_info['color']))
-            self.item_table.setItem(row, 2, color_item)
+            self.item_table.setItem(row, 3, color_item)
             
-            # Position column
+            # Position column (column 4)
             pos_item = QtWidgets.QTableWidgetItem(str(item_info['position']))
-            self.item_table.setItem(row, 3, pos_item)
+            self.item_table.setItem(row, 4, pos_item)
+        
+        self.item_table.blockSignals(False)  # Re-enable signals
     
     def show_context_menu(self, position):
         """Show right-click context menu"""
@@ -190,6 +205,32 @@ class ItemTracker(QtWidgets.QWidget):
         # Update tracking for next call
         self.previously_selected_ids = current_selected_ids
     
+    def on_item_changed(self, item):
+        """Handle Display checkbox state changes"""
+        # Only process if this is the Display checkbox column (column 0)
+        if self.item_table.column(item) != 0:
+            return
+        
+        row = self.item_table.row(item)
+        if row < 0:
+            return
+        
+        # Get the item_id from the checkbox
+        checkbox_item = self.item_table.item(row, 0)
+        if not checkbox_item:
+            return
+        
+        item_id = checkbox_item.data(Qt.UserRole)
+        if not item_id or item_id not in self.items:
+            return
+        
+        # Update the displayed state
+        is_checked = checkbox_item.checkState() == Qt.Checked
+        self.items[item_id]['displayed'] = is_checked
+        
+        # Emit signal so spectrum plotter can handle visibility toggle
+        self.item_display_toggled.emit(item_id, is_checked)
+    
     def delete_selected(self):
         """Delete selected items"""
         selected_rows = set(index.row() for index in self.item_table.selectedIndexes())
@@ -201,10 +242,13 @@ class ItemTracker(QtWidgets.QWidget):
     
     def clear_all(self):
         """Clear all items"""
+        # Collect item IDs first since handlers will modify self.items
         item_ids = list(self.items.keys())
+        # Only emit signals - don't call remove_item() here because
+        # the signal handlers (on_item_deleted_from_tracker) will call unregister_item()
+        # which calls remove_item(), so we'd be removing twice and crashing
         for item_id in item_ids:
             self.item_deleted.emit(item_id)
-            self.remove_item(item_id)
     
     def highlight_item(self, item_id):
         """Programmatically select a row corresponding to item_id"""

@@ -4,7 +4,7 @@ Main spectrum plotter widget for interactive spectral analysis
 
 KEYBOARD SHORTCUTS:
 
-Navigation & View Controls:
+Navigation Controls:
   [ / ]                - Pan left/right through spectrum
   \ (backslash)        - Reset spectrum view to starting bounds
   x                    - Center on mouse wavelength position
@@ -16,7 +16,7 @@ Navigation & View Controls:
   L                    - Toggle log x-axis
   f                    - Enter fullscreen mode
 
-Spectrum Processing:
+Spectrum Display:
   1-9                  - Apply Gaussian smoothing with different kernel sizes
   0                    - Remove smoothing (restore original spectrum)
   ~ (tilde)            - Toggle between step plot and line plot
@@ -26,12 +26,13 @@ Fitting Modes:
   m                    - Enter continuum fitting mode (define regions with SPACE)
   M                    - Remove a continuum region
   ENTER (in continuum mode) - Fit polynomial continuum to defined regions
-  g                    - Enter Single Mode Gaussian fit (click to fit, SPACE to select bounds)
+  d                    - Enter Single Mode Gaussian fit (click to fit, SPACE to select bounds)
   | (pipe)             - Enter Multi-Gaussian fit mode (fit multiple Gaussians simultaneously)
   n                    - Single mode Voigt profile fitting
   e                    - Open line list selector window (new line list system)
-  k                    - Open Listfit window for composite fitting
-
+  H                    - Open Listfit window for composite fitting (RECOMMENDED FOR COMPLEX FITS)
+  : (colon)            - Perform Bayesian fitting (MCMC) - follow along prompts in terminal - this works well for simple profile fits but has not been tested on cases more complex than a line+Gaussian/Voigt
+  
 Measurement & Analysis:
   v                    - Calculate equivalent width of fitted line
   ;                    - Show/toggle total line for Single Mode fitted lines
@@ -83,6 +84,7 @@ matplotlib.use('Qt5Agg')
 # Configure matplotlib to handle exceptions gracefully
 import matplotlib as mpl
 mpl.rcParams['figure.raise_window'] = False
+mpl.rcParams['axes.unicode_minus'] = False  # Use ASCII minus signs instead of Unicode for better compatibility
 
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
@@ -154,6 +156,19 @@ class OutputStreamCapture:
     def flush(self):
         """Flush the stream."""
         self.original_stdout.flush()
+
+
+# Helper function for numpy compatibility (trapz vs trapezoid in numpy 2.0+)
+def trapz_compat(y, x=None):
+    """Compatible trapezoid integration for numpy < 2.0 and >= 2.0
+    
+    In numpy >= 2.0, np.trapz was renamed to np.trapezoid.
+    This function tries np.trapz first, then falls back to np.trapezoid.
+    """
+    if hasattr(np, 'trapz'):
+        return np.trapz(y, x)
+    else:
+        return np.trapezoid(y, x)
 
 
 class OutputPanel(QtWidgets.QWidget):
@@ -354,6 +369,106 @@ This can be changed in the settings menu.
             return
         super().keyPressEvent(event)
 
+
+class SmoothingJoystick(QtWidgets.QWidget):
+    """Custom joystick widget for controlling smoothing parameters"""
+    
+    # Signals for joystick movement (0-1 range, centered at 0.5)
+    x_moved = QtCore.pyqtSignal(float)  # Left-right (Median control)
+    y_moved = QtCore.pyqtSignal(float)  # Up-down (Gaussian control)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(150, 150)
+        self.setMaximumSize(150, 150)
+        self.setStyleSheet("background-color: #f0f0f0; border: 2px solid #333;")
+        
+        # Joystick position (0-1 range)
+        self.x_pos = 0.5  # Center
+        self.y_pos = 0.5  # Center
+        
+        # Low sensitivity parameters
+        self.sensitivity = 0.02  # Small movement threshold
+        self.deadzone = 0.05  # Neutral zone around center
+        
+        self.setFocusPolicy(Qt.StrongFocus)
+        
+    def mouseMoveEvent(self, event):
+        """Track mouse movement to control joystick"""
+        if event.buttons() & Qt.LeftButton:
+            # Normalize mouse position to 0-1 range
+            rect = self.rect()
+            x = event.x() / rect.width()
+            y = 1.0 - (event.y() / rect.height())  # Invert Y (up is positive)
+            
+            # Clamp to 0-1 range
+            x = max(0.0, min(1.0, x))
+            y = max(0.0, min(1.0, y))
+            
+            # Apply deadzone
+            if abs(x - 0.5) < self.deadzone:
+                x = 0.5
+            if abs(y - 0.5) < self.deadzone:
+                y = 0.5
+            
+            self.x_pos = x
+            self.y_pos = y
+            
+            # Emit signals with low sensitivity
+            self.x_moved.emit(x)
+            self.y_moved.emit(y)
+            
+            self.update()
+    
+    def mousePressEvent(self, event):
+        """Start joystick control"""
+        if event.button() == Qt.LeftButton:
+            self.mouseMoveEvent(event)
+    
+    def mouseReleaseEvent(self, event):
+        """Joystick stays in place when released (no auto-return to center)"""
+        # Joystick position is retained, not reset
+        pass
+    
+    def paintEvent(self, event):
+        """Draw the joystick"""
+        painter = QtGui.QPainter(self)
+        rect = self.rect()
+        
+        # Draw background circle
+        painter.setBrush(QtGui.QColor("#e8e8e8"))
+        painter.setPen(QtGui.QPen(QtGui.QColor("#333"), 2))
+        painter.drawEllipse(rect)
+        
+        # Draw crosshairs (neutral position)
+        center_x = rect.width() / 2
+        center_y = rect.height() / 2
+        painter.setPen(QtGui.QPen(QtGui.QColor("#999"), 1, Qt.DashLine))
+        painter.drawLine(int(center_x - 20), int(center_y), int(center_x + 20), int(center_y))
+        painter.drawLine(int(center_x), int(center_y - 20), int(center_x), int(center_y + 20))
+        
+        # Draw current position indicator (joystick knob)
+        knob_x = self.x_pos * rect.width()
+        knob_y = (1.0 - self.y_pos) * rect.height()
+        
+        # Check if in deadzone
+        if abs(self.x_pos - 0.5) < self.deadzone and abs(self.y_pos - 0.5) < self.deadzone:
+            painter.setBrush(QtGui.QColor("#cccccc"))
+        else:
+            painter.setBrush(QtGui.QColor("#2196F3"))
+        
+        painter.setPen(QtGui.QPen(QtGui.QColor("#333"), 2))
+        painter.drawEllipse(int(knob_x - 8), int(knob_y - 8), 16, 16)
+        
+        # Draw labels
+        painter.setPen(QtGui.QColor("#666"))
+        painter.setFont(QtGui.QFont("Arial", 7))
+        painter.drawText(rect.adjusted(5, 5, -5, -5), Qt.AlignTop | Qt.AlignLeft, "↑ Gaussian σ")
+        painter.drawText(rect.adjusted(5, 5, -5, -5), Qt.AlignBottom | Qt.AlignLeft, "← Median")
+        
+        painter.end()
+
+
 class SpectrumPlotter(QtWidgets.QMainWindow):
     def __init__(self, fits_file, redshift=0.0, zoom_factor=0.1, file_flag=0, lsf="10",):
         super().__init__()
@@ -386,6 +501,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.qsap_handler = QSAPFileHandler(self.save_directory)  # Initialize QSAP file handler
         self.init_settings_panel()
         
+        # Initialize smoothing panel
+        self.init_smoothing_panel()
+        
         # Initialize window creation attempt flags and resources BEFORE create_menu_bar()
         self.help_window = None
         self.help_window_attempted = False  # Track if we've already tried to create it
@@ -406,6 +524,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.err_step = []
         self.x_data = []
         self.original_spec = []
+        self.smoothed_spec = []  # For smoothed spectrum data
         self.data_loaded_from_gui = False  # Track if data was loaded via GUI
         self.fig = None  # Will be created on first plot_spectrum() call
         self.ax = None  # Will be created on first plot_spectrum() call
@@ -433,6 +552,47 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.listfit_component_lines = {}  # Store plotted component lines by component ID
         self.listfit_polynomials = {}  # Store polynomial data for listfit
         self.deleted_listfit_polynomials = set()  # Track deleted polynomial item_ids for residual calculation
+        
+        # Guess drawing mode for listfit components
+        self.guess_drawing_mode = False
+        self.current_component_for_guess = None  # Component dict being edited
+        self.current_component_row = None  # Row index in listfit window
+        self.guess_preview_line = None  # Temporary line showing preview Gaussian/Voigt
+        self.guess_center = None  # Wavelength center of the guess
+        self.guess_sigma = None  # Width/sigma of the guess
+        self.guess_amp = None  # Amplitude being dragged
+        self.guess_lines = {}  # Store persistent guess lines by component_id
+        # Direct drag tracking for simplified guess drawing (click-drag to draw)
+        self.guess_mouse_down = False  # Whether mouse button is currently pressed
+        self.guess_drag_start_x = None  # Wavelength where drag started
+        self.guess_drag_start_y = None  # Flux where drag started
+        self.guess_drag_end_x = None  # Current wavelength during drag
+        self.guess_drag_end_y = None  # Current flux during drag
+        self.guess_polynomial_line = None  # Temporary line for polynomial guess
+        self.guess_polynomial_clicked_points = None  # Markers for clicked points during polynomial drawing
+        self.guess_polynomial_baseline_line = None  # Temporary line showing polynomial baseline during Gaussian/Voigt drag
+        self._polynomial_guess_confirmed = False  # Flag to track if polynomial guess was confirmed
+        
+        # Polynomial multi-point click mode for listfit
+        self.polynomial_points = []  # List of (x, y) tuples for polynomial guess
+        self.polynomial_order = 1  # Order of polynomial (will be set from component)
+        self.polynomial_preview_points = []  # Line objects for showing clicked points
+        
+        # Mask drawing mode
+        self.mask_drawing_mode = False  # True when drawing mask regions
+        self.mask_type = None  # 'data_mask' or 'polynomial_mask'
+        self.mask_regions = []  # List of (x_start, x_end) tuples for drawn regions
+        self.mask_preview_rects = []  # Rectangle patches for visual feedback
+        self.mask_drag_start_x = None  # X coordinate where mask drag started
+        
+        # Constraint bounds setting mode
+        self.constraint_bounds_mode = False  # True when setting bounds for a constraint
+        self.constraint_parameter = None  # Parameter being set (amp, mu, sigma, etc.)
+        self.constraint_bounds_drag_start_x = None  # X coordinate where drag started
+        self.constraint_bounds_drag_end_x = None  # X coordinate where drag ended
+        self.constraint_bounds_preview_line = None  # Temporary vertical line showing bounds
+        self.current_constraint_editor = None  # Reference to ConstraintEditor widget for updating bounds
+        self.current_constraint_editor_dialog = None  # Reference to dialog containing the editor
 
         self.redshift_estimation_mode = False
         self.rest_wavelength = None  # Set to `None` if no initial rest wavelength
@@ -506,6 +666,17 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.band_areas = []
         self.band_labels = []
 
+        # Smoothing controls
+        self.median_kernel_size = 1  # Median filter kernel size (default 1 = no smoothing)
+        self.gaussian_sigma = 0.0  # Gaussian filter sigma (default 0 = no smoothing)
+        self.smoothing_interactive_mode = False  # Is interactive smoothing enabled?
+        self.smoothing_drag_start_x = None  # Track drag start position for smoothing
+        self.smoothing_drag_start_y = None
+        self.smoothing_prev_median = 1  # Previous applied median kernel (for reset)
+        self.smoothing_prev_gaussian = 0.0  # Previous applied Gaussian sigma (for reset)
+        self.last_applied_median = 1  # Last successfully applied median value
+        self.last_applied_gaussian = 0.0  # Last successfully applied Gaussian value
+
         # MCMC
         self.bayes_bounds = []
         self.bayes_mode = False
@@ -528,6 +699,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         
         # Connect items_changed signal to update total line if displayed
         self.item_tracker.items_changed.connect(self.update_total_line_if_shown)
+        
+        # Connect display toggle signal to handle visibility changes
+        self.item_tracker.item_display_toggled.connect(self.on_item_display_toggled)
         
         # Action History for Undo/Redo
         self.action_history = ActionHistory()
@@ -1015,22 +1189,188 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         load_dir_layout.addLayout(load_input_layout)
         
         settings_layout.addLayout(load_dir_layout)
+        
+        # Add separator
+        settings_layout.addSpacing(15)
+        
+        # Remove All Plotted Features Section
+        remove_features_layout = QVBoxLayout()
+        remove_features_layout.setSpacing(5)
+        
+        remove_title = QtWidgets.QLabel("Data Management")
+        remove_title.setStyleSheet("font-weight: bold; font-size: 11px;")
+        remove_features_layout.addWidget(remove_title)
+        
+        self.remove_all_features_button = QtWidgets.QPushButton("Remove All Plotted Features")
+        self.remove_all_features_button.setStyleSheet("background-color: #fff3cd; color: #856404; font-weight: bold;")
+        self.remove_all_features_button.clicked.connect(self.on_remove_all_plotted_features)
+        button_layout = QtWidgets.QHBoxLayout()
+        button_layout.addWidget(self.remove_all_features_button)
+        button_layout.addStretch()
+        remove_features_layout.addLayout(button_layout)
+        
+        # Add helper text
+        remove_help_label = QtWidgets.QLabel("Remove all plotted features (guesses, fits, etc.) except the spectrum.")
+        remove_help_label.setStyleSheet("font-size: 9px; color: #666666;")
+        remove_features_layout.addWidget(remove_help_label)
+        
+        settings_layout.addLayout(remove_features_layout)
+        
         settings_layout.addStretch()
         
         self.settings_container.setLayout(settings_layout)
 
-    def on_browse_save_directory(self):
-        """Open file dialog to select save directory"""
-        directory = QtWidgets.QFileDialog.getExistingDirectory(
-            self,
-            "Select Save Directory",
-            self.save_directory,
-            QtWidgets.QFileDialog.ShowDirsOnly | QtWidgets.QFileDialog.DontResolveSymlinks
+    def init_smoothing_panel(self):
+        """Initialize the Smoothing widget panel with controls for interactive smoothing"""
+        # Create scroll area for smoothing controls
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet("""
+            QScrollArea { border: none; }
+            QScrollBar:vertical { width: 10px; }
+            QScrollBar::handle:vertical { background: #888888; border-radius: 5px; }
+            QScrollBar::handle:vertical:hover { background: #555555; }
+        """)
+        
+        # Create the actual content widget
+        content_widget = QtWidgets.QWidget()
+        smoothing_layout = QVBoxLayout()
+        smoothing_layout.setContentsMargins(10, 10, 10, 10)
+        smoothing_layout.setSpacing(8)
+        
+        # Title
+        smoothing_title = QtWidgets.QLabel("Smoothing Controls")
+        title_font = smoothing_title.font()
+        title_font.setBold(True)
+        title_font.setPointSize(11)
+        smoothing_title.setFont(title_font)
+        smoothing_layout.addWidget(smoothing_title)
+        
+        # Median Kernel Input
+        median_layout = QHBoxLayout()
+        median_layout.setSpacing(5)
+        median_label = QLabel("Median Kernel (pixels):")
+        self.smoothing_median_input = QLineEdit()
+        self.smoothing_median_input.setText("1")
+        self.smoothing_median_input.setMaximumWidth(80)
+        self.smoothing_median_input.setToolTip("Median filter kernel size in pixels (odd integer, 1=off)")
+        self.smoothing_median_input.returnPressed.connect(self.on_smoothing_apply)
+        median_layout.addWidget(median_label)
+        median_layout.addWidget(self.smoothing_median_input)
+        median_layout.addStretch()
+        smoothing_layout.addLayout(median_layout)
+        
+        # Gaussian Sigma Input
+        gaussian_layout = QHBoxLayout()
+        gaussian_layout.setSpacing(5)
+        gaussian_label = QLabel("Gaussian Sigma:")
+        self.smoothing_gaussian_input = QLineEdit()
+        self.smoothing_gaussian_input.setText("0.0")
+        self.smoothing_gaussian_input.setMaximumWidth(80)
+        self.smoothing_gaussian_input.setToolTip("Gaussian filter sigma (0=off)")
+        self.smoothing_gaussian_input.returnPressed.connect(self.on_smoothing_apply)
+        gaussian_layout.addWidget(gaussian_label)
+        gaussian_layout.addWidget(self.smoothing_gaussian_input)
+        gaussian_layout.addStretch()
+        smoothing_layout.addLayout(gaussian_layout)
+        
+        # Apply Button
+        apply_button = QPushButton("Apply Smoothing")
+        apply_button.clicked.connect(self.on_smoothing_apply)
+        apply_button.setToolTip("Apply median and/or Gaussian smoothing to spectrum")
+        apply_button.setMaximumWidth(180)
+        
+        # Reset Button
+        reset_button = QPushButton("Reset to Previous")
+        reset_button.clicked.connect(self.on_smoothing_reset)
+        reset_button.setToolTip("Restore previous smoothing settings")
+        reset_button.setMaximumWidth(180)
+        
+        # Original Data Button
+        original_button = QPushButton("Reset to Original")
+        original_button.clicked.connect(self.on_smoothing_original)
+        original_button.setToolTip("Remove all smoothing, show original spectrum")
+        original_button.setMaximumWidth(180)
+        
+        # Toggle Step/Line Plot Button
+        toggle_plot_button = QPushButton("Toggle Step/Line Plot")
+        toggle_plot_button.clicked.connect(self.on_toggle_step_line)
+        toggle_plot_button.setToolTip("Toggle between step and line plot (~ key)")
+        toggle_plot_button.setMaximumWidth(180)
+        
+        # Button Grid Layout (2x2)
+        button_grid = QtWidgets.QGridLayout()
+        button_grid.setSpacing(5)
+        button_grid.addWidget(apply_button, 0, 0)
+        button_grid.addWidget(reset_button, 0, 1)
+        button_grid.addWidget(original_button, 1, 0)
+        button_grid.addWidget(toggle_plot_button, 1, 1)
+        smoothing_layout.addLayout(button_grid)
+        
+        # Separator
+        separator = QtWidgets.QFrame()
+        separator.setFrameShape(QtWidgets.QFrame.HLine)
+        separator.setFrameShadow(QtWidgets.QFrame.Sunken)
+        smoothing_layout.addWidget(separator)
+        
+        # Joystick Label
+        joystick_label = QtWidgets.QLabel("Smoothing Joystick")
+        joystick_font = joystick_label.font()
+        joystick_font.setBold(True)
+        joystick_font.setPointSize(10)
+        joystick_label.setFont(joystick_font)
+        smoothing_layout.addWidget(joystick_label)
+        
+        # Joystick Widget
+        self.smoothing_joystick = SmoothingJoystick()
+        self.smoothing_joystick.x_moved.connect(self.on_joystick_x_moved)
+        self.smoothing_joystick.y_moved.connect(self.on_joystick_y_moved)
+        smoothing_layout.addWidget(self.smoothing_joystick, alignment=Qt.AlignCenter)
+        
+        # Joystick Info
+        joystick_info = QtWidgets.QLabel(
+            "<small><b>Joystick Control (Symmetric):</b><br>"
+            "Left/Right: Adjust Median Kernel (center = no smoothing)<br>"
+            "Up/Down: Adjust Gaussian Sigma (center = no smoothing)<br>"
+            "Joystick stays in place when released<br>"
+            "(Auto-applies smoothing)</small>"
         )
-        if directory:
-            self.save_directory = directory
-            self.qsap_handler.save_directory = directory  # Update QSAP handler
-            self.save_directory_input.setText(directory)
+        joystick_info.setWordWrap(True)
+        joystick_info.setStyleSheet("color: #666666; font-size: 8pt;")
+        smoothing_layout.addWidget(joystick_info)
+        
+        # Separator
+        separator2 = QtWidgets.QFrame()
+        separator2.setFrameShape(QtWidgets.QFrame.HLine)
+        separator2.setFrameShadow(QtWidgets.QFrame.Sunken)
+        smoothing_layout.addWidget(separator2)
+        
+        # Interactive Mode Checkbox
+        self.smoothing_interactive_checkbox = QtWidgets.QCheckBox("Enable Smoothing with Click-and-Drag in Plotter")
+        self.smoothing_interactive_checkbox.setChecked(False)
+        self.smoothing_interactive_checkbox.stateChanged.connect(self.on_smoothing_interactive_mode_changed)
+        self.smoothing_interactive_checkbox.setToolTip("When checked: Up-down drag adjusts Gaussian, Left-right adjusts Median")
+        smoothing_layout.addWidget(self.smoothing_interactive_checkbox)
+        
+        # Info label
+        info_label = QtWidgets.QLabel(
+            "<small><b>Click-and-Drag Smoothing (inside the plotter):</b><br>"
+            "Up-down drag: adjust Gaussian<br>"
+            "Left-right drag: adjust Median<br>"
+            "Release to apply</small>"
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #666666; font-size: 8pt;")
+        smoothing_layout.addWidget(info_label)
+        
+        smoothing_layout.addStretch()
+        content_widget.setLayout(smoothing_layout)
+        
+        # Set content widget into scroll area
+        scroll_area.setWidget(content_widget)
+        
+        # Store scroll area as smoothing_container for tab integration
+        self.smoothing_container = scroll_area
 
     def on_save_directory_changed(self):
         """Handle changes to the save directory input field"""
@@ -1043,6 +1383,19 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         except Exception as e:
             # If invalid path, revert to previous value
             self.save_directory_input.setText(self.save_directory)
+
+    def on_browse_save_directory(self):
+        """Open file dialog to select save directory"""
+        directory = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select Save Directory",
+            self.save_directory,
+            QtWidgets.QFileDialog.ShowDirsOnly | QtWidgets.QFileDialog.DontResolveSymlinks
+        )
+        if directory:
+            self.save_directory = directory
+            self.qsap_handler.save_directory = directory
+            self.save_directory_input.setText(directory)
 
     def on_browse_load_directory(self):
         """Open file dialog to select load directory"""
@@ -1109,7 +1462,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # Update polynomial order from Options panel input field
             try:
                 self.poly_order = int(self.options_poly_order_input.text())
-                print(f"Polynomial order set to: {self.poly_order}")
+                # Don't print polynomial order changes triggered by Apply button
             except ValueError:
                 print("Invalid polynomial order")
             
@@ -1139,6 +1492,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             "",
             "All Files (*);;FITS Files (*.fits *.fit);;ASCII Files (*.txt *.dat)"
         )
+        # Use native macOS file picker (spurious Finder window issue was fixed)
+        dialog.setOption(QFileDialog.DontUseNativeDialog, False)
         dialog.setFileMode(QFileDialog.ExistingFiles)
         
         if dialog.exec_() != QFileDialog.Accepted:
@@ -1225,6 +1580,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.load_directory,
             "QSAP Files (*.qsap);;CSV Files (*.csv);;All Files (*)"
         )
+        # Use Qt-styled dialog to avoid spurious Finder windows on macOS during initialization
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
         dialog.setFileMode(QFileDialog.ExistingFiles)
         
         if dialog.exec_() != QFileDialog.Accepted:
@@ -1330,8 +1687,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     self.voigt_fits.append(fit_dict)
                     # Register with ItemTracker
                     position_str = f"λ: {fit_dict.get('center', 0):.2f} Å"
+                    voigt_cfg = self.colors['profiles']['voigt']
                     self.register_item('voigt', f'Voigt', fit_dict=fit_dict, position=position_str,
-                                     color='orange')
+                                     color=voigt_cfg['color'])
             print(f"  Loaded {len(components)} Voigt components")
             
         elif fit_type == 'Continuum':
@@ -1389,8 +1747,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     if fit_dict:
                         self.voigt_fits.append(fit_dict)
                         position_str = f"λ: {fit_dict.get('center', 0):.2f} Å"
+                        voigt_cfg = self.colors['profiles']['voigt']
                         self.register_item('voigt', f'Voigt (listfit)', fit_dict=fit_dict, 
-                                         position=position_str, color='orange')
+                                         position=position_str, color=voigt_cfg['color'])
                 elif comp.get('TYPE') == 'Polynomial':
                     fit_dict = self._parse_qsap_polynomial_component(comp)
                     if fit_dict:
@@ -1704,7 +2063,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         self.legend_profile_types.add('gaussian')
                     
                     # Register with item tracker - use saved name if available
-                    name = fit.get('_tracker_name') or f"Gaussian (μ={fit['mean']:.1f}, σ={fit['stddev']:.1f})"
+                    name = fit.get('_tracker_name') or f"Gaussian (mu={fit['mean']:.1f}, sigma={fit['stddev']:.1f})"
                     self.register_item('gaussian', name, fit_dict=fit, line_obj=fit['line'], 
                                      color=gaussian_color['color'], bounds=fit['bounds'])
                 except Exception as e:
@@ -1730,7 +2089,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         self.legend_profile_types.add('voigt')
                     
                     # Register with item tracker - use saved name if available
-                    name = fit.get('_tracker_name') or f"Voigt (c={fit['center']:.1f}, σ={fit['sigma']:.1f}, γ={fit['gamma']:.1f})"
+                    name = fit.get('_tracker_name') or f"Voigt (c={fit['center']:.1f}, sigma={fit['sigma']:.1f}, gamma={fit['gamma']:.1f})"
                     self.register_item('voigt', name, fit_dict=fit, line_obj=fit['line'],
                                      color=voigt_color['color'], bounds=fit['bounds'])
                 except Exception as e:
@@ -2063,45 +2422,19 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
 
     def clear_all_fits(self):
         """Clear all fits (Gaussian, Voigt, continuum, listfit) and remove them from plot."""
-        # Remove all fit lines and continuum patches from the plot
-        for fit in self.gaussian_fits:
-            if 'line' in fit and fit['line']:
-                try:
-                    fit['line'].remove()
-                except (ValueError, AttributeError):
-                    pass
+        # **Important**: Clear Item Tracker FIRST so its deletion signals trigger handlers properly.
+        # The handlers will remove items from internal lists (gaussian_fits, voigt_fits, etc.)
+        # Do NOT manually clear fit lists before calling item_tracker.clear_all()
+        # because the handlers need access to item_id_map to find item information
+        self.item_tracker.clear_all()
         
-        for fit in self.voigt_fits:
-            if 'line' in fit and fit['line']:
-                try:
-                    fit['line'].remove()
-                except (ValueError, AttributeError):
-                    pass
-        
-        for fit in self.listfit_fits:
-            if 'line' in fit and fit['line']:
-                try:
-                    fit['line'].remove()
-                except (ValueError, AttributeError):
-                    pass
-        
-        # Remove continuum patches
-        for patch in self.continuum_patches:
-            if 'patch_obj' in patch and patch['patch_obj']:
-                try:
-                    patch['patch_obj'].remove()
-                except (ValueError, AttributeError):
-                    pass
-        
-        # Clear all fit lists
+        # Now that all Item Tracker items have been deleted via signals,
+        # clear the internal fit lists and related data structures
         self.gaussian_fits.clear()
         self.voigt_fits.clear()
         self.continuum_fits.clear()
         self.listfit_fits.clear()
         self.continuum_patches.clear()
-        
-        # Clear item tracker
-        self.item_tracker.clear_all()
         self.item_id_map.clear()
         self.highlighted_item_ids.clear()
         self.fit_information_window.clear_all()
@@ -2141,6 +2474,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
 
     def quit_application(self):
         """Quit the QSAP application gracefully"""
+        import sys
         try:
             # Show goodbye message in terminal
             message = "Quitting QSAP. Bye!"
@@ -2148,6 +2482,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             print("\n" + "╔" + "═" * (box_width) + "╗")
             print("║" + message + "║")
             print("╚" + "═" * (box_width) + "╝\n")
+            sys.stdout.flush()
             
             # Close all child windows
             if hasattr(self, 'help_window') and self.help_window is not None:
@@ -2174,8 +2509,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # Close main window
             self.close()
             
-            # Quit the application
-            QtWidgets.QApplication.quit()
+            # Exit cleanly without triggering crash handlers
+            sys.exit(0)
         except Exception as e:
             print(f"Error during quit: {e}")
             import sys
@@ -2396,6 +2731,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # Add matplotlib toolbar
             from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
             self.toolbar = NavigationToolbar2QT(self.canvas, self)
+            # Make toolbar icons half as big (default is 24x24, set to 12x12)
+            from PyQt5.QtCore import QSize
+            self.toolbar.setIconSize(QSize(16, 16))
             wrapper_layout.addWidget(self.toolbar)
             
             # Add canvas
@@ -2415,11 +2753,12 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.center_splitter = center_splitter
             self.setCentralWidget(center_splitter)
             
-            # Create tab widget for dockable Control Panel + Item Tracker + Settings
+            # Create tab widget for dockable Control Panel + Item Tracker + Settings + Smoothing
             top_tab_widget = QtWidgets.QTabWidget()
             top_tab_widget.addTab(self.control_panel_container, "Control Panel")
             top_tab_widget.addTab(self.item_tracker, "Item Tracker")
             top_tab_widget.addTab(self.settings_container, "Settings")
+            top_tab_widget.addTab(self.smoothing_container, "Smoothing")
             
             # Create dock widget for the tab widget (Control Panel - top/left)
             self.control_panel_dock = QtWidgets.QDockWidget("Control Panel", self)
@@ -2453,7 +2792,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # Connect matplotlib events to SpectrumPlotter handlers
             self.fig.canvas.mpl_connect('key_press_event', self.on_key)
             self.fig.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
-            self.fig.canvas.mpl_connect('button_press_event', self.on_canvas_click)
+            self.fig.canvas.mpl_connect('button_press_event', self.on_mouse_press)
+            self.fig.canvas.mpl_connect('button_release_event', self.on_mouse_release)
             
             # Ensure canvas can receive focus for keyboard events
             self.canvas.setFocus()
@@ -2466,6 +2806,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         error_cfg = self.colors['spectrum']['error']
         self.step_spec, = self.ax.step(self.x_data, self.spec, label='Data', color=data_cfg['color'], where='mid', zorder=0)
         self.line_spec, = self.ax.plot(self.x_data, self.spec, color=data_cfg['color'], visible=False, zorder=0)
+        
+        # Set initial plot style to match the visible plot (step plot is displayed first)
+        self.is_step_plot = True
         
         # Only plot error if errors exist
         if self.err is not None:
@@ -2527,7 +2870,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Connect keyboard and mouse events to the canvas
         self.fig.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
         self.fig.canvas.mpl_connect("key_press_event", self.on_key)
-        self.fig.canvas.mpl_connect('button_press_event', self.on_canvas_click)
+        self.fig.canvas.mpl_connect('button_press_event', self.on_mouse_press)
+        self.fig.canvas.mpl_connect('button_release_event', self.on_mouse_release)
         
         # Connect x-bounds update to the axes
         self.ax.callbacks.connect('xlim_changed', self.update_residual_xbounds)
@@ -2937,6 +3281,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.listfit_bound_lines = []
             self.listfit_components = []
             print("Listfit mode: Use the spacebar to define left and right boundaries.")
+            print("            Or press ENTER/RETURN to use the full spectral range.")
             self.record_action('activate_listfit_mode', 'Activated Listfit Mode')
         elif mode_text == "Bayes Fit":
             # Activate bayes mode (same as pressing ':')
@@ -3312,6 +3657,27 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.calculate_mode_dropdown.blockSignals(True)
             self.calculate_mode_dropdown.setCurrentIndex(0)
             self.calculate_mode_dropdown.blockSignals(False)
+        
+        # Deactivate guess drawing mode
+        if self.guess_drawing_mode:
+            self._cancel_guess()
+            modes_deactivated.append("Guess Drawing")
+        
+        # Deactivate constraint bounds setting mode
+        if self.constraint_bounds_mode:
+            self.constraint_bounds_mode = False
+            self.constraint_parameter = None
+            self.constraint_bounds_drag_start_x = None
+            self.constraint_bounds_drag_end_x = None
+            if self.constraint_bounds_preview_line is not None:
+                try:
+                    self.constraint_bounds_preview_line.remove()
+                except (ValueError, RuntimeError):
+                    pass
+            self.constraint_bounds_preview_line = None
+            self.current_constraint_editor = None
+            self.current_constraint_editor_dialog = None
+            modes_deactivated.append("Constraint Bounds Setting")
         
         # Redraw canvas
         if self.ax is not None:
@@ -3703,25 +4069,202 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         
         self.fig.canvas.draw_idle()
 
-    # Smooth the spectrum with a Gaussian kernel
-    def smooth_spectrum(self, kernel_width):
-        from scipy.ndimage import gaussian_filter1d  # Import here to avoid global imports
-
-        # [DEBUG] Ensure original spectrum data is present
+    # Smooth the spectrum with optional median and/or Gaussian filtering
+    def smooth_spectrum(self, median_kernel=1, gaussian_sigma=0.0):
+        """Apply median and/or Gaussian smoothing to spectrum.
+        
+        Args:
+            median_kernel: Median filter kernel size (odd integer, 1=no smoothing)
+            gaussian_sigma: Gaussian filter sigma (0=no smoothing)
+        """
+        from scipy.ndimage import gaussian_filter1d, median_filter
+        
         if self.original_spec is None:
             print("Error: original_spec is not defined.")
-            return
-
-        print("Applying Gaussian smoothing with kernel width:", kernel_width)
-        self.smoothed_spec = gaussian_filter1d(self.original_spec, sigma=kernel_width)
+            return False
         
-        # [DEBUG] Verify smoothing result
-        print("Smoothed spectrum (first 5 values):", self.smoothed_spec[:5])
-
-        if self.smoothed_spec is not None:  # Check if the spectrum_line is defined
-            print("Spectrum line updated with smoothed data.")
+        # Start with original spectrum
+        result_spec = np.copy(self.original_spec)
+        
+        # Apply median filter if kernel > 1
+        if median_kernel > 1:
+            # Ensure kernel is odd
+            if median_kernel % 2 == 0:
+                median_kernel += 1
+            result_spec = median_filter(result_spec, size=median_kernel)
+        
+        # Apply Gaussian filter if sigma > 0
+        if gaussian_sigma > 0:
+            result_spec = gaussian_filter1d(result_spec, sigma=gaussian_sigma)
+        
+        if median_kernel > 1 or gaussian_sigma > 0:
+            self.smoothed_spec = result_spec
+            return True
         else:
-            print("Error: spectrum_line is not defined.")
+            self.smoothed_spec = result_spec
+            return False
+
+    def _update_spectrum_display(self, spec_data):
+        """Update the plotted spectrum with new data (smoothed or original)
+        
+        NOTE: This method preserves the current plot style (step vs line).
+        The plot style is ONLY changed by:
+        - Pressing '~' key
+        - Clicking 'Toggle Step/Line Plot' button
+        - It is NOT changed by smoothing operations
+        """
+        if self.spectrum_line is None:
+            return
+        
+        # Preserve current plot style
+        saved_plot_style = self.is_step_plot
+        
+        # Hide old lines
+        self.step_spec.set_visible(False)
+        self.line_spec.set_visible(False)
+        self.spectrum_line.set_visible(False)
+        self.fig.canvas.draw_idle()
+        
+        # Create new step and line plots
+        self.step_spec, = self.ax.step(self.x_data, spec_data, color='black', where='mid', zorder=0)
+        self.line_spec, = self.ax.plot(self.x_data, spec_data, color='black', visible=False, zorder=0)
+        
+        # Restore the saved plot style (do NOT change the style during display update)
+        self.is_step_plot = saved_plot_style
+        
+        # Update current spectrum_line reference based on preserved plot style
+        if self.is_step_plot:
+            self.step_spec.set_visible(True)
+            self.line_spec.set_visible(False)
+            self.spectrum_line = self.step_spec
+        else:
+            self.step_spec.set_visible(False)
+            self.line_spec.set_visible(True)
+            self.spectrum_line = self.line_spec
+        
+        self.fig.canvas.draw_idle()
+
+    def on_smoothing_apply(self):
+        """Apply smoothing based on current input values"""
+        try:
+            median_kernel = int(self.smoothing_median_input.text())
+            gaussian_sigma = float(self.smoothing_gaussian_input.text())
+        except ValueError:
+            print("Invalid smoothing input values. Please enter integers for Median and floats for Gaussian.")
+            return
+        
+        # Validate ranges
+        if median_kernel < 1:
+            median_kernel = 1
+            self.smoothing_median_input.setText("1")
+        if gaussian_sigma < 0:
+            gaussian_sigma = 0.0
+            self.smoothing_gaussian_input.setText("0.0")
+        
+        # Store previous values before applying new ones
+        self.smoothing_prev_median = self.last_applied_median
+        self.smoothing_prev_gaussian = self.last_applied_gaussian
+        
+        # Apply smoothing
+        if self.smooth_spectrum(median_kernel, gaussian_sigma):
+            self._update_spectrum_display(self.smoothed_spec)
+            self.last_applied_median = median_kernel
+            self.last_applied_gaussian = gaussian_sigma
+
+    def on_smoothing_reset(self):
+        """Reset to previous smoothing values"""
+        self.smoothing_median_input.setText(str(self.smoothing_prev_median))
+        self.smoothing_gaussian_input.setText(str(self.smoothing_prev_gaussian))
+        self.on_smoothing_apply()
+
+    def on_smoothing_original(self):
+        """Reset to original unsmoothed spectrum and return joystick to center"""
+        self.smoothing_median_input.setText("1")
+        self.smoothing_gaussian_input.setText("0.0")
+        self.smoothing_prev_median = self.last_applied_median
+        self.smoothing_prev_gaussian = self.last_applied_gaussian
+        self._update_spectrum_display(self.original_spec)
+        self.last_applied_median = 1
+        self.last_applied_gaussian = 0.0
+        # Reset joystick to center
+        self.smoothing_joystick.x_pos = 0.5
+        self.smoothing_joystick.y_pos = 0.5
+        self.smoothing_joystick.update()
+        print("Restored original spectrum")
+
+    def on_toggle_step_line(self):
+        """Toggle between step and line plot"""
+        self.is_step_plot = not self.is_step_plot
+        self.step_spec.set_visible(self.is_step_plot)
+        self.line_spec.set_visible(not self.is_step_plot)
+        
+        if self.step_error is not None:
+            self.step_error.set_visible(self.is_step_plot)
+        if self.line_error is not None:
+            self.line_error.set_visible(not self.is_step_plot)
+        
+        self.spectrum_line = self.step_spec if self.is_step_plot else self.line_spec
+        if self.step_error is not None:
+            self.error_line = self.step_error if self.is_step_plot else self.line_error
+        
+        self.fig.canvas.draw_idle()
+        print("Plot style toggled:", "Step plot" if self.is_step_plot else "Line plot")
+
+    def on_smoothing_interactive_mode_changed(self, state):
+        """Handle toggling of interactive smoothing mode"""
+        self.smoothing_interactive_mode = (state == QtCore.Qt.Checked)
+        if self.smoothing_interactive_mode:
+            print("Interactive smoothing mode ENABLED")
+            print("  Up-Down drag: adjust Gaussian sigma")
+            print("  Left-Right drag: adjust Median kernel")
+        else:
+            print("Interactive smoothing mode DISABLED")
+
+    def on_joystick_x_moved(self, x_pos):
+        """Handle joystick X movement (left-right) - controls Median kernel"""
+        # x_pos is 0-1, centered at 0.5
+        # Symmetric mapping: center (0.5) = 1, edges (0 or 1) = 15
+        min_kernel = 1
+        max_kernel = 15
+        
+        # Only update if not at center (deadzone)
+        if abs(x_pos - 0.5) > 0.05:
+            # Distance from center (0 to 0.5)
+            distance = abs(x_pos - 0.5)
+            # Map distance to kernel value (symmetric, both sides increase)
+            kernel_val = min_kernel + (distance / 0.5) * (max_kernel - min_kernel)
+            # Make it odd (required for median)
+            kernel_val = int(kernel_val) if int(kernel_val) % 2 == 1 else int(kernel_val) + 1
+            kernel_val = max(min_kernel, min(max_kernel, kernel_val))
+            
+            self.smoothing_median_input.setText(str(kernel_val))
+            self.on_smoothing_apply()
+        else:
+            # At center (deadzone) = no smoothing
+            self.smoothing_median_input.setText("1")
+            self.on_smoothing_apply()
+
+    def on_joystick_y_moved(self, y_pos):
+        """Handle joystick Y movement (up-down) - controls Gaussian sigma"""
+        # y_pos is 0-1, centered at 0.5
+        # Symmetric mapping: center (0.5) = 0.0, edges (0 or 1) = 5.0
+        min_sigma = 0.0
+        max_sigma = 5.0
+        
+        # Only update if not at center (deadzone)
+        if abs(y_pos - 0.5) > 0.05:
+            # Distance from center (0 to 0.5)
+            distance = abs(y_pos - 0.5)
+            # Map distance to sigma value (symmetric, both sides increase)
+            sigma_val = min_sigma + (distance / 0.5) * (max_sigma - min_sigma)
+            sigma_val = max(min_sigma, min(max_sigma, sigma_val))
+            
+            self.smoothing_gaussian_input.setText(f"{sigma_val:.2f}")
+            self.on_smoothing_apply()
+        else:
+            # At center (deadzone) = no smoothing
+            self.smoothing_gaussian_input.setText("0.0")
+            self.on_smoothing_apply()
 
     # Check if there is an existing fitted continuum covering the current bounds
     def get_existing_continuum(self, left_bound, right_bound):
@@ -3742,6 +4285,20 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         except (ValueError, KeyError):
             print("No existing continuum within bounds")
             return None, None, None
+    
+    def get_continuum_fit_dict(self, left_bound, right_bound):
+        """Get the continuum fit dictionary for a given bound region
+        
+        Returns the full continuum fit dict (with coeffs, covariance, etc.)
+        if one exists that encompasses the bounds, None otherwise
+        """
+        try:
+            for continuum_fit in self.continuum_fits:
+                if continuum_fit['bounds'][0] <= left_bound and continuum_fit['bounds'][1] >= right_bound:
+                    return continuum_fit
+            return None
+        except (ValueError, KeyError):
+            return None
     
     def check_continuum_partial_overlap(self, left_bound, right_bound):
         """Check if fit bounds partially overlap with any continuum region.
@@ -3827,9 +4384,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Calculate the equivalent width (EW) using the trapezoidal rule
         if self.is_velocity_mode:
             x_values
-            ew = (self.rest_wavelength/c_in_km_per_s) * np.trapz(1 - (profile_values + continuum_values) / continuum_values, x_values)
+            ew = (self.rest_wavelength/c_in_km_per_s) * trapz_compat(1 - (profile_values + continuum_values) / continuum_values, x_values)
         else:
-            ew = np.trapz(1 - (profile_values + continuum_values) / continuum_values, x_values)
+            ew = trapz_compat(1 - (profile_values + continuum_values) / continuum_values, x_values)
         ew_r = ew / (1 + self.redshift)
 
         # Calculate the equivalent width (EW) using summation
@@ -3844,7 +4401,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
     
     # Code for EW from Gaussian
     def expr_ew(self, comp_x, cont_y, model_y, redshift):
-        ew = np.trapz(1 - (model_y + cont_y) / cont_y, comp_x)
+        ew = trapz_compat(1 - (model_y + cont_y) / cont_y, comp_x)
         ew_r = ew / (1 + redshift)
         return ew, ew_r
 
@@ -3870,11 +4427,26 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.residual_line.set_xdata(self.velocities)
         
     def toggle_residual_panel(self):
+        """Toggle residual panel on/off. When shown, spectrum shrinks to make room."""
         if not self.is_residual_shown:
+            # Show residual panel
+            # Shrink main spectrum plot to make room for residual below it
+            # Original position: left=0.125, bottom=0.1, width=0.775, height=0.8
+            # Split: spectrum gets 60% height at top, residual gets 20% height at bottom, with NO gap between them
+            
+            spectrum_position = [0.125, 0.3, 0.775, 0.6]   # Spectrum: top 60% (from 0.3 to 0.9)
+            residual_position = [0.125, 0.1, 0.775, 0.2]   # Residual: bottom 20% (from 0.1 to 0.3)
+            
+            # Resize spectrum plot
+            self.ax.set_position(spectrum_position)
+            
             # Create residual panel only if it doesn't exist
             if self.residual_ax is None:
-                # Create a new axis for residuals below the spectrum
-                self.residual_ax = self.fig.add_axes([0.125, 0.2, 0.775, 0.15])  # Adjusted position and height and position below the main plot
+                self.residual_ax = self.fig.add_axes(residual_position)
+            else:
+                # Resize existing residual axes
+                self.residual_ax.set_position(residual_position)
+            
             if self.is_velocity_mode:
                 self.residual_ax.set_xlabel(r"Velocity (km s$^{-1}$)")
             else:
@@ -3888,15 +4460,25 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.residual_ax.set_xlim(self.ax.get_xlim())  # Match x-bounds with the main plot
             self.update_residual_ybounds()
             self.is_residual_shown = True
+            print("Residual panel shown")
         else:
-            # Hide the residual panel
-            self.residual_ax.clear()
-            self.residual_ax.set_visible(False)
+            # Hide residual panel
+            # Restore spectrum plot to full size
+            spectrum_position = [0.125, 0.1, 0.775, 0.8]  # Full height
+            self.ax.set_position(spectrum_position)
+            
+            # Hide residual axes
+            if self.residual_ax is not None:
+                self.residual_ax.clear()
+                self.residual_ax.set_visible(False)
+            
             self.is_residual_shown = False
+            
+            # Restore x-ticks to main plot
+            self.ax.set_xticks(self.ax.get_xticks())
+            print("Residual panel hidden")
 
-            self.ax.set_xticks(self.ax.get_xticks())  # Restore the x-ticks based on current limits
-
-        plt.draw()  # Refresh plot to show/hide residual panel
+        self.fig.canvas.draw_idle()  # Refresh plot to show/hide residual panel
 
     def toggle_total_line(self):
         """Toggle the total line for ALL fitted profiles (single, multi-gaussian, voigt, continuum, listfit)"""
@@ -3982,22 +4564,19 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     continue  # No data points in this range
                 comp_x = self.x_data[mask]
                 components = listfit['components']
-                result = listfit['result']
                 
                 # Add polynomial components from the listfit (already filtered - deleted ones removed)
                 poly_count = 0
                 for comp in components:
                     if comp['type'] == 'polynomial':
                         order = comp.get('order', 1)
-                        prefix = f'p{poly_count}_'
-                        poly_coeffs = []
-                        for i in range(order + 1):
-                            coeff_val = result.params[f'{prefix}c{i}'].value
-                            poly_coeffs.append(coeff_val)
-                        # Reverse coefficients for np.polyval (expects highest order first)
-                        poly_coeffs = poly_coeffs[::-1]
-                        y_poly = np.polyval(poly_coeffs, comp_x)
-                        listfit_poly_sum[mask] += y_poly
+                        # Get stored coefficients from component (precomputed during fit)
+                        poly_coeffs = comp.get('coeffs', [])
+                        if poly_coeffs:
+                            # Reverse coefficients for np.polyval (expects highest order first)
+                            poly_coeffs_reversed = poly_coeffs[::-1]
+                            y_poly = np.polyval(poly_coeffs_reversed, comp_x)
+                            listfit_poly_sum[mask] += y_poly
                         poly_count += 1
 
         # Calculate residual as (spectrum - fitted Gaussians - Voigts - continuum - listfit polynomials)
@@ -4270,16 +4849,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         print("Exited velocity mode and reverted to wavelength space.")
 
     # Define fitted functions
-    def gaussian(self, x, amp, mean, stddev):
-        y = amp * np.exp(-(x - mean)**2 / (2 * stddev**2))
+    def gaussian(self, x, amp, mu, sigma):
+        y = amp * np.exp(-(x - mu)**2 / (2 * sigma**2))
         # return y
         return self.apply_lsf(y)
 
     def multi_gaussian(self, x, *params):
         y = np.zeros_like(x)
         for i in range(0, len(params), 3):
-            amp, mean, stddev = params[i:i+3]
-            y += self.gaussian(x, amp, mean, stddev)
+            amp, mu, sigma = params[i:i+3]
+            y += self.gaussian(x, amp, mu, sigma)
         return y
 
     def multi_gaussian_sharedsigma(self, x, *params):
@@ -4655,10 +5234,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         for linelist_info in self.active_line_lists:
             linelist = linelist_info['linelist']
             color = linelist_info['color']
+            # Check if this line list should be updated with redshift (default: True for backward compatibility)
+            apply_redshift = linelist_info.get('apply_redshift', True)
             
             for line in linelist.lines:
-                # Apply redshift to the line wavelength (linelist is in Angstroms)
-                shifted_wl = line.wave * (1 + self.redshift)
+                # Apply redshift to the line wavelength only if apply_redshift is True
+                if apply_redshift:
+                    shifted_wl = line.wave * (1 + self.redshift)
+                else:
+                    # Use rest-frame wavelength without redshift
+                    shifted_wl = line.wave
                 
                 # Convert from Angstroms to current display unit
                 shifted_wl_display = self._convert_wavelength_from_angstrom(shifted_wl)
@@ -4786,7 +5371,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             'position': position,
             'color': color,
             'bounds': bounds,
-            'original_linewidth': original_linewidth
+            'original_linewidth': original_linewidth,
+            'original_zorder': line_obj.get_zorder() if line_obj else None
         }
         self.item_tracker.add_item(item_id, item_type, name, position=position, color=color, line_obj=line_obj)
         # Also add to Fit Information window
@@ -4797,7 +5383,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         """Remove item from tracker"""
         if item_id in self.item_id_map:
             del self.item_id_map[item_id]
-            self.item_tracker.remove_item(item_id)
+            # Only call item_tracker.remove_item if the item is still in the tracker
+            # (to avoid double-removal during clear_all operations)
+            if item_id in self.item_tracker.items:
+                self.item_tracker.remove_item(item_id)
             self.fit_information_window.remove_fit(item_id)
         
         # Clean up highlighting tracking if this item was highlighted
@@ -4832,10 +5421,12 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         # Skip non-profile components (polynomial, masks, diagnostics)
                         if component_type not in ['gaussian', 'voigt']:
                             continue
-                        component_fit_type = component_type
-                    else:
-                        # For multi-Gaussian or multi-Voigt, use the provided fit_type
-                        component_fit_type = fit_type.lower()
+                        # Skip EW calculation for listfit components here
+                        # (we have a dedicated auto EW feature that runs during perform_listfit)
+                        continue
+                    
+                    # For non-listfit types (Multi-Gaussian, Multi-Voigt), use the provided fit_type
+                    component_fit_type = fit_type.lower()
                     
                     # DEBUG: Check structure of fit dict
                     component_id = fit.get('component_id', '?')
@@ -5029,7 +5620,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             normalized_diff = (continuum_level - y_profile) / continuum_level
             
             # Integrate using trapezoidal rule
-            ew = np.trapz(normalized_diff, x_int)
+            ew = trapz_compat(normalized_diff, x_int)
             
             # Apply sign convention: 
             # - Emission lines (positive amplitude): EW should be negative
@@ -5076,9 +5667,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             params = [fit_dict.get('amp'), fit_dict.get('mean'), fit_dict.get('stddev')]
             names = ['amp', 'mean', 'stddev']
         elif fit_type == 'voigt':
-            params = [fit_dict.get('amplitude'), fit_dict.get('center', fit_dict.get('mean')), 
+            # Try 'amp' first (from single Voigt mode), fall back to 'amplitude' (from other modes)
+            amp = fit_dict.get('amp') if fit_dict.get('amp') is not None else fit_dict.get('amplitude')
+            params = [amp, fit_dict.get('center', fit_dict.get('mean')), 
                      fit_dict.get('sigma'), fit_dict.get('gamma')]
-            names = ['amplitude', 'center', 'sigma', 'gamma']
+            names = ['amp', 'center', 'sigma', 'gamma']
         else:
             return None, None
         
@@ -5105,6 +5698,60 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             return self.voigt(x, amp, center, sigma, gamma)
         else:
             raise ValueError(f"Unknown fit type: {fit_type}")
+    
+    def _reconstruct_tied_parameters(self, result, free_param_sample, free_param_names):
+        """Reconstruct all parameter values from a sample of free parameters.
+        
+        When parameters are tied (e.g., g0_sigma = g1_sigma * (1+Z1)), this method:
+        1. Takes a sample of only the free parameters
+        2. Reconstructs values of all tied parameters using their tie expressions
+        3. Returns dict mapping all parameter names to their values
+        
+        Args:
+            result: lmfit fit result object (contains tie expressions)
+            free_param_sample: array of sampled free parameter values (one-to-one with free_param_names)
+            free_param_names: list of free parameter names in sample order (from result.var_names)
+        
+        Returns:
+            Dictionary mapping all parameter names (free + tied) to their values
+        """
+        # Build initial dict with free parameters from the sample
+        all_params = {}
+        for i, name in enumerate(free_param_names):
+            all_params[name] = free_param_sample[i]
+        
+        # Now reconstruct tied parameters using their expressions
+        for param_name in result.params.keys():
+            if param_name not in all_params:  # This parameter is tied or fixed
+                param = result.params[param_name]
+                if param.expr is not None:
+                    # Evaluate the tie expression using the parameters we have so far
+                    try:
+                        # Create a namespace for eval() using currently available parameters
+                        namespace = {name: all_params[name] for name in all_params}
+                        # Also add common math functions
+                        namespace.update({
+                            'sqrt': np.sqrt,
+                            'exp': np.exp,
+                            'log': np.log,
+                            'sin': np.sin,
+                            'cos': np.cos,
+                            'abs': abs
+                        })
+                        # Evaluate the expression
+                        value = float(eval(param.expr, {"__builtins__": {}}, namespace))
+                        all_params[param_name] = value
+                    except Exception as e:
+                        print(f"[MC] WARNING: Could not evaluate tie expression for {param_name}: {param.expr}")
+                        print(f"[MC]   Error: {e}")
+                        print(f"[MC]   Available parameters: {list(all_params.keys())}")
+                        # Fall back to initial guess
+                        all_params[param_name] = result.params[param_name].value if result.params[param_name].value is not None else 0.0
+                else:
+                    # Fixed parameter - use its value
+                    all_params[param_name] = result.params[param_name].value if result.params[param_name].value is not None else 0.0
+        
+        return all_params
     
     def _calculate_equivalent_width_monte_carlo(self, fit_dict, continuum_fit_dict, fit_type='gaussian', n_samples=1000):
         """Calculate equivalent width using Monte Carlo error propagation
@@ -5144,21 +5791,41 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             if profile_cov is None:
                 return None
             if isinstance(profile_cov, list):
-                profile_cov = np.array(profile_cov)
+                profile_cov = np.array(profile_cov, dtype=float)
+            elif not isinstance(profile_cov, np.ndarray):
+                profile_cov = np.array(profile_cov, dtype=float)
             
             cont_cov = continuum_fit_dict.get('covariance') if continuum_fit_dict else None
             
             # Get continuum polynomial if available
             cont_coeffs = None
             if continuum_fit_dict and 'coeffs' in continuum_fit_dict:
-                cont_coeffs = np.array(continuum_fit_dict['coeffs'])
+                cont_coeffs = np.array(continuum_fit_dict['coeffs'], dtype=float)
                 if isinstance(cont_cov, list):
-                    cont_cov = np.array(cont_cov)
+                    cont_cov = np.array(cont_cov, dtype=float)
+                elif cont_cov is not None and not isinstance(cont_cov, np.ndarray):
+                    cont_cov = np.array(cont_cov, dtype=float)
                 
-                # Validate we have proper covariance matrix
+                # Validate covariance matrix shape and non-singularity
                 if cont_cov is None:
                     print("[MC] ERROR: Continuum covariance matrix is missing")
                     return None
+                
+                # Check shape matches coefficients
+                expected_shape = (len(cont_coeffs), len(cont_coeffs))
+                if cont_cov.shape != expected_shape:
+                    print(f"[MC] ERROR: Covariance shape {cont_cov.shape} doesn't match coeffs count {len(cont_coeffs)}")
+                    # Try to fix by rebuilding diagonal covariance
+                    cont_cov = np.diag(np.diag(cont_cov)) if cont_cov.ndim == 2 else np.diag([1e-10] * len(cont_coeffs))
+                    print(f"[MC]   Rebuilt as diagonal: {cont_cov.shape}")
+                
+                # Check for zero/near-zero variance
+                cov_diag = np.diag(cont_cov) if cont_cov.ndim == 2 else cont_cov
+                if np.any(cov_diag <= 0):
+                    print("[MC] WARNING: Covariance matrix has zero or negative diagonal elements")
+                    # Replace with small default values
+                    cont_cov = np.diag(np.maximum(cov_diag, 1e-20))
+                    print(f"[MC]   Replaced with small defaults to avoid singular matrix")
             
             # Integration grid
             x_int = np.linspace(bounds[0], bounds[1], 200)
@@ -5167,42 +5834,223 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             profile_samples = []  # Store all realized profiles
             continuum_samples = []  # Store all realized continua
             
-            # Monte Carlo loop
-            for sample_idx in range(n_samples):
-                # Extract profile parameters based on fit_type
-                profile_params, param_names = self._get_profile_params_from_dict(fit_dict, fit_type)
-                if profile_params is None:
-                    return None
+            # Extract profile parameters FIRST (needed for singularity check and MC loop)
+            profile_params, param_names = self._get_profile_params_from_dict(fit_dict, fit_type)
+            if profile_params is None:
+                return None
+            
+            # Convert to float array to ensure proper dtype
+            profile_params = np.array(profile_params, dtype=float)
+            
+            # Check if this fit has tied parameters by looking for result object in fit_dict
+            has_tied_params = 'result' in fit_dict
+            result_obj = fit_dict.get('result')
+            
+            tried_tied_path = False  # Track whether we attempted tied path
+            
+            if has_tied_params and result_obj is not None:
+                # Try MC sampling with tied parameter reconstruction
+                tried_tied_path = True
+                try:
+                    print("[MC] ========== TIED PARAMETER PATH ==========")
+                    print("[MC] Sampling with tied parameter reconstruction")
+                    
+                    # Get free parameter names and covariance from lmfit result
+                    free_param_names = result_obj.var_names  # List of free parameter names
+                    free_param_covariance = np.array(result_obj.covar, dtype=float) if result_obj.covar is not None else None
+                    
+                    if free_param_covariance is None:
+                        print("[MC] ERROR: Free parameter covariance not available")
+                        raise RuntimeError("Free parameter covariance is None")
+                    
+                    # Extract best-fit values of free parameters (in the order of var_names)
+                    free_param_values = np.array([result_obj.params[name].value for name in free_param_names], dtype=float)
+                    
+                    # Check if free-parameter covariance is singular
+                    try:
+                        cov_det = np.linalg.det(free_param_covariance)
+                        if abs(cov_det) < 1e-10:
+                            print("[MC] WARNING: Free-parameter covariance matrix is singular!")
+                            print("[MC]   This is unexpected - lmfit should only include free params in covar")
+                    except (np.linalg.LinAlgError, ValueError):
+                        print("[MC] WARNING: Could not compute determinant of free-parameter covariance")
+                    
+                    print(f"[MC] Free parameters: {free_param_names}")
+                    print(f"[MC] Free param values: {free_param_values}")
+                    print(f"[MC] Free param covariance shape: {free_param_covariance.shape}")
+                    
+                    # Monte Carlo loop with tied parameter reconstruction
+                    for sample_idx in range(n_samples):
+                        try:
+                            # Sample free parameters from their covariance
+                            try:
+                                free_param_sample = np.random.multivariate_normal(free_param_values, free_param_covariance)
+                            except (np.linalg.LinAlgError, ValueError) as e:
+                                print(f"[MC] ERROR: Cannot sample from free-parameter covariance: {e}")
+                                raise  # Re-raise to exit tied path and try non-tied
+                            
+                            # Reconstruct all parameters (free + tied) using tie expressions
+                            all_params_dict = self._reconstruct_tied_parameters(result_obj, free_param_sample, free_param_names)
+                            
+                            # Extract parameters for this specific component
+                            component_prefix = fit_dict.get('component_prefix')
+                            param_names_list = fit_dict.get('param_names', [])
+                            
+                            component_params = []
+                            for pname in param_names_list:
+                                full_name = f'{component_prefix}{pname}'
+                                if full_name in all_params_dict:
+                                    component_params.append(all_params_dict[full_name])
+                                else:
+                                    print(f"[MC] WARNING: Parameter {full_name} not found in reconstructed params")
+                                    raise RuntimeError(f"Missing parameter: {full_name}")
+                            
+                            # Evaluate profile with reconstructed parameters
+                            profile = self._evaluate_profile(x_int, fit_type, component_params)
+                            
+                            # Sample continuum polynomial if available
+                            if cont_coeffs is not None and cont_cov is not None:
+                                try:
+                                    cont_sample = np.random.multivariate_normal(cont_coeffs, cont_cov)
+                                except (np.linalg.LinAlgError, ValueError) as e:
+                                    print(f"[MC] ERROR in continuum sampling (sample {sample_idx}): {e}")
+                                    raise  # Re-raise to exit tied path
+                                continuum = np.polyval(cont_sample, x_int)
+                            else:
+                                print("[MC] ERROR: Cannot compute MC EW without continuum covariance matrix")
+                                raise RuntimeError("Continuum covariance missing")
+                            
+                            # Ensure non-zero continuum to avoid division issues
+                            continuum = np.maximum(continuum, 1e-10)
+                            
+                            # Store samples for later plotting
+                            profile_samples.append(profile)
+                            continuum_samples.append(continuum)
+                            
+                            # Calculate EW for this sample
+                            normalized = -profile / continuum
+                            ew = trapz_compat(normalized, x_int)
+                            ew_samples.append(ew)
+                        
+                        except Exception as e:
+                            print(f"[MC] Exception in sample {sample_idx}: {type(e).__name__}: {e}")
+                            if sample_idx < 5:  # Only print first few
+                                import traceback
+                                traceback.print_exc()
+                            # Continue trying remaining samples
+                            continue
                 
-                # Sample profile parameters from multivariate normal
-                profile_sample = np.random.multivariate_normal(profile_params, profile_cov)
+                except Exception as e:
+                    # Tied parameter path failed - will try non-tied below
+                    print(f"[MC] Tied parameter path failed: {type(e).__name__}: {e}")
+                    print("[MC]   Will attempt non-tied parameter path...")
+                    ew_samples = []  # Clear any partial samples
+                    profile_samples = []
+                    continuum_samples = []
+            
+            # If tied path was attempted and produced samples, we're done
+            # Otherwise, try the non-tied path
+            if not ew_samples:
+                # Original MC sampling without tied parameters (component covariance is non-singular)
+                print("[MC] ========== NON-TIED PARAMETER PATH ==========")
+                print("[MC] Sampling without tied parameters")
                 
-                # Evaluate profile at high resolution
-                profile = self._evaluate_profile(x_int, fit_type, profile_sample)
+                try:
+                    # Check if profile covariance is singular
+                    # Do this BEFORE trying any numpy operations on it
+                    profile_cov_array = np.array(profile_cov, dtype=float)
+                    
+                    # Check for all-zero rows/columns or very small diagonal (signs of singularity)
+                    cov_diag = np.diag(profile_cov_array) if profile_cov_array.ndim == 2 else profile_cov_array
+                    num_zero_diag = np.sum(cov_diag <= 1e-15)
+                    
+                    # Try to detect singularity without calling det() which might crash
+                    is_singular = False
+                    if num_zero_diag > 0:
+                        is_singular = True
+                        print(f"[MC] ERROR: {num_zero_diag} parameters have zero/near-zero variance (tied/fixed)")
+                        print("[MC]   This means the profile covariance is singular - cannot do MC sampling")
+                        print("[MC]   Check that tied parameters were properly handled in the fit")
+                        raise RuntimeError("Profile covariance is singular")
+                    else:
+                        # Check determinant only if diagonal looks OK
+                        try:
+                            cov_det = np.linalg.det(profile_cov_array)
+                            if abs(cov_det) < 1e-10:
+                                is_singular = True
+                                print("[MC] ERROR: Covariance matrix has near-zero determinant (singular)")
+                                print("[MC]   Cannot perform MC sampling with singular covariance matrix")
+                                raise RuntimeError("Covariance matrix is singular (det ≈ 0)")
+                        except (np.linalg.LinAlgError, ValueError, RuntimeWarning) as e:
+                            is_singular = True
+                            print(f"[MC] ERROR: Could not compute determinant: {e}")
+                            raise RuntimeError(f"Determinant check failed: {e}")
+                    
+                    # No longer checking is_singular - just let MC loop run
+                    # If there are issues, the loop will catch them and return None
+                    
+                    # Monte Carlo loop (standard path for non-tied parameters)
+                    for sample_idx in range(n_samples):
+                        try:
+                            # Sample profile parameters from multivariate normal
+                            try:
+                                profile_sample = np.random.multivariate_normal(profile_params, profile_cov)
+                            except (np.linalg.LinAlgError, ValueError) as e:
+                                print(f"[MC] ERROR: Cannot sample from singular covariance matrix: {e}")
+                                print(f"[MC]   This typically happens with tied parameters")
+                                print(f"[MC]   MC sampling failed - cannot calculate EW with proper uncertainties")
+                                raise  # Re-raise to exit non-tied path
+                            
+                            # Evaluate profile at high resolution
+                            profile = self._evaluate_profile(x_int, fit_type, profile_sample)
+                            
+                            # Sample continuum polynomial if available
+                            if cont_coeffs is not None and cont_cov is not None:
+                                try:
+                                    cont_sample = np.random.multivariate_normal(cont_coeffs, cont_cov)
+                                except (np.linalg.LinAlgError, ValueError) as e:
+                                    print(f"[MC] ERROR in continuum sampling (sample {sample_idx}): {e}")
+                                    print(f"[MC]   Coefficients: {cont_coeffs}")
+                                    print(f"[MC]   Covariance shape: {cont_cov.shape}, diagonal: {np.diag(cont_cov)}")
+                                    raise  # Re-raise to exit non-tied path
+                                continuum = np.polyval(cont_sample, x_int)
+                            else:
+                                # Cannot proceed without continuum if one was used in the fit
+                                print("[MC] ERROR: Cannot compute MC EW without continuum covariance matrix")
+                                raise RuntimeError("Continuum covariance missing")
+                            
+                            # Ensure non-zero continuum to avoid division issues
+                            continuum = np.maximum(continuum, 1e-10)
+                            
+                            # Store samples for later plotting
+                            profile_samples.append(profile)
+                            continuum_samples.append(continuum)
+                            
+                            # Calculate EW for this sample
+                            # Note: profile is the residual (flux - continuum) from the fit
+                            # EW = ∫(continuum - flux)/continuum dλ = -∫residual/continuum dλ
+                            normalized = -profile / continuum
+                            ew = trapz_compat(normalized, x_int)
+                            
+                            ew_samples.append(ew)
+                        
+                        except Exception as e:
+                            print(f"[MC] Exception in sample {sample_idx}: {type(e).__name__}: {e}")
+                            if sample_idx < 5:  # Only print first few
+                                import traceback
+                                traceback.print_exc()
+                            # Continue with remaining samples
+                            continue
                 
-                # Sample continuum polynomial if available
-                if cont_coeffs is not None and cont_cov is not None:
-                    cont_sample = np.random.multivariate_normal(cont_coeffs, cont_cov)
-                    continuum = np.polyval(cont_sample, x_int)
-                else:
-                    # Cannot proceed without continuum if one was used in the fit
-                    print("[MC] ERROR: Cannot compute MC EW without continuum covariance matrix")
-                    return None
-                
-                # Ensure non-zero continuum to avoid division issues
-                continuum = np.maximum(continuum, 1e-10)
-                
-                # Store samples for later plotting
-                profile_samples.append(profile)
-                continuum_samples.append(continuum)
-                
-                # Calculate EW for this sample
-                # Note: profile is the residual (flux - continuum) from the fit
-                # EW = ∫(continuum - flux)/continuum dλ = -∫residual/continuum dλ
-                normalized = -profile / continuum
-                ew = np.trapz(normalized, x_int)
-                
-                ew_samples.append(ew)
+                except Exception as e:
+                    # Non-tied path also failed
+                    print(f"[MC] Non-tied parameter path also failed: {type(e).__name__}: {e}")
+                    print("[MC]   Both tied and non-tied paths have failed")
+            
+            # At this point, ew_samples should be populated from either tied or non-tied path
+            if not ew_samples:
+                print("[MC] ERROR: No EW samples generated")
+                return None
             
             ew_samples = np.array(ew_samples)
             profile_samples_array = np.array(profile_samples)
@@ -5241,7 +6089,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 best_continuum = np.ones_like(x_int) * continuum_level
             best_continuum = np.maximum(best_continuum, 1e-10)
             best_normalized = -best_profile / best_continuum
-            best_ew = np.trapz(best_normalized, x_int)
+            best_ew = trapz_compat(best_normalized, x_int)
             # Note: profile and best_profile are residuals (flux - continuum) from the fit
             
             # 1-sigma (16th-84th percentile)
@@ -5255,6 +6103,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # 3-sigma (0.135th-99.865th percentile)
             p0135_3 = np.percentile(valid_ew_samples, 0.135)
             p99865_3 = np.percentile(valid_ew_samples, 99.865)
+            
+            print(f"[MC] ========== RESULTS ==========")
+            print(f"[MC] Median EW: {median_ew:.6f}")
+            print(f"[MC] 1-sigma: -{median_ew - p16_1:.6f}/+{p84_1 - median_ew:.6f}")
+            print(f"[MC] 2-sigma: -{median_ew - p228_2:.6f}/+{p9772_2 - median_ew:.6f}")
+            print(f"[MC] 3-sigma: -{median_ew - p0135_3:.6f}/+{p99865_3 - median_ew:.6f}")
+            print(f"[MC] Generated {len(valid_ew_samples)} valid samples")
             
             return {
                 'ew_best': best_ew,
@@ -5353,11 +6208,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     if listfit.get('bounds') == listfit_bounds:
                         # Remove the component from the listfit's components list
                         components = listfit.get('components', [])
-                        # Remove components in reverse order by index to avoid index shifting
-                        for i, comp in enumerate(components):
+                        # Remove component by matching type and index
+                        for i in range(len(components) - 1, -1, -1):  # Iterate backwards to avoid index shifting
+                            comp = components[i]
                             if (comp.get('type') == 'polynomial' and 
                                 comp.get('index') == poly_index):
                                 components.pop(i)
+                                print(f"[DEBUG] Removed polynomial (index={poly_index}) from listfit components")
                                 break
                         break
         
@@ -5400,15 +6257,17 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             min_lambda = fit_dict.get('min_lambda')
             max_lambda = fit_dict.get('max_lambda')
             
-            if listfit_bounds is not None:
+            if listfit_bounds is not None and min_lambda is not None and max_lambda is not None:
                 for listfit in self.listfit_fits:
                     if listfit.get('bounds') == listfit_bounds:
                         components = listfit.get('components', [])
-                        for i, comp in enumerate(components):
+                        for i in range(len(components) - 1, -1, -1):  # Iterate backwards for safe removal
+                            comp = components[i]
                             if (comp.get('type') == 'polynomial_guess_mask' and 
                                 comp.get('min_lambda') == min_lambda and
                                 comp.get('max_lambda') == max_lambda):
                                 components.pop(i)
+                                print(f"[DEBUG] Removed polynomial_guess_mask ({min_lambda:.2f}-{max_lambda:.2f}) from listfit components")
                                 break
                         break
         
@@ -5419,15 +6278,17 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             min_lambda = fit_dict.get('min_lambda')
             max_lambda = fit_dict.get('max_lambda')
             
-            if listfit_bounds is not None:
+            if listfit_bounds is not None and min_lambda is not None and max_lambda is not None:
                 for listfit in self.listfit_fits:
                     if listfit.get('bounds') == listfit_bounds:
                         components = listfit.get('components', [])
-                        for i, comp in enumerate(components):
+                        for i in range(len(components) - 1, -1, -1):  # Iterate backwards for safe removal
+                            comp = components[i]
                             if (comp.get('type') == 'data_mask' and 
                                 comp.get('min_lambda') == min_lambda and
                                 comp.get('max_lambda') == max_lambda):
                                 components.pop(i)
+                                print(f"[DEBUG] Removed data_mask ({min_lambda:.2f}-{max_lambda:.2f}) from listfit components")
                                 break
                         break
         
@@ -5436,23 +6297,31 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         if line_obj:
             try:
                 line_obj.remove()
-            except (ValueError, NotImplementedError):
+                print(f"[DEBUG] Removed line object for {item_type}")
+            except Exception as e:
                 # Object may have already been removed or cannot be removed
-                pass
+                # Log the error but don't crash
+                print(f"[DEBUG] Warning: Could not remove line object for {item_type}: {type(e).__name__}: {e}")
         
         # Handle patches (continuum regions, masks)
         patch_obj = item_info.get('patch_obj')
         if patch_obj:
             try:
                 patch_obj.remove()
-            except (ValueError, NotImplementedError):
+                print(f"[DEBUG] Removed patch object for {item_type}")
+            except Exception as e:
                 # Object may have already been removed or cannot be removed
-                pass
+                # Log the error but don't crash
+                print(f"[DEBUG] Warning: Could not remove patch object for {item_type}: {type(e).__name__}: {e}")
         
         # If it's a continuum region, also remove from continuum_patches list
         if item_type == 'continuum_region' and 'bounds' in item_info:
             bounds = item_info['bounds']
             self.continuum_patches = [p for p in self.continuum_patches if p.get('bounds') != bounds]
+        
+        # Additional cleanup for mask items - ensure they're removed from listfit_fits components if present
+        if item_type in ['polynomial_guess_mask', 'data_mask']:
+            print(f"[DEBUG] Completed cleanup for {item_type} item")
         
         # Update residual display if shown
         if self.is_residual_shown:
@@ -5600,7 +6469,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             print("[EW] No fit dictionary found for this item")
             return
         
-        # Get the corresponding fit type
+        # Determine if this is from a listfit or a regular fit
+        is_listfit = 'listfit_bounds' in fit_dict
+        
+        # Get the corresponding fit type and continuum
         if item_type == 'gaussian':
             fit_type = 'gaussian'
         elif item_type == 'voigt':
@@ -5610,7 +6482,18 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             return
         
         # Get the continuum fit
-        continuum_fit_dict = self.continuum_fits[-1] if self.continuum_fits else None
+        if is_listfit:
+            # For listfit profiles, get continuum from the same listfit
+            continuum_fit_dict = self._get_listfit_continuum(fit_dict)
+            if continuum_fit_dict is None:
+                print("[EW] No continuum polynomial found in listfit (exactly 1 required)")
+                return
+        else:
+            # For regular fits, use the stored continuum_fit_dict if available (stored during fitting)
+            # Otherwise fall back to the last continuum fit
+            continuum_fit_dict = fit_dict.get('continuum_fit_dict')
+            if continuum_fit_dict is None:
+                continuum_fit_dict = self.continuum_fits[-1] if self.continuum_fits else None
         
         # Calculate EW
         ew_result = self._calculate_equivalent_width_monte_carlo(fit_dict, continuum_fit_dict, fit_type)
@@ -5643,6 +6526,74 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 self.plot_mc_profiles(fit_dict, ew_result, fit_type)
         else:
             print("[EW] Failed to calculate equivalent width")
+    
+    def _get_listfit_continuum(self, listfit_profile_dict):
+        """Extract the continuum polynomial from a listfit
+        
+        Returns continuum fit dict if there's exactly 1 polynomial, None otherwise
+        """
+        listfit_bounds = listfit_profile_dict.get('listfit_bounds')
+        if listfit_bounds is None:
+            return None
+        
+        # FIRST: Check if polynomial coefficients are directly stored in the profile dict
+        # (this happens when a Gaussian/Voigt from listfit stores its continuum reference)
+        if 'coeffs' in listfit_profile_dict and 'covariance' in listfit_profile_dict:
+            # Polynomial coefficients are directly available in the dict
+            print("[EW] Found polynomial coefficients stored in profile dict")
+            return listfit_profile_dict
+        
+        # SECOND: Look in continuum_fits for polynomials from this listfit
+        listfit_continua = [c for c in self.continuum_fits 
+                           if c.get('bounds') == listfit_bounds and c.get('listfit_source')]
+        
+        if len(listfit_continua) == 1:
+            continuum = listfit_continua[0]
+            print(f"[EW] Found polynomial in continuum_fits: order={continuum.get('poly_order')}")
+            # Return as continuum dict for MC calculation
+            return {
+                'coeffs': continuum.get('coeffs', []),
+                'covariance': np.diag([(e**2 if e > 0 else 1e-10) for e in continuum.get('coeffs_err', [])]),
+                'bounds': listfit_bounds
+            }
+        elif len(listfit_continua) > 1:
+            print(f"[EW] Found {len(listfit_continua)} polynomials in continuum_fits (need exactly 1)")
+            return None
+        
+        # THIRD: Fall back to looking in listfit_fits for polynomial components
+        for listfit in self.listfit_fits:
+            if listfit.get('bounds') == listfit_bounds:
+                # Extract all polynomials from this listfit
+                components = listfit.get('components', [])
+                polynomials = [c for c in components if c.get('type') == 'polynomial']
+                
+                # Return the continuum only if there's exactly 1 polynomial
+                if len(polynomials) == 1:
+                    poly_comp = polynomials[0]
+                    
+                    # Get coefficients from the stored polynomial component
+                    coeffs = poly_comp.get('coeffs', [])
+                    coeffs_err = poly_comp.get('coeffs_err', [])
+                    
+                    if not coeffs:
+                        return None
+                    
+                    # Build covariance matrix from errors (diagonal approximation)
+                    covariance = np.diag([e**2 if e > 0 else 1e-10 for e in coeffs_err]) if coeffs_err else np.diag([1e-10] * len(coeffs))
+                    
+                    continuum_dict = {
+                        'coeffs': coeffs,
+                        'covariance': covariance,
+                        'bounds': listfit.get('bounds')
+                    }
+                    print("[EW] Found polynomial in listfit_fits components")
+                    return continuum_dict
+                else:
+                    print(f"[EW] Listfit has {len(polynomials)} polynomials (need exactly 1)")
+                    return None
+        
+        print("[EW] No continuum polynomial found for this listfit")
+        return None
         
     def on_calculate_ew_auto_toggled(self, state):
         """Handle toggle of 'Calculate EW automatically' checkbox"""
@@ -6692,7 +7643,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             continuum_flux = np.maximum(continuum_flux, 1e-10) # Ensure continuum flux is non-zero to avoid division by zero
             flux_diff = 1 - (model_flux / continuum_flux)
             # Compute the equivalent width by integrating over the wavelength range
-            ew = np.trapz(flux_diff, x)
+            ew = trapz_compat(flux_diff, x)
             return ew
 
         def model(x, amp, mu, sigma, *poly_coeffs):
@@ -6804,10 +7755,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         ew_total_16th_rest   = ew_total_16th / (1 + z)
         ew_total_84th_rest   = ew_total_84th / (1 + z)
 
-        print(f"Gaussian EW 2σ confidence interval (obs): [{ew_gauss_16th:.4f}, {ew_gauss_50th:.4f}, {ew_gauss_84th:.4f}]")
-        print(f"Total EW 2σ confidence interval (obs): [{ew_total_16th:.4f}, {ew_total_50th:.4f}, {ew_total_84th:.4f}]")
-        print(f"Gaussian EW 2σ confidence interval (rest): [{ew_gauss_16th_rest:.4f}, {ew_gauss_50th_rest:.4f}, {ew_gauss_84th_rest:.4f}]")
-        print(f"Total EW 2σ confidence interval (rest): [{ew_total_16th_rest:.4f}, {ew_total_50th_rest:.4f}, {ew_total_84th_rest:.4f}]")
+        print(f"Gaussian EW 2-sigma confidence interval (obs): [{ew_gauss_16th:.4f}, {ew_gauss_50th:.4f}, {ew_gauss_84th:.4f}]")
+        print(f"Total EW 2-sigma confidence interval (obs): [{ew_total_16th:.4f}, {ew_total_50th:.4f}, {ew_total_84th:.4f}]")
+        print(f"Gaussian EW 2-sigma confidence interval (rest): [{ew_gauss_16th_rest:.4f}, {ew_gauss_50th_rest:.4f}, {ew_gauss_84th_rest:.4f}]")
+        print(f"Total EW 2-sigma confidence interval (rest): [{ew_total_16th_rest:.4f}, {ew_total_50th_rest:.4f}, {ew_total_84th_rest:.4f}]")
 
         # Error bars
         ew_gauss_lo = ew_gauss_50th - ew_gauss_16th
@@ -6980,11 +7931,190 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             else:
                 print(f"Unknown command: {command}")
 
-    def on_canvas_click(self, event):
-        """Handle canvas click events to refocus on the plot area"""
+    def on_mouse_press(self, event):
+        """Handle mouse button press events - start drag for guess drawing, mask drawing, or interactive smoothing"""
         # Set focus to the canvas when clicked to deselect text fields
         if event.inaxes or event.xdata is not None:
             self.canvas.setFocus()
+        
+        # Handle interactive smoothing mode - click-drag to adjust
+        if self.smoothing_interactive_mode and event.inaxes == self.ax and event.xdata is not None:
+            self.smoothing_drag_start_x = event.xdata
+            self.smoothing_drag_start_y = event.ydata
+
+            return  # Don't process other mouse events in smoothing mode
+        
+        # Handle constraint bounds setting mode - click-drag to set bounds
+        if self.constraint_bounds_mode and event.inaxes == self.ax and event.xdata is not None:
+            self.constraint_bounds_drag_start_x = event.xdata
+            return
+        
+        # Handle mask drawing mode - click-drag to draw regions
+        if self.mask_drawing_mode and event.inaxes == self.ax and event.xdata is not None:
+            self.mask_drag_start_x = event.xdata
+            return
+        
+        # Handle guess drawing mode - click-drag to draw, or multi-point click for polynomial
+        if self.guess_drawing_mode and event.inaxes == self.ax and event.xdata is not None:
+            comp_type = self.current_component_for_guess.get('type', '').lower()
+            
+            # Polynomial: multi-point click mode
+            if comp_type == 'polynomial':
+                self._add_polynomial_point(event.xdata, event.ydata)
+                return  # Don't start a drag for polynomial
+            
+            # Gaussian/Voigt: drag mode
+            self.guess_mouse_down = True
+            self.guess_drag_start_x = event.xdata
+            self.guess_drag_start_y = event.ydata
+            self.guess_drag_end_x = event.xdata
+            self.guess_drag_end_y = event.ydata
+            print(f"[Guess] Drag started at λ={event.xdata:.2f} Å, flux={event.ydata:.4f}")
+    
+    def on_mouse_release(self, event):
+        """Handle mouse button release events - end drag for guess drawing, mask drawing, or smoothing"""
+        # End interactive smoothing drag
+        if self.smoothing_interactive_mode and self.smoothing_drag_start_x is not None:
+            self.smoothing_drag_start_x = None
+            self.smoothing_drag_start_y = None
+            try:
+                median_kernel = int(self.smoothing_median_input.text() or 1)
+                gaussian_sigma = float(self.smoothing_gaussian_input.text() or 0.0)
+                # Finalize smoothing
+                self.smooth_spectrum(median_kernel, gaussian_sigma)
+                self._update_spectrum_display(self.smoothed_spec)
+                self.last_applied_median = median_kernel
+                self.last_applied_gaussian = gaussian_sigma
+            except ValueError:
+                pass
+            return  # Don't process other release events
+        
+        # End constraint bounds setting drag
+        if self.constraint_bounds_mode and self.constraint_bounds_drag_start_x is not None and event.inaxes == self.ax:
+            if event.xdata is not None:
+                x_min = min(self.constraint_bounds_drag_start_x, event.xdata)
+                x_max = max(self.constraint_bounds_drag_start_x, event.xdata)
+                
+                # Store bounds in the constraint editor
+                self._apply_constraint_bounds(x_min, x_max)
+                
+                # Exit constraint bounds mode
+                self.constraint_bounds_mode = False
+                self.constraint_parameter = None
+                self.constraint_bounds_drag_start_x = None
+                self.constraint_bounds_drag_end_x = None
+                
+                # Remove preview line
+                if self.constraint_bounds_preview_line is not None:
+                    try:
+                        self.constraint_bounds_preview_line.remove()
+                    except (ValueError, RuntimeError):
+                        pass
+                self.constraint_bounds_preview_line = None
+                
+                print(f"[Constraint] Bounds set: {x_min:.2f} to {x_max:.2f} Å")
+                self.canvas.draw_idle()
+            
+            return  # Don't process other release events
+        
+        # End mask drawing drag
+        if self.mask_drawing_mode and self.mask_drag_start_x is not None and event.inaxes == self.ax:
+            if event.xdata is not None:
+                x_start = min(self.mask_drag_start_x, event.xdata)
+                x_end = max(self.mask_drag_start_x, event.xdata)
+                self.mask_regions.append((x_start, x_end))
+                
+                print(f"[Mask] Region {len(self.mask_regions)} drawn: λ={x_start:.2f} to {x_end:.2f} Å")
+                print(f"  Drag to draw another region or press ENTER to confirm")
+            
+            # Clear preview rectangles and redraw with updated rectangles
+            for rect in self.mask_preview_rects:
+                try:
+                    rect.remove()
+                except (ValueError, RuntimeError):
+                    pass
+            self.mask_preview_rects.clear()
+            
+            # Redraw preview for all regions
+            from matplotlib.patches import Rectangle
+            for x_start, x_end in self.mask_regions:
+                y_min, y_max = self.ax.get_ylim()
+                rect = Rectangle((x_start, y_min), x_end - x_start, y_max - y_min,
+                               linewidth=1, edgecolor='red', facecolor='red', alpha=0.15, zorder=1)
+                self.ax.add_patch(rect)
+                self.mask_preview_rects.append(rect)
+            
+            self.canvas.draw_idle()
+            self.mask_drag_start_x = None
+            return  # Don't process other release events
+        
+        # End guess drawing drag
+        if self.guess_drawing_mode and self.guess_mouse_down and event.inaxes == self.ax:
+            self.guess_mouse_down = False
+            if event.xdata is not None and event.ydata is not None:
+                self.guess_drag_end_x = event.xdata
+                self.guess_drag_end_y = event.ydata
+                
+                # Process the completed drag
+                comp_type = self.current_component_for_guess.get('type', '').lower()
+                if comp_type in ['gaussian', 'voigt']:
+                    self._process_gaussian_voigt_drag()
+                elif comp_type == 'polynomial':
+                    self._process_polynomial_drag()
+    
+    def _process_gaussian_voigt_drag(self):
+        """Process a completed drag for Gaussian/Voigt guess"""
+        x1, y1 = self.guess_drag_start_x, self.guess_drag_start_y
+        x2, y2 = self.guess_drag_end_x, self.guess_drag_end_y
+        
+        # Calculate guess parameters from drag
+        self.guess_center = (x1 + x2) / 2.0
+        # Preserve sign: positive if dragging up (y2 > y1), negative if dragging down (y2 < y1)
+        self.guess_amp = y2 - y1
+        # Convert FWHM to sigma: FWHM = 2.355 * sigma
+        fwhm = abs(x2 - x1)
+        self.guess_sigma = max(0.01, fwhm / 2.355)
+        
+        print(f"[Guess] Drag ended. Calculated parameters:")
+        print(f"  Center (λ): {self.guess_center:.2f} Å")
+        print(f"  Amplitude: {self.guess_amp:.4f}")
+        print(f"  Width (sigma): {self.guess_sigma:.2f} Å (FWHM: {fwhm:.2f} Å)")
+        
+        # Update preview
+        self._update_guess_preview_salmon()
+    
+    def _process_polynomial_drag(self):
+        """Process a completed drag for polynomial guess"""
+        x1, y1 = self.guess_drag_start_x, self.guess_drag_start_y
+        x2, y2 = self.guess_drag_end_x, self.guess_drag_end_y
+        
+        # Calculate linear fit: y = mx + b
+        if abs(x2 - x1) < 1e-10:
+            print("[Guess] Error: Cannot draw vertical line. Try dragging horizontally.")
+            return
+        
+        slope = (y2 - y1) / (x2 - x1)
+        intercept = y1 - slope * x1
+        
+        print(f"[Guess] Polynomial line drawn from λ={x1:.2f} to λ={x2:.2f}")
+        print(f"  Slope (m): {slope:.6f}")
+        print(f"  Intercept (b): {intercept:.4f}")
+        print(f"  Equation: y = {slope:.6f} * x + {intercept:.4f}")
+        
+        # Store polynomial parameters in guess
+        self.current_component_for_guess['guess'] = {
+            'slope': slope,
+            'intercept': intercept,
+            'x1': x1,
+            'y1': y1,
+            'x2': x2,
+            'y2': y2
+        }
+        
+        # Plot the polynomial line
+        self._plot_polynomial_guess_line(x1, x2, y1, y2)
+        
+        print("[Guess] Press ENTER to confirm polynomial guess, or drag again to redraw")
 
     def on_mouse_move(self, event):
         # Check if the cursor is within the axes bounds
@@ -6994,6 +8124,278 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             if not (self.x_lower_bound <= event.xdata <= self.x_upper_bound and
                     self.y_lower_bound <= event.ydata <= self.y_upper_bound):
                 return  # Exit if the cursor is outside the plot area
+        
+        # Handle interactive smoothing drag
+        if self.smoothing_interactive_mode and self.smoothing_drag_start_x is not None and event.inaxes == self.ax:
+            if event.xdata is not None and event.ydata is not None:
+                # Calculate drag distances
+                dx = event.xdata - self.smoothing_drag_start_x
+                dy = event.ydata - self.smoothing_drag_start_y
+                
+                # Determine primary drag direction
+                abs_dx = abs(dx)
+                abs_dy = abs(dy)
+                
+                try:
+                    # Up-down drag (> 2x larger vertical component): adjust Gaussian sigma
+                    if abs_dy > abs_dx * 2:
+                        # Map vertical drag to Gaussian sigma change
+                        sigma_delta = dy * 0.01  # Sensitivity factor (10x less aggressive)
+                        current_sigma = float(self.smoothing_gaussian_input.text() or 0.0)
+                        new_sigma = max(0.0, current_sigma + sigma_delta)
+                        self.smoothing_gaussian_input.setText(f"{new_sigma:.2f}")
+                    
+                    # Left-right drag (> 2x larger horizontal component): adjust Median kernel
+                    elif abs_dx > abs_dy * 2:
+                        # Map horizontal drag to median kernel change
+                        kernel_delta = int(dx * 0.005)  # Sensitivity factor (10x less aggressive)
+                        current_kernel = int(self.smoothing_median_input.text() or 1)
+                        new_kernel = max(1, current_kernel + kernel_delta)
+                        # Ensure odd number
+                        if new_kernel % 2 == 0:
+                            new_kernel += 1
+                        self.smoothing_median_input.setText(str(new_kernel))
+                    
+                    # Apply current smoothing values during drag for live preview
+                    try:
+                        median_kernel = int(self.smoothing_median_input.text() or 1)
+                        gaussian_sigma = float(self.smoothing_gaussian_input.text() or 0.0)
+                        self.smooth_spectrum(median_kernel, gaussian_sigma)
+                        self._update_spectrum_display(self.smoothed_spec)
+                    except ValueError:
+                        pass  # Ignore parsing errors during typing
+                
+                except (ValueError, AttributeError):
+                    pass  # Ignore errors
+        
+        # Handle live preview during constraint bounds setting drag
+        if self.constraint_bounds_mode and event.inaxes == self.ax and self.constraint_bounds_drag_start_x is not None:
+            if event.xdata is not None:
+                # Remove old preview line
+                if self.constraint_bounds_preview_line is not None:
+                    try:
+                        self.constraint_bounds_preview_line.remove()
+                    except (ValueError, RuntimeError):
+                        pass
+                
+                # Draw two vertical lines showing min and max bounds
+                x_min = min(self.constraint_bounds_drag_start_x, event.xdata)
+                x_max = max(self.constraint_bounds_drag_start_x, event.xdata)
+                y_min, y_max = self.ax.get_ylim()
+                
+                # Draw a vertical span to show the bounds
+                from matplotlib.patches import Rectangle
+                rect = Rectangle((x_min, y_min), x_max - x_min, y_max - y_min,
+                               linewidth=1, edgecolor='green', facecolor='green', alpha=0.1, zorder=1)
+                self.ax.add_patch(rect)
+                self.constraint_bounds_preview_line = rect
+                
+                # Also draw vertical lines at min and max
+                line_min = self.ax.axvline(x=x_min, color='green', linestyle='--', linewidth=1.5, alpha=0.7)
+                line_max = self.ax.axvline(x=x_max, color='green', linestyle='--', linewidth=1.5, alpha=0.7)
+                
+                self.canvas.draw_idle()
+        
+        # Handle live preview during mask drawing drag
+        if self.mask_drawing_mode and event.inaxes == self.ax and self.mask_drag_start_x is not None:
+            if event.xdata is not None:
+                # Clear old preview rectangles
+                for rect in self.mask_preview_rects:
+                    try:
+                        rect.remove()
+                    except (ValueError, RuntimeError):
+                        pass
+                self.mask_preview_rects.clear()
+                
+                # Draw preview rectangles for all regions (existing + current drag)
+                from matplotlib.patches import Rectangle
+                
+                # Draw existing regions
+                for x_start, x_end in self.mask_regions:
+                    y_min, y_max = self.ax.get_ylim()
+                    rect = Rectangle((x_start, y_min), x_end - x_start, y_max - y_min,
+                                   linewidth=1, edgecolor='red', facecolor='red', alpha=0.15, zorder=1)
+                    self.ax.add_patch(rect)
+                    self.mask_preview_rects.append(rect)
+                
+                # Draw current drag preview
+                x_start = min(self.mask_drag_start_x, event.xdata)
+                x_end = max(self.mask_drag_start_x, event.xdata)
+                y_min, y_max = self.ax.get_ylim()
+                current_rect = Rectangle((x_start, y_min), x_end - x_start, y_max - y_min,
+                                       linewidth=2, edgecolor='red', facecolor='red', alpha=0.25, zorder=1)
+                self.ax.add_patch(current_rect)
+                self.mask_preview_rects.append(current_rect)
+                
+                self.canvas.draw_idle()
+        
+        # Handle live preview during guess drawing drag
+        if self.guess_drawing_mode and event.inaxes == self.ax and self.guess_mouse_down:
+            if event.xdata is not None and event.ydata is not None:
+                self.guess_drag_end_x = event.xdata
+                self.guess_drag_end_y = event.ydata
+                
+                # Update preview in real-time based on component type
+                comp_type = self.current_component_for_guess.get('type', '').lower()
+                if comp_type in ['gaussian', 'voigt']:
+                    # Update live preview of Gaussian/Voigt as user drags
+                    x1, y1 = self.guess_drag_start_x, self.guess_drag_start_y
+                    x2, y2 = self.guess_drag_end_x, self.guess_drag_end_y
+                    
+                    center = (x1 + x2) / 2.0
+                    # Preserve sign: positive if dragging up (y2 > y1), negative if dragging down (y2 < y1)
+                    amp = y2 - y1
+                    fwhm = abs(x2 - x1)
+                    sigma = max(0.01, fwhm / 2.355)
+                    
+                    # Show live preview
+                    x_preview = np.linspace(center - 3*sigma, center + 3*sigma, 200)
+                    if comp_type == 'gaussian':
+                        y_preview = amp * np.exp(-((x_preview - center)**2) / (2 * sigma**2))
+                    else:  # voigt
+                        gamma = sigma * 0.01
+                        s2pi = np.sqrt(2*np.pi)
+                        amp_compensated = amp * (sigma * s2pi)
+                        y_preview = self.voigt(x_preview, amp_compensated, center, sigma, gamma)
+                    
+                    # Add polynomial baseline to preview (floor for profiles to stand on)
+                    poly_guesses = [c for c in self.listfit_components if c.get('type') == 'polynomial' and c.get('guess')]
+                    poly_baseline_for_profile = np.zeros_like(x_preview)
+                    
+                    # Remove old polynomial baseline line preview
+                    if self.guess_polynomial_baseline_line is not None:
+                        try:
+                            self.guess_polynomial_baseline_line.remove()
+                        except (ValueError, RuntimeError):
+                            pass
+                        self.guess_polynomial_baseline_line = None
+                    
+                    # If exactly one polynomial guess exists, visualize it with the profile
+                    if len(poly_guesses) == 1:
+                        poly_comp = poly_guesses[0]
+                        poly_guess = poly_comp.get('guess', {})
+                        try:
+                            # Get x range for polynomial baseline visualization (use full visible range)
+                            x_poly_range = np.linspace(self.ax.get_xlim()[0], self.ax.get_xlim()[1], 300)
+                            poly_baseline_for_profile = np.zeros_like(x_preview)
+                            x_poly_baseline = None
+                            
+                            if 'coefficients' in poly_guess:
+                                coeffs = poly_guess.get('coefficients')
+                                if coeffs:
+                                    print(f"[DEBUG] Using polynomial coefficients for baseline: {coeffs}")
+                                    poly_baseline_for_profile = np.polyval(coeffs, x_preview)
+                                    x_poly_baseline = np.polyval(coeffs, x_poly_range)
+                            elif poly_guess.get('x1') is not None and poly_guess.get('x2') is not None:
+                                # Old format: linear interpolation (extrapolate to full range)
+                                x1_poly = poly_guess.get('x1')
+                                x2_poly = poly_guess.get('x2')
+                                y1_poly = poly_guess.get('y1')
+                                y2_poly = poly_guess.get('y2')
+                                print(f"[DEBUG] Using linear polynomial: ({x1_poly}, {y1_poly}) to ({x2_poly}, {y2_poly})")
+                                
+                                # Calculate slope and extrapolate across entire x_preview range
+                                if abs(x2_poly - x1_poly) > 1e-10:
+                                    slope = (y2_poly - y1_poly) / (x2_poly - x1_poly)
+                                    # Use point-slope form: y - y1 = slope * (x - x1)
+                                    poly_baseline_for_profile = y1_poly + slope * (x_preview - x1_poly)
+                                    x_poly_baseline = y1_poly + slope * (x_poly_range - x1_poly)
+                                    print(f"[DEBUG] Linear baseline slope={slope}, extended to full x_preview range")
+                                else:
+                                    # Vertical line - use y1
+                                    poly_baseline_for_profile[:] = y1_poly
+                                    x_poly_baseline = np.full_like(x_poly_range, y1_poly)
+                            
+                            # Draw the polynomial baseline line as a visual reference (gray, lighter)
+                            if x_poly_baseline is not None:
+                                self.guess_polynomial_baseline_line, = self.ax.plot(x_poly_range, x_poly_baseline, 
+                                                                                   color='gray', linestyle='--', 
+                                                                                   linewidth=1.5, alpha=0.5, zorder=10,
+                                                                                   label='Polynomial Baseline')
+                                print(f"[DEBUG] Plotted polynomial baseline line")
+                        except Exception as e:
+                            print(f"[Debug] Error visualizing polynomial baseline: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            pass
+                        
+                        # Add the baseline to the profile so it sits on top (OUTSIDE the try block to ensure it always happens)
+                        print(f"[DEBUG] Before adding baseline: y_preview range [{np.min(y_preview):.2f}, {np.max(y_preview):.2f}]")
+                        print(f"[DEBUG] Polynomial baseline range [{np.min(poly_baseline_for_profile):.2f}, {np.max(poly_baseline_for_profile):.2f}]")
+                        y_preview = y_preview + poly_baseline_for_profile
+                        print(f"[DEBUG] After adding baseline: y_preview range [{np.min(y_preview):.2f}, {np.max(y_preview):.2f}]")
+                    
+                    # Remove old preview
+                    if self.guess_preview_line is not None:
+                        try:
+                            self.guess_preview_line.remove()
+                        except (ValueError, RuntimeError):
+                            pass
+                    
+                    # Draw new salmon-colored preview with higher z-order so it appears on top
+                    self.guess_preview_line, = self.ax.plot(x_preview, y_preview, color='salmon', 
+                                                           linestyle='-', linewidth=2, alpha=0.7, zorder=15,
+                                                           label=f'{comp_type.title()} Guess Preview')
+                    self.canvas.draw_idle()
+                
+                elif comp_type == 'polynomial':
+                    # Update live preview of polynomial line as user drags
+                    # Calculate line equation from the two clicked points
+                    x1, y1 = self.guess_drag_start_x, self.guess_drag_start_y
+                    x2, y2 = self.guess_drag_end_x, self.guess_drag_end_y
+                    
+                    # Calculate slope and intercept
+                    if abs(x2 - x1) > 1e-10:
+                        slope = (y2 - y1) / (x2 - x1)
+                        intercept = y1 - slope * x1
+                        
+                        # Extend to full listfit fitting range (or use current bounds as fallback)
+                        if self.listfit_bounds and len(self.listfit_bounds) >= 2:
+                            x_min = min(self.listfit_bounds)
+                            x_max = max(self.listfit_bounds)
+                        else:
+                            x_min = self.x_lower_bound
+                            x_max = self.x_upper_bound
+                        
+                        # Generate extended line across full range
+                        x_line = np.linspace(x_min, x_max, 200)
+                        y_line = slope * x_line + intercept
+                        
+                        # Also mark the clicked points on the line
+                        x_points = [x1, x2]
+                        y_points = [y1, y2]
+                    else:
+                        # Fallback to simple two-point line if vertical
+                        x_line = [x1, x2]
+                        y_line = [y1, y2]
+                        x_points = [x1, x2]
+                        y_points = [y1, y2]
+                    
+                    # Remove old preview
+                    if self.guess_polynomial_line is not None:
+                        try:
+                            self.guess_polynomial_line.remove()
+                        except (ValueError, RuntimeError):
+                            pass
+                    
+                    # Draw new salmon-colored line preview (extended across full range)
+                    self.guess_polynomial_line, = self.ax.plot(x_line, y_line, color='salmon',
+                                                              linestyle='-', linewidth=2.5, alpha=0.7,
+                                                              label='Polynomial Guess Preview')
+                    
+                    # Overlay the clicked points as markers on the extended line
+                    # Store markers so they can be removed later
+                    if self.guess_polynomial_clicked_points is not None:
+                        try:
+                            self.guess_polynomial_clicked_points.remove()
+                        except (ValueError, RuntimeError):
+                            pass
+                    
+                    if len(x_points) == 2:
+                        self.guess_polynomial_clicked_points, = self.ax.plot(x_points, y_points, 'o', color='salmon', markersize=7, 
+                                    markeredgewidth=1.5, markeredgecolor='darkred', zorder=20)
+                    
+                    self.canvas.draw_idle()
 
     def capture_state(self):
         """Capture current state for undo/redo"""
@@ -7224,143 +8626,40 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.ax.figure.canvas.draw()
     
     def draw_total_line(self):
-        """Draw the total line from all fitted profiles."""
-        # Lazy imports for drawing total line
-        from scipy.interpolate import interp1d
-        
+        """Draw the total line by summing all plotted profile lines from the item tracker."""
         # Remove any existing total lines first to avoid duplicates
         existing_total_lines = [line for line in self.ax.get_lines() if line.get_label() == "Total"]
         for line in existing_total_lines:
             line.remove()
         
-        # Generate x values for plotting
+        # Generate x values for plotting at high resolution
         x_plot = np.linspace(self.x_data.min(), self.x_data.max(), 10000)
-
-        # Combine continuum fits
-        total_continuum = np.zeros_like(x_plot)
-        for fit in self.continuum_fits:
-            left_bound, right_bound = fit['bounds']
-            mask = (x_plot >= left_bound) & (x_plot <= right_bound)
-            if mask.any():
-                coeffs = fit['coeffs']
-                total_continuum[mask] += np.polyval(coeffs, x_plot[mask])
+        total_y = np.zeros_like(x_plot)
         
-        # Combine Gaussian fits
-        total_gaussian = np.zeros_like(x_plot)
-        for fit in self.gaussian_fits:
-            # Handle both loaded fits (no 'line' object) and normal fits (with 'line' object)
-            if 'line' in fit and fit['line'] is not None:
-                fit_x = fit['line'].get_xdata()
-                fit_y = fit['line'].get_ydata()
-                left_bound, right_bound = min(fit_x), max(fit_x)
-            else:
-                # Reconstruct from Gaussian parameters for loaded fits
-                left_bound, right_bound = fit.get('bounds', (0, 0))
-                if left_bound == 0 and right_bound == 0:
-                    continue  # Skip if no bounds
-                fit_x = np.linspace(left_bound, right_bound, 500)
-                # Reconstruct Gaussian: A * exp(-(x - mean)^2 / (2 * stddev^2))
-                amplitude = fit.get('amp', 1.0)
-                mean = fit.get('mean', (left_bound + right_bound) / 2)
-                stddev = fit.get('stddev', 1.0)
-                fit_y = amplitude * np.exp(-((fit_x - mean) ** 2) / (2 * stddev ** 2))
-            
-            # Get continuum coefficients and interpolate to fit line's x values
-            existing_continuum_vals, a, b = self.get_existing_continuum(left_bound, right_bound)
-            if existing_continuum_vals is not None:
-                # Interpolate continuum to fit line's x values
-                continuum_interp = interp1d(self.x_data[(self.x_data >= left_bound) & (self.x_data <= right_bound)], 
-                                           existing_continuum_vals, bounds_error=False, fill_value='extrapolate')
-                existing_continuum = continuum_interp(fit_x)
-            else:
-                existing_continuum = np.zeros_like(fit_y)
-            
-            fit_is_velocity = fit.get('is_velocity_mode', False)
-            if fit_is_velocity and self.is_velocity_mode:
-                profile_interp = interp1d(fit_x, fit_y - existing_continuum, bounds_error=False, fill_value=0)
-            elif not fit_is_velocity and not self.is_velocity_mode:
-                profile_interp = interp1d(fit_x, fit_y - existing_continuum, bounds_error=False, fill_value=0)
-            elif not fit_is_velocity and self.is_velocity_mode:
-                profile_interp = interp1d(self.wav_to_vel(fit_x, fit.get('rest_wavelength'), z=self.redshift), fit_y - existing_continuum, bounds_error=False, fill_value=0)
-            elif fit_is_velocity and not self.is_velocity_mode:
-                profile_interp = interp1d(self.vel_to_wav(fit_x, fit.get('rest_wavelength'), z=self.redshift), fit_y - existing_continuum, bounds_error=False, fill_value=0)
-            total_gaussian += profile_interp(x_plot)
-
-        # Combine Voigt fits
-        total_voigt = np.zeros_like(x_plot)
-        for fit in self.voigt_fits:
-            # Handle both loaded fits (no 'line' object) and normal fits (with 'line' object)
-            if 'line' in fit and fit['line'] is not None:
-                fit_x = fit['line'].get_xdata()
-                fit_y = fit['line'].get_ydata()
-                left_bound, right_bound = min(fit_x), max(fit_x)
-            else:
-                # Reconstruct from Voigt parameters for loaded fits
-                left_bound, right_bound = fit.get('bounds', (0, 0))
-                if left_bound == 0 and right_bound == 0:
-                    continue  # Skip if no bounds
-                fit_x = np.linspace(left_bound, right_bound, 500)
-                # Reconstruct Voigt profile
-                from scipy.special import wofz
-                amplitude = fit.get('amplitude', 1.0)
-                center = fit.get('center', (left_bound + right_bound) / 2)
-                sigma = fit.get('sigma', 1.0)
-                gamma = fit.get('gamma', 1.0)
-                z = ((fit_x - center) + 1j * gamma) / (sigma * np.sqrt(2.0))
-                fit_y = amplitude * wofz(z).real / (sigma * np.sqrt(2.0 * np.pi))
-            
-            # Get continuum coefficients and interpolate to fit line's x values
-            existing_continuum_vals, a, b = self.get_existing_continuum(left_bound, right_bound)
-            if existing_continuum_vals is not None:
-                # Interpolate continuum to fit line's x values
-                continuum_interp = interp1d(self.x_data[(self.x_data >= left_bound) & (self.x_data <= right_bound)], 
-                                           existing_continuum_vals, bounds_error=False, fill_value='extrapolate')
-                existing_continuum = continuum_interp(fit_x)
-            else:
-                existing_continuum = np.zeros_like(fit_y)
-            
-            fit_is_velocity = fit.get('is_velocity_mode', False)
-            if fit_is_velocity and self.is_velocity_mode:
-                profile_interp = interp1d(fit_x, fit_y - existing_continuum, bounds_error=False, fill_value=0)
-            elif not fit_is_velocity and not self.is_velocity_mode:
-                profile_interp = interp1d(fit_x, fit_y - existing_continuum, bounds_error=False, fill_value=0)
-            elif not fit_is_velocity and self.is_velocity_mode:
-                profile_interp = interp1d(self.wav_to_vel(fit_x, fit.get('rest_wavelength'), z=self.redshift), fit_y - existing_continuum, bounds_error=False, fill_value=0)
-            elif fit_is_velocity and not self.is_velocity_mode:
-                profile_interp = interp1d(self.vel_to_wav(fit_x, fit.get('rest_wavelength'), z=self.redshift), fit_y - existing_continuum, bounds_error=False, fill_value=0)
-            total_voigt += profile_interp(x_plot)
-
-        # Combine Listfit fits - only extract polynomials (gaussians/voigts already in their respective lists)
-        total_listfit = np.zeros_like(x_plot)
-        for fit in self.listfit_fits:
-            left_bound, right_bound = fit.get('bounds', (0, 0))
-            mask = (x_plot >= left_bound) & (x_plot <= right_bound)
-            if mask.any():
-                components = fit.get('components', [])
-                result = fit.get('result')
+        # Simple approach: sum all profile lines from the item tracker
+        # The item tracker's items dict contains all plotted profiles (gaussian, voigt, continuum, polynomial, etc.)
+        if hasattr(self, 'item_tracker') and self.item_tracker and hasattr(self.item_tracker, 'items'):
+            for item_id, item_data in self.item_tracker.items.items():
+                item_type = item_data.get('type')
+                line_obj = item_data.get('line_obj')
                 
-                # Calculate polynomial components from the listfit only
-                # (Gaussians and Voigts are already counted via gaussian_fits and voigt_fits lists)
-                poly_count = 0
-                for comp in components:
-                    if comp['type'] == 'polynomial':
-                        order = comp.get('order', 1)
-                        prefix = f'p{poly_count}_'
-                        poly_coeffs = []
-                        for i in range(order + 1):
-                            coeff_key = f'{prefix}c{i}'
-                            if coeff_key in result.params:
-                                coeff_val = result.params[coeff_key].value
-                                poly_coeffs.append(coeff_val)
-                        # Reverse coefficients for np.polyval (expects highest order first)
-                        if poly_coeffs:
-                            poly_coeffs = poly_coeffs[::-1]
-                            y_poly = np.polyval(poly_coeffs, x_plot[mask])
-                            total_listfit[mask] += y_poly
-                        poly_count += 1
-
-        total_y = total_continuum + total_gaussian + total_voigt + total_listfit
-
+                # Only sum actual profile lines (not masks or other non-profile items)
+                if item_type in ['gaussian', 'voigt', 'continuum', 'polynomial'] and line_obj is not None:
+                    try:
+                        # Get the plotted data from the line object
+                        fit_x = line_obj.get_xdata()
+                        fit_y = line_obj.get_ydata()
+                        
+                        if len(fit_x) > 0 and len(fit_y) > 0:
+                            # Interpolate to common x grid
+                            from scipy.interpolate import interp1d
+                            interp_func = interp1d(fit_x, fit_y, kind='linear', bounds_error=False, fill_value=0)
+                            total_y += interp_func(x_plot)
+                    except Exception as e:
+                        # Skip lines that can't be interpolated
+                        print(f"[DEBUG] Warning: Could not add {item_type} line to total: {e}")
+                        continue
+        
         # Plot the total line using the configured color
         total_line_cfg = self.colors['profiles']['total_line']
         self.ax.plot(x_plot, total_y, label="Total", color=total_line_cfg['color'], 
@@ -7439,8 +8738,24 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             
             # Deactivate all modes with 'escape' key
             if event.key == 'escape':
+                if self.mask_drawing_mode:
+                    self._cancel_mask_drawing()
+                    return
+                # Cancel guess drawing first (removes polynomial points and preview lines)
+                if self.guess_drawing_mode:
+                    self._cancel_guess()
+                    return
                 self.on_deactivate_all()
                 return
+            
+            # Handle Enter/Return to confirm guess or mask drawing
+            if event.key in ['enter', 'return']:
+                if self.mask_drawing_mode:
+                    self._confirm_mask_regions()
+                    return
+                elif self.guess_drawing_mode:
+                    self._confirm_guess()
+                    return
 
         # Guard: ensure bounds are initialized before processing other key events
         if self.x_lower_bound is None or self.x_upper_bound is None or self.y_lower_bound is None or self.y_upper_bound is None:
@@ -7826,6 +9141,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.listfit_bound_lines = []
             self.listfit_components = []
             print("Listfit mode: Use the spacebar to define left and right boundaries.")
+            print("            Or press ENTER/RETURN to use the full spectral range.")
 
         # Set Listfit bounds with space bar
         if event.key == ' ' and self.listfit_mode:
@@ -7863,6 +9179,17 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 # Show the listfit window
                 self.show_listfit_window()
 
+        # Use full spectrum range for listfit with Enter/Return
+        if event.key in ('enter', 'return') and self.listfit_mode and len(self.listfit_bounds) == 0:
+            # Use full spectrum x-range as bounds
+            left_bound = float(np.min(self.x_data))
+            right_bound = float(np.max(self.x_data))
+            self.listfit_bounds = [left_bound, right_bound]
+            print(f"Listfit bounds set to full spectrum range: {left_bound:.2f} to {right_bound:.2f}. Opening component selection dialog...")
+            self.record_action('set_listfit_bounds_full_range', f'Set Listfit bounds to full spectrum range λ={left_bound:.2f}-{right_bound:.2f} Å')
+            # Show the listfit window
+            self.show_listfit_window()
+        
         # Exit listfit mode with Escape
         if event.key == 'escape' and self.listfit_mode:
             self.listfit_mode = False
@@ -7872,6 +9199,28 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.listfit_bounds = []
             plt.draw()
             print("Exiting listfit mode.")
+        
+        # Exit constraint bounds setting mode with Escape
+        if event.key == 'escape' and self.constraint_bounds_mode:
+            print("[Constraint] Bounds setting cancelled.")
+            self.constraint_bounds_mode = False
+            self.constraint_parameter = None
+            self.constraint_bounds_drag_start_x = None
+            self.constraint_bounds_drag_end_x = None
+            
+            # Remove preview line
+            if self.constraint_bounds_preview_line is not None:
+                try:
+                    self.constraint_bounds_preview_line.remove()
+                except (ValueError, RuntimeError):
+                    pass
+            self.constraint_bounds_preview_line = None
+            
+            # Keep constraint editor dialog open so user can try again
+            self.current_constraint_editor = None
+            self.current_constraint_editor_dialog = None
+            
+            plt.draw()
 
         # Set Gaussian bounds with space bar
         if event.key == ' ' and (self.gaussian_mode or self.multi_gaussian_mode_old):
@@ -8301,6 +9650,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
 
                 # Check for existing continuum
                 existing_continuum, _, _ = self.get_existing_continuum(left_bound, right_bound)
+                continuum_fit_dict = self.get_continuum_fit_dict(left_bound, right_bound)
                 comp_x = self.x_data[(self.x_data >= left_bound) & (self.x_data <= right_bound)]
                 comp_y = self.spec[(self.x_data >= left_bound) & (self.x_data <= right_bound)]
                 # Handle optional error spectrum
@@ -8327,6 +9677,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 center_guess = np.mean(comp_x)
                 sigma_max = self._calculate_max_sigma(left_bound, right_bound, center_guess, epsilon=0.05)
                 
+                # Lazy imports for lmfit model fitting
+                from lmfit import Model, Parameters
+                
                 initial_params = Parameters()
                 if np.mean(continuum_subtracted_y) > 0:
                     initial_params.add('amp', value=max(continuum_subtracted_y) - min(continuum_subtracted_y))
@@ -8336,8 +9689,6 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 initial_params.add('sigma', value=np.std(comp_x)/10, min=0, max=sigma_max)  # Constrain sigma with upper bound
                 initial_params.add('gamma', value=np.std(comp_x)/10, min=0, max=sigma_max)  # Constrain gamma similarly
 
-                # Lazy imports for lmfit model fitting
-                from lmfit import Model, Parameters
                 # Create the Voigt model and perform the fit
                 voigt_model = Model(self.voigt)
                 test_output = voigt_model.eval(params=initial_params, x=comp_x)
@@ -8346,6 +9697,20 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 # Use weights if errors available, otherwise None
                 weights = 1/comp_err if comp_err is not None else None
                 result = voigt_model.fit(continuum_subtracted_y, x=comp_x, params=initial_params, weights=weights)
+                
+                # Extract covariance matrix from lmfit result
+                # If result has full covariance, use it; otherwise build diagonal from stderr
+                if result.covar is not None:
+                    covariance = result.covar
+                else:
+                    # Build diagonal covariance matrix from parameter errors
+                    param_names = [name for name in result.params.keys()]
+                    param_errors = [result.params[name].stderr if result.params[name].stderr is not None else 1e-10 for name in param_names]
+                    covariance = np.diag([e**2 for e in param_errors])
+                
+                # Convert to list for storage
+                if isinstance(covariance, np.ndarray):
+                    covariance = covariance.tolist()
 
                 # Clear bounds
                 for line in self.bound_lines:
@@ -8388,7 +9753,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     'rest_wavelength': self.rest_wavelength,
                     'rest_id': self.rest_id,
                     'z_sys': self.redshift,
-                    'N': np.log10(N) if N else None
+                    'N': np.log10(N) if N else None,
+                    'continuum_fit_dict': continuum_fit_dict,  # Store the continuum fit for EW calculation
+                    'covariance': covariance  # Store covariance matrix for error propagation
                 }
                 for name, param in result.params.items():
                     fit_results[name] = param.value
@@ -8406,8 +9773,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     self.calculate_and_plot_residuals()
                 # Register with ItemTracker
                 position_str = f"λ: {fit_results.get('center', fit_results.get('mean', 0)):.2f} Å"
+                voigt_cfg = self.colors['profiles']['voigt']
                 self.register_item('voigt', f'Voigt', fit_dict=fit_results, line_obj=fit_results.get('line'),
-                                 position=position_str, color='orange')
+                                 position=position_str, color=voigt_cfg['color'])
                 
                 # Record action for undo/redo
                 self.record_action('fit_voigt', f'Fit Voigt at λ={fit_results.get("center", fit_results.get("mean", 0)):.2f} Å')
@@ -8646,8 +10014,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     self.calculate_and_plot_residuals()
                 # Register with ItemTracker
                 position_str = f"λ: {fit_results.get('center', fit_results.get('mean', 0)):.2f} Å"
+                voigt_cfg = self.colors['profiles']['voigt']
                 self.register_item('voigt', f'Voigt', fit_dict=fit_results, line_obj=fit_results.get('line'),
-                                 position=position_str, color='orange')
+                                 position=position_str, color=voigt_cfg['color'])
                 print("fit_results:",fit_results)
                 print(f"  Fit ID: {self.fit_id}")
                 print(f"  Component ID: {self.component_id}")
@@ -8941,69 +10310,29 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         if hasattr(event, 'xdata') and hasattr(event, 'ydata'):
             if event.xdata is not None and event.ydata is not None:
                 if (self.x_lower_bound <= event.xdata <= self.x_upper_bound and self.y_lower_bound <= event.ydata <= self.y_upper_bound):
-                    # Smoothing with keys '1'-'9'
+                    # Smoothing with keys '1'-'9' (quick Gaussian smoothing)
                     if event.key in '123456789':
                         try:
                             print(f"Key pressed: {event.key}")
                             key_num = int(event.key)
-                            # print(self.spectrum_line.get_xdata)
-                            kernel_width = key_num  # Set the kernel width based on the key pressed
-                            self.smooth_spectrum(kernel_width) # Saves the smoothed spectrum to the self.smoothed_spec variable
-                            # self.spectrum_line.set_ydata(self.smoothed_spec)  # Update line with smoothed data
+                            # Quick Gaussian smoothing via keyboard (no median)
+                            self.smooth_spectrum(median_kernel=1, gaussian_sigma=key_num)
                             if self.spectrum_line:
-                                self.step_spec.set_visible(False)  # Hide the old line instead of removing it
-                                self.line_spec.set_visible(False)
-                                self.spectrum_line.set_visible(False)
-                                self.fig.canvas.draw_idle()
-                                self.step_spec, = self.ax.step(self.x_data, self.smoothed_spec, color='black', where='mid', zorder=0)
-                                self.line_spec, = self.ax.plot(self.x_data, self.smoothed_spec, color='black', visible=False, zorder=0)
-                                # self.spectrum_line = self.step_spec if self.is_step_plot else self.line_spec
-                                # Make sure to hide the step/line plot
-                                if self.is_step_plot:
-                                    self.step_spec.set_visible(True)
-                                    self.line_spec.set_visible(False)
-                                    self.spectrum_line = self.step_spec
-                                else:
-                                    self.step_spec.set_visible(False)
-                                    self.line_spec.set_visible(True)
-                                    self.spectrum_line = self.line_spec
-                                # self.spectrum_line.set_ydata(self.smoothed_spec)  # Update the data for the old line
-                                # self.spectrum_line.set_visible(True)  # Make it visible again
-                                self.fig.canvas.draw_idle()
-                            # self.spectrum_line.remove()
-                            # self.spectrum_line, = self.ax.step(self.x_data, self.smoothed_spec, color='black', where='mid') if self.is_step_plot else self.ax.plot(self.x_data, self.smoothed_spec, color='black')  # Update line with smoothed data
-                            # print(self.spectrum_line.get_xdata)
-                            # self.ax.step(self.x_data, self.smoothed_spec, where='mid')
+                                self._update_spectrum_display(self.smoothed_spec)
                             self.fig.canvas.draw_idle()
+                            self.last_applied_gaussian = key_num
+                            self.last_applied_median = 1
                         except Exception as e:
                             print(f"Error: {e}")
                     # Reset to original spectrum with '0'
                     elif event.key == '0':
                         print("Key pressed:", event.key)
                         print("Going back to unsmoothed spectrum.")
-                        # self.spectrum_line.set_ydata(self.original_spec)
                         if self.spectrum_line:
-                            self.step_spec.set_visible(False)  # Hide the old line instead of removing it
-                            self.line_spec.set_visible(False)
-                            self.spectrum_line.set_visible(False)
+                            self._update_spectrum_display(self.original_spec)
+                            self.last_applied_gaussian = 0.0
+                            self.last_applied_median = 1
                             self.fig.canvas.draw_idle()
-                            self.step_spec, = self.ax.step(self.x_data, self.original_spec, color='black', where='mid', zorder=0)
-                            self.line_spec, = self.ax.plot(self.x_data, self.original_spec, color='black', visible=False, zorder=0)
-                            # self.spectrum_line = self.step_spec if self.is_step_plot else self.line_spec
-                            # Make sure to hide the step/line plot
-                            if self.is_step_plot:
-                                self.step_spec.set_visible(True)
-                                self.line_spec.set_visible(False)
-                                self.spectrum_line = self.step_spec
-                            else:
-                                self.step_spec.set_visible(False)
-                                self.line_spec.set_visible(True)
-                                self.spectrum_line = self.line_spec
-                            # self.spectrum_line.set_ydata(self.smoothed_spec)  # Update the data for the old line
-                            # self.spectrum_line.set_visible(True)  # Make it visible again
-                            self.fig.canvas.draw_idle()
-                        # self.spectrum_line, = self.ax.step(self.x_data, self.original_spec, color='black', where='mid') if self.is_step_plot else self.ax.plot(self.x_data, self.original_spec, color='black')  # Update line with original data
-                        self.fig.canvas.draw_idle()
 
         if event.key == 'x':
             # Center x-bounds on cursor position
@@ -9493,11 +10822,927 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
 
     def show_listfit_window(self):
         """Display the listfit component selection window"""
-        self.listfit_window = ListfitWindow(self.listfit_bounds)
+        self.listfit_window = ListfitWindow(self.listfit_bounds, self.resources_dir)
         self.listfit_window.fit_requested.connect(self.perform_listfit)
         self.listfit_window.bounds_cleared.connect(self.clear_listfit_bounds)
+        self.listfit_window.cleanup_guesses.connect(self._remove_guess_lines)  # Clean up all drawn guesses when listfit closes
         self.listfit_window.components_changed.connect(self._on_listfit_components_changed)
+        self.listfit_window.request_set_guess.connect(self.on_request_set_guess)
+        self.listfit_window.request_remove_guess.connect(self._remove_guess)
+        self.listfit_window.request_draw_data_mask_regions.connect(self.on_request_draw_data_mask_regions)
+        self.listfit_window.request_draw_polynomial_mask_regions.connect(self.on_request_draw_polynomial_mask_regions)
+        self.listfit_window.request_set_constraint_bounds.connect(self.on_request_set_constraint_bounds)
         self.listfit_window.show()
+    
+    def on_request_set_guess(self, row, component):
+        """Handle request to set guess for a listfit component - click-drag to draw"""
+        self.guess_drawing_mode = True
+        self.current_component_for_guess = component
+        self.current_component_row = row
+        
+        # Reset all drag tracking
+        self.guess_mouse_down = False
+        self.guess_drag_start_x = None
+        self.guess_drag_start_y = None
+        self.guess_drag_end_x = None
+        self.guess_drag_end_y = None
+        self.guess_center = None
+        self.guess_sigma = None
+        self.guess_amp = None
+        
+        # Initialize polynomial multi-point click mode
+        self.polynomial_points = []
+        self.polynomial_preview_points = []
+        self.polynomial_order = component.get('order', 1)  # Get order from component, default to 1
+        
+        # Remove any old preview/polynomial lines
+        if self.guess_preview_line is not None:
+            try:
+                self.guess_preview_line.remove()
+            except (ValueError, RuntimeError):
+                pass
+        if self.guess_polynomial_line is not None:
+            try:
+                self.guess_polynomial_line.remove()
+            except (ValueError, RuntimeError):
+                pass
+        self.guess_preview_line = None
+        self.guess_polynomial_line = None
+        
+        comp_type = component.get('type', '').lower()
+        print(f"\n{'='*70}")
+        print(f"[Guess Mode] Setting guess for {comp_type.upper()} #{row + 1}")
+        
+        if comp_type in ['gaussian', 'voigt']:
+            print(f"  • CLICK & DRAG on the plot to draw the guess:")
+            print(f"    - Drag UP/DOWN to set AMPLITUDE")
+            print(f"    - Drag LEFT/RIGHT to set WIDTH (sigma)")
+            print(f"  • Press ENTER/RETURN to confirm guess")
+            print(f"  • Press ESC to cancel")
+        elif comp_type == 'polynomial':
+            points_needed = self.polynomial_order + 1
+            print(f"  • CLICK on the plot to set points for polynomial guess:")
+            print(f"    - Polynomial order: {self.polynomial_order}")
+            print(f"    - Points needed: {points_needed}")
+            print(f"    - The polynomial will be fit through the clicked points")
+            print(f"  • Press ENTER/RETURN to confirm guess")
+            print(f"  • Press ESC to cancel")
+        print(f"{'='*70}\n")
+    
+    def on_request_set_constraint_bounds(self, parameter):
+        """Handle request to set constraint bounds by clicking and dragging on plot"""
+        self.constraint_bounds_mode = True
+        self.constraint_parameter = parameter
+        self.constraint_bounds_drag_start_x = None
+        self.constraint_bounds_drag_end_x = None
+        
+        # Remove any old preview line
+        if self.constraint_bounds_preview_line is not None:
+            try:
+                self.constraint_bounds_preview_line.remove()
+            except (ValueError, RuntimeError):
+                pass
+        self.constraint_bounds_preview_line = None
+        
+        param_display = {
+            'amp': 'Amplitude',
+            'mu': 'Center (mu)',
+            'center': 'Center',
+            'sigma': 'Width (sigma)',
+            'gamma': 'Gamma',
+        }
+        
+        param_name = param_display.get(parameter, parameter.upper())
+        
+        print(f"\n{'='*70}")
+        print(f"[Constraint Bounds] Setting bounds for: {param_name}")
+        print(f"  • CLICK & DRAG on the plot to set bounds:")
+        print(f"    - Start position sets MINIMUM bound")
+        print(f"    - End position sets MAXIMUM bound")
+        print(f"  • Bounds will be applied to the constraint dialog")
+        print(f"  • Press ESC to cancel bounds setting")
+        print(f"{'='*70}\n")
+    
+    def _apply_constraint_bounds(self, x_min, x_max):
+        """Apply the dragged bounds to the current constraint editor"""
+        if not self.current_constraint_editor:
+            print("[Constraint] Error: No constraint editor reference found")
+            return
+        
+        # Map parameter name to constraint editor field
+        parameter = self.constraint_parameter
+        
+        # Format bounds as strings
+        min_str = f"{x_min:.2f}"
+        max_str = f"{x_max:.2f}"
+        
+        # Update the appropriate fields in the constraint editor
+        if parameter == 'amp':
+            if hasattr(self.current_constraint_editor, 'amp_min'):
+                self.current_constraint_editor.amp_min.setText(min_str)
+            if hasattr(self.current_constraint_editor, 'amp_max'):
+                self.current_constraint_editor.amp_max.setText(max_str)
+            print(f"[Constraint] Amplitude bounds set: {min_str} to {max_str}")
+        elif parameter == 'mu':
+            if hasattr(self.current_constraint_editor, 'mean_min'):
+                self.current_constraint_editor.mean_min.setText(min_str)
+            if hasattr(self.current_constraint_editor, 'mean_max'):
+                self.current_constraint_editor.mean_max.setText(max_str)
+            print(f"[Constraint] Center (mu) bounds set: {min_str} to {max_str}")
+        elif parameter == 'center':
+            if hasattr(self.current_constraint_editor, 'center_min'):
+                self.current_constraint_editor.center_min.setText(min_str)
+            if hasattr(self.current_constraint_editor, 'center_max'):
+                self.current_constraint_editor.center_max.setText(max_str)
+            print(f"[Constraint] Center bounds set: {min_str} to {max_str}")
+        elif parameter == 'sigma':
+            if hasattr(self.current_constraint_editor, 'sigma_min'):
+                self.current_constraint_editor.sigma_min.setText(min_str)
+            if hasattr(self.current_constraint_editor, 'sigma_max'):
+                self.current_constraint_editor.sigma_max.setText(max_str)
+            print(f"[Constraint] Width (sigma) bounds set: {min_str} to {max_str}")
+        elif parameter == 'gamma':
+            if hasattr(self.current_constraint_editor, 'gamma_min'):
+                self.current_constraint_editor.gamma_min.setText(min_str)
+            if hasattr(self.current_constraint_editor, 'gamma_max'):
+                self.current_constraint_editor.gamma_max.setText(max_str)
+            print(f"[Constraint] Gamma bounds set: {min_str} to {max_str}")
+        
+        # Clear references
+        self.current_constraint_editor = None
+        self.current_constraint_editor_dialog = None
+    
+    def on_request_draw_data_mask_regions(self):
+        """Handle request to draw data mask regions - click and drag to define regions"""
+        self.mask_drawing_mode = True
+        self.mask_type = 'data_mask'
+        self.mask_regions = []
+        self.mask_preview_rects = []
+        self.mask_drag_start_x = None
+        
+        print(f"\n{'='*70}")
+        print(f"[Mask Drawing Mode] Data Mask Regions")
+        print(f"  • CLICK & DRAG on the plot to draw mask regions:")
+        print(f"    - Drag LEFT to RIGHT to set the masked wavelength range")
+        print(f"    - You can draw multiple regions")
+        print(f"  • Press ENTER/RETURN to confirm all regions")
+        print(f"  • Press ESC to cancel")
+        print(f"{'='*70}\n")
+    
+    def on_request_draw_polynomial_mask_regions(self):
+        """Handle request to draw polynomial mask regions - click and drag to define regions"""
+        self.mask_drawing_mode = True
+        self.mask_type = 'polynomial_mask'
+        self.mask_regions = []
+        self.mask_preview_rects = []
+        self.mask_drag_start_x = None
+        
+        print(f"\n{'='*70}")
+        print(f"[Mask Drawing Mode] Polynomial Exclude Regions")
+        print(f"  • CLICK & DRAG on the plot to draw mask regions:")
+        print(f"    - Drag LEFT to RIGHT to set the excluded wavelength range")
+        print(f"    - You can draw multiple regions")
+        print(f"    - Note: These don't apply to polynomial guesses from clicked points")
+        print(f"  • Press ENTER/RETURN to confirm all regions")
+        print(f"  • Press ESC to cancel")
+        print(f"{'='*70}\n")
+    
+    def _confirm_mask_regions(self):
+        """Confirm mask regions and add them to listfit window"""
+        if not self.mask_regions:
+            print("[Mask] No regions drawn - cancelled")
+            self._cancel_mask_drawing()
+            return
+        
+        print(f"\n{'='*70}")
+        print(f"[Mask] ✓ Confirmed {len(self.mask_regions)} region(s) for {self.mask_type}:")
+        for i, (x_min, x_max) in enumerate(self.mask_regions):
+            print(f"  Region {i+1}: λ={x_min:.2f} to {x_max:.2f} Å")
+        print(f"{'='*70}\n")
+        
+        # Add the regions to listfit window
+        if self.mask_type == 'data_mask':
+            self.listfit_window.add_drawn_data_mask_regions(self.mask_regions)
+        elif self.mask_type == 'polynomial_mask':
+            self.listfit_window.add_drawn_polynomial_mask_regions(self.mask_regions)
+        
+        self._cancel_mask_drawing()
+    
+    def _cancel_mask_drawing(self):
+        """Cancel mask drawing mode and clean up"""
+        # Remove preview rectangles
+        for rect in self.mask_preview_rects:
+            try:
+                rect.remove()
+            except (ValueError, RuntimeError):
+                pass
+        
+        self.mask_preview_rects.clear()
+        self.mask_regions.clear()
+        self.mask_drawing_mode = False
+        self.mask_type = None
+        self.mask_drag_start_x = None
+        
+        self.canvas.draw()
+    
+    def on_item_display_toggled(self, item_id, display_state):
+        """Handle Display checkbox toggle in Item Tracker"""
+        if item_id not in self.item_id_map:
+            return
+        
+        item_info = self.item_id_map[item_id]
+        line_obj = item_info.get('line_obj')
+        
+        if line_obj is None:
+            return
+        
+        # Toggle visibility
+        if display_state:
+            # Turning on - restore visibility and original zorder
+            line_obj.set_visible(True)
+            # Restore zorder if it was saved
+            if 'original_zorder' in item_info:
+                line_obj.set_zorder(item_info['original_zorder'])
+        else:
+            # Turning off - hide the line but save zorder first
+            if 'original_zorder' not in item_info:
+                item_info['original_zorder'] = line_obj.get_zorder()
+            line_obj.set_visible(False)
+        
+        # Redraw canvas to reflect changes
+        self.canvas.draw_idle()
+    
+    def _update_guess_preview_salmon(self):
+        """Update the live preview of the Gaussian/Voigt with salmon color (deprecated - use on_mouse_move instead)"""
+        # This method is now handled in on_mouse_move for direct drag preview
+        pass
+    
+    def _confirm_guess(self):
+        """Confirm the guess and update the component, creating a persistent line"""
+        if not self.current_component_for_guess:
+            print("[Guess] No component selected - cancelled")
+            self._cancel_guess()
+            return
+        
+        comp_type = self.current_component_for_guess.get('type', '').lower()
+        
+        if comp_type in ['gaussian', 'voigt']:
+            # Confirm Gaussian/Voigt guess
+            if self.guess_center is None or self.guess_amp is None or self.guess_sigma is None:
+                print("[Guess] Incomplete Gaussian/Voigt guess - cancelled")
+                self._cancel_guess()
+                return
+            
+            # Update the component's guess dictionary
+            guess_dict = {
+                'center': self.guess_center,
+                'amp': self.guess_amp,
+            }
+            
+            if comp_type == 'gaussian':
+                guess_dict['stddev'] = self.guess_sigma
+            else:  # voigt
+                guess_dict['sigma'] = self.guess_sigma
+                guess_dict['gamma'] = self.guess_sigma * 0.01  # Small Lorentzian contribution
+            
+            self.current_component_for_guess['guess'] = guess_dict
+            
+            print(f"\n{'='*70}")
+            print(f"[Guess] ✓ Confirmed for {comp_type.upper()}:")
+            print(f"  Center (λ): {self.guess_center:.2f} Å")
+            print(f"  Amplitude: {self.guess_amp:.4f}")
+            print(f"  Width (sigma): {self.guess_sigma:.2f} Å")
+            print(f"{'='*70}\n")
+            
+            # Create persistent guess line on the plot (salmon color)
+            self._plot_guess_line(self.current_component_for_guess)
+        
+        elif comp_type == 'polynomial':
+            # Confirm polynomial guess
+            if 'guess' not in self.current_component_for_guess or not self.current_component_for_guess['guess']:
+                print("[Guess] Incomplete polynomial guess - cancelled")
+                self._cancel_guess()
+                return
+            
+            guess = self.current_component_for_guess['guess']
+            print(f"\n{'='*70}")
+            print(f"[Guess] ✓ Confirmed for POLYNOMIAL:")
+            
+            # Handle both old format (x1, y1, x2, y2) and new format (coefficients)
+            if 'coefficients' in guess:
+                # New multi-point format
+                order = guess.get('order', 1)
+                coeffs = guess.get('coefficients', [])
+                x_points = guess.get('x_points', [])
+                y_points = guess.get('y_points', [])
+                print(f"  Order: {order}")
+                print(f"  Points: {len(x_points)}")
+                
+                # Extend x_min and x_max to cover the FULL listfit fitting range
+                if self.listfit_bounds and len(self.listfit_bounds) >= 2:
+                    x_min = min(self.listfit_bounds)
+                    x_max = max(self.listfit_bounds)
+                    print(f"  Fitted range extended to listfit bounds: λ={x_min:.2f} to {x_max:.2f} Å")
+                else:
+                    # Fallback to original points range if no listfit bounds
+                    x_min = guess.get('x_min', 0)
+                    x_max = guess.get('x_max', 0)
+                    print(f"  Range: λ={x_min:.2f} to {x_max:.2f} Å")
+                
+                # Update guess with full range
+                guess['x_min'] = x_min
+                guess['x_max'] = x_max
+                
+                poly_str = "y = "
+                for i, coeff in enumerate(coeffs):
+                    power = len(coeffs) - 1 - i
+                    if power == 0:
+                        poly_str += f"{coeff:.6f}"
+                    elif power == 1:
+                        poly_str += f"{coeff:.6f}*x + "
+                    else:
+                        poly_str += f"{coeff:.6f}*x^{power} + "
+                print(f"  Equation: {poly_str}")
+            else:
+                # Old drag format
+                print(f"  Equation: y = {guess.get('slope', 0):.6f} * x + {guess.get('intercept', 0):.4f}")
+                print(f"  From: λ={guess.get('x1', 0):.2f}, y={guess.get('y1', 0):.4f}")
+                print(f"  To:   λ={guess.get('x2', 0):.2f}, y={guess.get('y2', 0):.4f}")
+            
+            print(f"{'='*70}\n")
+            
+            # Exit guess drawing mode BEFORE plotting to prevent on_mouse_move() from redrawing preview
+            self.guess_drawing_mode = False
+            
+            # Remove temporary polynomial preview line before plotting extended persistent line
+            if self.guess_polynomial_line is not None:
+                try:
+                    self.guess_polynomial_line.remove()
+                    print("[DEBUG] Removed temporary polynomial preview line")
+                except (ValueError, RuntimeError):
+                    pass
+            
+            # Also remove temporary clicked points markers
+            if self.guess_polynomial_clicked_points is not None:
+                try:
+                    self.guess_polynomial_clicked_points.remove()
+                    print("[DEBUG] Removed temporary clicked points markers")
+                except (ValueError, RuntimeError):
+                    pass
+            
+            # Create persistent polynomial guess line on the plot (extended across full range)
+            self._plot_guess_line(self.current_component_for_guess)
+            
+            # Mark that polynomial guess was confirmed (so we don't remove it in _cancel_guess)
+            self._polynomial_guess_confirmed = True
+        
+        # Update the table display in listfit_window
+        if hasattr(self, 'listfit_window') and self.listfit_window:
+            self.listfit_window.component_list._update_guess_indicator(self.current_component_row)
+        
+        self._cancel_guess()
+    
+    def _plot_guess_line(self, component):
+        """Plot a persistent salmon-colored line for a confirmed Gaussian/Voigt/Polynomial guess
+        
+        For polynomial guesses: Plot across full Listfit x-range after guess is confirmed.
+        This line will be removed after fitting completes or fails.
+        """
+        if not component or 'guess' not in component:
+            return
+        
+        guess = component.get('guess', {})
+        comp_id = component.get('id')
+        comp_type = component.get('type', '').lower()
+        
+        # Handle polynomial guesses (plot across full Listfit x-range)
+        if comp_type == 'polynomial':
+            print(f"[DEBUG] Plotting polynomial guess #{comp_id}")
+            print(f"[DEBUG] listfit_bounds: {self.listfit_bounds}")
+            print(f"[DEBUG] guess dict keys: {guess.keys()}")
+            
+            # Support both old format (x1, y1, x2, y2) and new format (coefficients, x_points, y_points)
+            if 'coefficients' in guess:
+                # New multi-point format
+                try:
+                    coeffs = guess.get('coefficients', [])
+                    print(f"[DEBUG] coeffs: {coeffs}")
+                    # Use listfit_bounds for full x-range
+                    if coeffs and self.listfit_bounds and len(self.listfit_bounds) >= 2:
+                        x_min, x_max = self.listfit_bounds[0], self.listfit_bounds[1]
+                        x_line = np.linspace(x_min, x_max, 200)
+                        y_line = np.polyval(coeffs, x_line)
+                        label_str = f'Poly Guess #{comp_id} (order {guess.get("order", 1)})'
+                        print(f"[DEBUG] Plotting polynomial with coefficients across x_range [{x_min}, {x_max}]")
+                    else:
+                        print(f"[DEBUG] Skipping: coeffs={bool(coeffs)}, listfit_bounds={bool(self.listfit_bounds)}")
+                        return
+                except Exception as e:
+                    print(f"[Guess] Error plotting polynomial with coefficients: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    return
+            elif guess.get('x1') is not None and guess.get('x2') is not None:
+                # Old drag format (linear only)
+                print(f"[DEBUG] Old format polynomial: x1={guess.get('x1')}, x2={guess.get('x2')}, y1={guess.get('y1')}, y2={guess.get('y2')}")
+                if self.listfit_bounds and len(self.listfit_bounds) >= 2:
+                    x_min, x_max = self.listfit_bounds[0], self.listfit_bounds[1]
+                    # Create linear polynomial across full range
+                    x1 = guess.get('x1')
+                    x2 = guess.get('x2')
+                    y1 = guess.get('y1')
+                    y2 = guess.get('y2')
+                    slope = (y2 - y1) / (x2 - x1) if (x2 - x1) != 0 else 0
+                    x_line = np.linspace(x_min, x_max, 200)
+                    y_line = y1 + slope * (x_line - x1)
+                    label_str = f'Poly Guess #{comp_id}'
+                    print(f"[DEBUG] Plotting linear polynomial across x_range [{x_min}, {x_max}], slope={slope}")
+                else:
+                    print(f"[DEBUG] Skipping old format: listfit_bounds not properly set")
+                    return
+            else:
+                print(f"[DEBUG] No polynomial data found in guess")
+                return
+            
+            # Remove old line if exists
+            if comp_id in self.guess_lines:
+                try:
+                    self.guess_lines[comp_id].remove()
+                except (ValueError, RuntimeError):
+                    pass
+            
+            # Plot salmon-colored line across full Listfit x-range (z-order 5 so profiles appear on top)
+            line, = self.ax.plot(x_line, y_line, color='salmon', linestyle='-',
+                               linewidth=2.5, alpha=0.8,
+                               label=label_str, zorder=5)
+            self.guess_lines[comp_id] = line
+            print(f"[DEBUG] Successfully plotted polynomial guess #{comp_id}")
+            self.canvas.draw_idle()  # Use canvas.draw_idle() to refresh the plot properly
+            return
+        
+        # Handle Gaussian/Voigt guesses
+        if guess.get('center') is None or guess.get('amp') is None:
+            return
+        
+        guess_center = guess.get('center')
+        guess_amp = guess.get('amp')
+        
+        # Determine width parameter name
+        if comp_type == 'gaussian':
+            guess_width = guess.get('stddev', 0.5)
+        else:  # voigt
+            guess_width = guess.get('sigma', 0.5)
+        
+        # Remove old line if it exists
+        if comp_id in self.guess_lines:
+            try:
+                self.guess_lines[comp_id].remove()
+            except (ValueError, RuntimeError):
+                pass
+        
+        # Create new persistent line
+        x_line = np.linspace(guess_center - 3*guess_width, guess_center + 3*guess_width, 200)
+        
+        try:
+            if comp_type == 'gaussian':
+                y_line = guess_amp * np.exp(-((x_line - guess_center)**2) / (2 * guess_width**2))
+            elif comp_type == 'voigt':
+                # Compensate for Voigt normalization: voigt divides by (sigma * sqrt(2*pi))
+                gamma = guess.get('gamma', guess_width * 0.01)  # Use stored gamma or default
+                s2pi = np.sqrt(2*np.pi)
+                amp_compensated = guess_amp * (guess_width * s2pi)
+                y_line = self.voigt(x_line, amp_compensated, guess_center, guess_width, gamma)
+            else:
+                return
+            
+            # Check if there's exactly ONE polynomial guess in listfit_components
+            # If so, add the polynomial baseline to the profile (floor for profiles to stand on)
+            poly_guesses = [c for c in self.listfit_components if c.get('type') == 'polynomial' and c.get('guess')]
+            if len(poly_guesses) == 1:
+                poly_comp = poly_guesses[0]
+                poly_guess = poly_comp.get('guess', {})
+                try:
+                    # Get polynomial coefficients (new format)
+                    if 'coefficients' in poly_guess:
+                        coeffs = poly_guess.get('coefficients')
+                        if coeffs:
+                            # Evaluate polynomial at x_line points and add to profile
+                            poly_baseline = np.polyval(coeffs, x_line)
+                            y_line = y_line + poly_baseline
+                            print(f"[Guess] Added polynomial baseline from component #{poly_comp.get('id')}")
+                    # Also handle old linear format
+                    elif poly_guess.get('x1') is not None and poly_guess.get('x2') is not None:
+                        x1_poly = poly_guess.get('x1')
+                        x2_poly = poly_guess.get('x2')
+                        y1_poly = poly_guess.get('y1')
+                        y2_poly = poly_guess.get('y2')
+                        # Only add baseline for x values within the polynomial range
+                        in_range = (x_line >= min(x1_poly, x2_poly)) & (x_line <= max(x1_poly, x2_poly))
+                        poly_baseline = y1_poly + (y2_poly - y1_poly) * (x_line - x1_poly) / (x2_poly - x1_poly)
+                        y_line[in_range] = y_line[in_range] + poly_baseline[in_range]
+                        print(f"[Guess] Added linear polynomial baseline from component #{poly_comp.get('id')}")
+                except Exception as e:
+                    print(f"[Guess] Warning: Could not add polynomial baseline: {e}")
+            
+            # Plot as salmon-colored solid line with HIGHER z-order so it appears on top of polynomial
+            line, = self.ax.plot(x_line, y_line, color='salmon', linestyle='-',
+                                linewidth=2, alpha=0.8, label=f'Guess #{comp_id}', zorder=15)
+            self.guess_lines[comp_id] = line
+            plt.draw()
+        except Exception as e:
+            print(f"Error plotting guess line: {e}")
+    
+    def _plot_polynomial_guess_line(self, x1, x2, y1, y2):
+        """Plot a salmon-colored polynomial guess line during confirmation, extended across full fitting range"""
+        # Remove old polynomial preview line
+        if self.guess_polynomial_line is not None:
+            try:
+                self.guess_polynomial_line.remove()
+            except (ValueError, RuntimeError):
+                pass
+        
+        # Calculate line equation from the two clicked points
+        if abs(x2 - x1) > 1e-10:
+            slope = (y2 - y1) / (x2 - x1)
+            intercept = y1 - slope * x1
+            
+            # Extend to full listfit fitting range (or use current bounds as fallback)
+            if self.listfit_bounds and len(self.listfit_bounds) >= 2:
+                x_min = min(self.listfit_bounds)
+                x_max = max(self.listfit_bounds)
+            else:
+                x_min = self.x_lower_bound
+                x_max = self.x_upper_bound
+            
+            # Generate extended line across full range
+            x_line = np.linspace(x_min, x_max, 200)
+            y_line = slope * x_line + intercept
+            x_points = [x1, x2]
+            y_points = [y1, y2]
+        else:
+            # Fallback to simple two-point line if vertical
+            x_line = [x1, x2]
+            y_line = [y1, y2]
+            x_points = [x1, x2]
+            y_points = [y1, y2]
+        
+        # Draw salmon-colored line (extended across full range)
+        self.guess_polynomial_line, = self.ax.plot(x_line, y_line, color='salmon',
+                                                   linestyle='-', linewidth=2.5, alpha=0.8,
+                                                   label='Polynomial Guess')
+        
+        # Overlay the clicked points as markers on the extended line
+        if len(x_points) == 2:
+            self.ax.plot(x_points, y_points, 'o', color='salmon', markersize=7,
+                        markeredgewidth=1.5, markeredgecolor='darkred', zorder=20)
+        
+        self.canvas.draw_idle()
+    
+    def _remove_guess(self, component_id):
+        """Remove a guess line from the plot and clear the guess dictionary"""
+        # Remove the line from plot
+        if component_id in self.guess_lines:
+            try:
+                self.guess_lines[component_id].remove()
+                print(f"[DEBUG] Removed guess line for component #{component_id}")
+            except (ValueError, RuntimeError) as e:
+                print(f"[DEBUG] Warning: Could not remove guess line for component #{component_id}: {e}")
+            del self.guess_lines[component_id]
+        
+        # Find the component and clear its guess
+        for component in self.listfit_components:
+            if component.get('id') == component_id:
+                comp_type = component.get('type', '').lower()
+                # Clear the guess dictionary based on component type
+                if comp_type == 'polynomial':
+                    component['guess'] = {}
+                    print(f"[Guess] Removed polynomial guess for component #{component_id}")
+                elif comp_type == 'gaussian':
+                    component['guess'] = {'center': None, 'amp': None, 'stddev': None}
+                    print(f"[Guess] Removed Gaussian guess for component #{component_id}")
+                elif comp_type == 'voigt':
+                    component['guess'] = {'center': None, 'amp': None, 'sigma': None, 'gamma': None}
+                    print(f"[Guess] Removed Voigt guess for component #{component_id}")
+                break
+        
+        plt.draw()
+    
+    def public_remove_guess(self, component_id):
+        """Public method for removing a guess - called from listfit_window context menu"""
+        self._remove_guess(component_id)
+    
+    def _add_polynomial_point(self, x, y):
+        """Add a point for polynomial multi-point click mode"""
+        # Determine polynomial order from component type
+        if not hasattr(self, 'polynomial_points'):
+            self.polynomial_points = []
+        if not hasattr(self, 'polynomial_order'):
+            self.polynomial_order = 1
+        
+        # Add the point
+        self.polynomial_points.append((x, y))
+        points_needed = self.polynomial_order + 1
+        points_have = len(self.polynomial_points)
+        points_remaining = max(0, points_needed - points_have)
+        
+        print(f"[Polynomial Guess] Point {points_have} clicked at λ={x:.2f} Å, flux={y:.4f}")
+        print(f"  Points needed: {points_needed}, Points remaining: {points_remaining}")
+        
+        # Plot the clicked point as a small marker
+        point_marker, = self.ax.plot([x], [y], 'o', color='salmon', markersize=8, zorder=15)
+        self.polynomial_preview_points.append(point_marker)
+        
+        # If we have enough points, fit the polynomial
+        if points_have >= points_needed:
+            self._fit_polynomial_from_points()
+        
+        self.canvas.draw()
+    
+    def _fit_polynomial_from_points(self):
+        """Fit a polynomial through the collected points"""
+        if len(self.polynomial_points) < 2:
+            print("[Polynomial Guess] Need at least 2 points to fit polynomial")
+            return
+        
+        # Extract x and y coordinates
+        x_pts = np.array([pt[0] for pt in self.polynomial_points])
+        y_pts = np.array([pt[1] for pt in self.polynomial_points])
+        
+        # Fit polynomial
+        try:
+            coeffs = np.polyfit(x_pts, y_pts, self.polynomial_order)
+            
+            # Generate smooth curve for display
+            x_line = np.linspace(x_pts.min(), x_pts.max(), 100)
+            y_line = np.polyval(coeffs, x_line)
+            
+            # Store in guess
+            self.current_component_for_guess['guess'] = {
+                'coefficients': coeffs.tolist(),
+                'order': self.polynomial_order,
+                'x_points': x_pts.tolist(),
+                'y_points': y_pts.tolist(),
+                'x_min': float(x_pts.min()),
+                'x_max': float(x_pts.max())
+            }
+            
+            # Plot the fitted curve
+            self._plot_polynomial_fitted_curve(x_line, y_line)
+            
+            # Print info
+            poly_str = "y = "
+            for i, coeff in enumerate(coeffs):
+                power = len(coeffs) - 1 - i
+                if power == 0:
+                    poly_str += f"{coeff:.6f}"
+                elif power == 1:
+                    poly_str += f"{coeff:.6f}*x + "
+                else:
+                    poly_str += f"{coeff:.6f}*x^{power} + "
+            
+            print(f"[Polynomial Guess] ✓ Fitted polynomial (order {self.polynomial_order}):")
+            print(f"  {poly_str}")
+            print(f"[Polynomial Guess] Press ENTER to confirm, or ESC to cancel")
+            
+        except np.linalg.LinAlgError as e:
+            print(f"[Polynomial Guess] Error fitting polynomial: {e}")
+    
+    def _plot_polynomial_fitted_curve(self, x_line, y_line):
+        """Plot the fitted polynomial curve"""
+        # Remove old guess polynomial line
+        if self.guess_polynomial_line is not None:
+            try:
+                self.guess_polynomial_line.remove()
+            except (ValueError, RuntimeError):
+                pass
+        
+        # Draw salmon-colored curve
+        self.guess_polynomial_line, = self.ax.plot(x_line, y_line, color='salmon',
+                                                   linestyle='-', linewidth=2.5, alpha=0.8,
+                                                   label='Polynomial Guess', zorder=14)
+        self.canvas.draw()
+    
+    def _cancel_guess(self):
+        """Cancel guess drawing mode (removes temporary preview only, NOT persistent lines)"""
+        # Remove preview lines ONLY (not persistent lines in guess_lines dict)
+        if self.guess_preview_line is not None:
+            try:
+                self.guess_preview_line.remove()
+            except (ValueError, RuntimeError):
+                pass
+        
+        # Remove polynomial preview markers (clicked points)
+        for marker in self.polynomial_preview_points:
+            try:
+                marker.remove()
+            except (ValueError, RuntimeError):
+                pass
+        self.polynomial_preview_points.clear()
+        self.polynomial_points.clear()
+        
+        # NOTE: Do NOT remove self.guess_polynomial_line here if a guess was confirmed
+        # The persistent line should already be in self.guess_lines and will be drawn
+        # Only remove the temporary preview if it wasn't confirmed
+        if self.guess_polynomial_line is not None and not hasattr(self, '_polynomial_guess_confirmed'):
+            try:
+                self.guess_polynomial_line.remove()
+            except (ValueError, RuntimeError):
+                pass
+        self._polynomial_guess_confirmed = False
+        
+        # Clean up polynomial baseline line preview
+        if self.guess_polynomial_baseline_line is not None:
+            try:
+                self.guess_polynomial_baseline_line.remove()
+            except (ValueError, RuntimeError):
+                pass
+            self.guess_polynomial_baseline_line = None
+        
+        # Reset variables
+        self.guess_drawing_mode = False
+        self.current_component_for_guess = None
+        self.current_component_row = None
+        self.guess_center = None
+        self.guess_sigma = None
+        self.guess_amp = None
+        self.guess_preview_line = None
+        
+        # Reset drag tracking
+        self.guess_mouse_down = False
+        self.guess_drag_start_x = None
+        self.guess_drag_start_y = None
+        self.guess_drag_end_x = None
+        self.guess_drag_end_y = None
+        
+        plt.draw()
+    
+    def on_remove_all_plotted_features(self):
+        """Remove all plotted features except spectrum with confirmation dialog"""
+        # Show confirmation dialog
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Remove All Plotted Features",
+            "Are you sure you want to remove all plotted features (except for the plotted spectrum)? Progress may be lost.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No
+        )
+        
+        if reply == QtWidgets.QMessageBox.Yes:
+            self.remove_all_plotted_features()
+    
+    def remove_all_plotted_features(self):
+        """Internally remove all plotted features (guesses, fits, bounds, etc.)"""
+        print("[DEBUG] Removing all plotted features...")
+        
+        try:
+            # Cancel any active guess drawing
+            if self.guess_drawing_mode:
+                self._cancel_guess()
+            
+            # Remove all guess lines
+            for comp_id in list(self.guess_lines.keys()):
+                try:
+                    self.guess_lines[comp_id].remove()
+                except (ValueError, RuntimeError):
+                    pass
+            self.guess_lines.clear()
+            
+            # Remove all polynomial preview points
+            for marker in self.polynomial_preview_points:
+                try:
+                    marker.remove()
+                except (ValueError, RuntimeError):
+                    pass
+            self.polynomial_preview_points.clear()
+            self.polynomial_points.clear()
+            
+            # Remove all listfit bound lines and clear components
+            for line in self.listfit_bound_lines:
+                try:
+                    line.remove()
+                except (ValueError, RuntimeError):
+                    pass
+            self.listfit_bound_lines.clear()
+            self.listfit_bounds = []
+            self.listfit_components = []
+            
+            # Remove all continuum fits and patches
+            for fit in self.continuum_fits:
+                try:
+                    if 'line' in fit and fit['line'] is not None:
+                        fit['line'].remove()
+                except (ValueError, RuntimeError):
+                    pass
+            self.continuum_fits.clear()
+            
+            for patch_info in self.continuum_patches:
+                try:
+                    patch = patch_info.get('patch')
+                    if patch is not None and self.ax is not None and patch in self.ax.patches:
+                        patch.remove()
+                except (ValueError, RuntimeError, AttributeError):
+                    pass
+            self.continuum_patches.clear()
+            
+            # Remove all Gaussian fits
+            for fit in self.gaussian_fits:
+                try:
+                    if 'line' in fit and fit['line'] is not None:
+                        fit['line'].remove()
+                except (ValueError, RuntimeError):
+                    pass
+            self.gaussian_fits.clear()
+            
+            # Remove all Voigt fits
+            for fit in self.voigt_fits:
+                try:
+                    if 'line' in fit and fit['line'] is not None:
+                        fit['line'].remove()
+                except (ValueError, RuntimeError):
+                    pass
+            self.voigt_fits.clear()
+            
+            # Remove all Bayes fits and bounds
+            for line in self.bayes_bound_lines:
+                try:
+                    line.remove()
+                except (ValueError, RuntimeError):
+                    pass
+            self.bayes_bound_lines.clear()
+            self.bayes_bounds.clear()
+            
+            # Remove all markers and labels
+            for marker in self.markers:
+                try:
+                    marker.remove()
+                except (ValueError, RuntimeError):
+                    pass
+            self.markers.clear()
+            
+            for label in self.labels:
+                try:
+                    label.remove()
+                except (ValueError, RuntimeError):
+                    pass
+            self.labels.clear()
+            
+            # Clear item tracker
+            if hasattr(self, 'item_id_map'):
+                self.item_id_map.clear()
+            if hasattr(self, 'item_tracker'):
+                self.item_tracker.clear_all()
+            
+            # Deactivate modes
+            self.guess_drawing_mode = False
+            self.continuum_mode = False
+            self.gaussian_mode = False
+            self.voigt_mode = False
+            self.multi_gaussian_mode = False
+            self.multi_gaussian_mode_old = False
+            self.multi_voigt_mode = False
+            self.mask_drawing_mode = False
+            self.bayes_mode = False
+            self.listfit_mode = False
+            self.redshift_estimation_mode = False
+            self.calculate_ew_selection_mode = False
+            
+            # Reset dropdown menus
+            self.continuum_mode_dropdown.blockSignals(True)
+            self.continuum_mode_dropdown.setCurrentIndex(0)
+            self.continuum_mode_dropdown.blockSignals(False)
+            
+            self.gaussian_mode_dropdown.blockSignals(True)
+            self.gaussian_mode_dropdown.setCurrentIndex(0)
+            self.gaussian_mode_dropdown.blockSignals(False)
+            
+            self.advanced_mode_dropdown.blockSignals(True)
+            self.advanced_mode_dropdown.setCurrentIndex(0)
+            self.advanced_mode_dropdown.blockSignals(False)
+            
+            self.calculate_mode_dropdown.blockSignals(True)
+            self.calculate_mode_dropdown.setCurrentIndex(0)
+            self.calculate_mode_dropdown.blockSignals(False)
+            
+            self.calculate_ew_mode_dropdown.blockSignals(True)
+            self.calculate_ew_mode_dropdown.setCurrentIndex(0)
+            self.calculate_ew_mode_dropdown.blockSignals(False)
+            
+            # Disable relevant buttons
+            self.continuum_enter_button.setEnabled(False)
+            self.gaussian_enter_button.setEnabled(False)
+            
+            # Redraw the plot if figure exists
+            if self.fig is not None and hasattr(self.fig, 'canvas'):
+                try:
+                    self.fig.canvas.draw_idle()
+                except Exception as e:
+                    print(f"[DEBUG] Warning: Could not redraw plot: {e}")
+            
+            print("[DEBUG] All plotted features removed successfully.")
+        except Exception as e:
+            print(f"[ERROR] Failed to remove plotted features: {e}")
+            import traceback
+            traceback.print_exc()
     
     def clear_listfit_bounds(self):
         """Clear listfit bounds and remove bound lines from plot"""
@@ -9508,6 +11753,18 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 pass
         self.listfit_bound_lines.clear()
         self.listfit_bounds = []
+        
+        # Also clear all guess lines
+        for comp_id in list(self.guess_lines.keys()):
+            try:
+                self.guess_lines[comp_id].remove()
+            except (ValueError, RuntimeError):
+                pass
+        self.guess_lines.clear()
+        
+        # Also clear all mask regions when user escapes/closes listfit
+        self._clear_mask_regions()
+        
         self.listfit_mode = False
         plt.draw()
     
@@ -9523,10 +11780,28 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             traceback.print_exc()
 
 
-    def perform_listfit(self, components):
-        """Perform multi-component fitting"""
+    def perform_listfit(self, fit_data):
+        """Perform multi-component fitting
+        
+        Args:
+            fit_data: dict with 'components' and 'tied_parameters' keys
+        """
+        # Handle both dict (new format) and list (legacy format for backward compatibility)
+        if isinstance(fit_data, dict):
+            components = fit_data.get('components', [])
+            tied_parameters = fit_data.get('tied_parameters', [])
+        else:
+            # Legacy format: fit_data is just components list
+            components = fit_data
+            tied_parameters = []
+        
+        # FIRST: Clear all temporary guess visualizations (salmon-colored lines)
+        # The guesses themselves remain in components dict to use as initial values
+        self._remove_guess_lines()
+        
         if not self.listfit_bounds or len(self.listfit_bounds) < 2:
             print("Error: Invalid bounds for listfit")
+            self._clear_mask_regions()  # Clear masks on error
             return
         
         left_bound, right_bound = sorted(self.listfit_bounds)
@@ -9539,6 +11814,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         
         if len(x_fit) == 0:
             print("Error: No data within bounds")
+            self._remove_guess_lines()
+            self._clear_mask_regions()  # Clear masks on error
             return
         
         # Extract data masks to exclude pixels from fit
@@ -9560,27 +11837,103 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         
         if len(x_fit_masked) == 0:
             print("Error: All data excluded by data masks")
+            self._remove_guess_lines()
+            self._clear_mask_regions()  # Clear masks on error
             return
         
         # Build the composite model
         try:
-            composite_model = self.build_composite_model(components, x_fit_masked, y_fit_masked, err_fit_masked)
+            composite_model = self.build_composite_model(components, x_fit_masked, y_fit_masked, err_fit_masked, tied_parameters)
         except Exception as e:
             print(f"Error building composite model: {e}")
             import traceback
             traceback.print_exc()
+            self._remove_guess_lines()
+            self._clear_mask_regions()  # Clear masks on error
             return
         
         if composite_model is None:
             print("Error: Could not build composite model")
+            self._remove_guess_lines()
+            self._clear_mask_regions()  # Clear masks on error
             return
         
         # Perform the fit with optional weights
+        params = None  # Initialize to None - will be created during fitting
         try:
-            if err_fit_masked is not None:
-                result = composite_model.fit(y_fit_masked, x=x_fit_masked, weights=1.0/err_fit_masked)
+            # **COMPREHENSIVE DEBUG OUTPUT BEFORE FITTING**
+            print("\n" + "="*80)
+            print("[DEBUG] COMPREHENSIVE LISTFIT MODEL SETUP")
+            print("="*80)
+            print(f"[DEBUG] Fit data: {len(x_fit_masked)} data points (from {len(x_fit)} total in bounds)")
+            print(f"[DEBUG] Composite model structure:\n{composite_model}")
+            print("\n[DEBUG] Parameter Summary BEFORE fit:")
+            if hasattr(composite_model, 'make_params'):
+                params = composite_model.make_params()
+                
+                # **APPLY TIED PARAMETERS NOW THAT PARAMETERS EXIST**
+                if tied_parameters:
+                    print(f"[DEBUG] Applying {len(tied_parameters)} tied parameter(s) to created parameters...")
+                    for tie in tied_parameters:
+                        param1 = tie.get('param1', '').strip()
+                        param2_expr = tie.get('param2', '').strip()
+                        
+                        if not param1 or not param2_expr:
+                            continue
+                        
+                        # Parse param1 to get the actual parameter name
+                        if '=' in param1:
+                            param1 = param1.split('=')[0].strip()
+                        
+                        if param1 in params:
+                            # **CRITICAL FIX**: Skip if parameter already has an expression (e.g., from redshift tying)
+                            if params[param1].expr:
+                                print(f"[DEBUG] SKIPPING tie for {param1} (already has expression: {params[param1].expr})")
+                                continue
+                            
+                            print(f"[DEBUG] Setting tie: {param1} = {param2_expr}")
+                            try:
+                                params[param1].expr = param2_expr
+                                params[param1].vary = False  # Dependent parameters don't vary
+                            except Exception as e:
+                                print(f"[DEBUG] ERROR applying tie {param1} = {param2_expr}: {e}")
+                        else:
+                            print(f"[DEBUG] ERROR: Parameter '{param1}' not found in model")
+                
+                for pname in sorted(params.keys()):
+                    p = params[pname]
+                    bounds_str = f"[{p.min if p.min is not None else '-∞'}, {p.max if p.max is not None else '+∞'}]"
+                    expr_str = f", expr='{p.expr}'" if p.expr else ""
+                    print(f"  {pname:20s}: value={p.value:12.6f}, vary={p.vary!s:5s}, bounds={bounds_str}{expr_str}")
+            
+            # **ADDITIONAL DEBUG: Show which parameters have tied expressions**
+            print("\n[DEBUG] Parameters with expressions (tied parameters):")
+            if params:
+                for pname in sorted(params.keys()):
+                    if params[pname].expr:
+                        print(f"  {pname:20s} = {params[pname].expr}")
+                print(f"\n[DEBUG] All parameters in params object: {list(params.keys())}")
             else:
-                result = composite_model.fit(y_fit_masked, x=x_fit_masked)
+                print("  (None - params not yet created or empty)")
+            print("\n[DEBUG] Fit method: leastsq")
+            if err_fit_masked is not None:
+                print(f"[DEBUG] Using error spectrum (weights=1/err)")
+            else:
+                print(f"[DEBUG] No error spectrum (unweighted fit)")
+            print("="*80 + "\n")
+            
+            # Use the params object we created (which has ties applied)
+            if hasattr(composite_model, 'make_params') and params is not None:
+                if err_fit_masked is not None:
+                    result = composite_model.fit(y_fit_masked, params, x=x_fit_masked, weights=1.0/err_fit_masked)
+                else:
+                    result = composite_model.fit(y_fit_masked, params, x=x_fit_masked)
+            else:
+                # Fallback if params wasn't created properly
+                if err_fit_masked is not None:
+                    result = composite_model.fit(y_fit_masked, x=x_fit_masked, weights=1.0/err_fit_masked)
+                else:
+                    result = composite_model.fit(y_fit_masked, x=x_fit_masked)
         except RecursionError as e:
             error_msg = (
                 "Fit failed due to circular or conflicting constraints!\n\n"
@@ -9594,11 +11947,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 "  3. Ensure fixed values don't conflict with bounds"
             )
             print(f"Error: {error_msg}")
+            self._remove_guess_lines()
             QtWidgets.QMessageBox.critical(self, "Fit Failed - Invalid Constraints", error_msg)
             return
         except Exception as e:
             error_msg = f"Fit failed with error: {str(e)}\n\nPlease check your constraints and try again."
             print(f"Error: {error_msg}")
+            self._remove_guess_lines()
             QtWidgets.QMessageBox.critical(self, "Fit Failed", error_msg)
             return
         
@@ -9607,6 +11962,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         
         if not fit_converged:
             print(f"Fit failed: {result.message}")
+            self._remove_guess_lines()
             return
         
         # Print warning if fit converged but error bars couldn't be estimated
@@ -9660,13 +12016,12 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             initial_guesses = {}
             constraints_info = {}
         
-        # Store the fit
+        # Store the fit (IMPORTANT: Do NOT store 'result' object as it can have corrupted state)
         print("[DEBUG] Storing fit results...")
         try:
             self.listfit_fits.append({
                 'bounds': (left_bound, right_bound),
                 'components': components,
-                'result': result,
                 'x_data': x_fit,
                 'y_data': y_fit,
                 'err_data': err_fit,
@@ -9680,8 +12035,24 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             traceback.print_exc()
             return
         
-        # Record action for undo/redo
-        self.record_action('perform_listfit', f'Perform Listfit ({len(self.listfit_fits)} total fits)')
+        # Extract initial guesses from lmfit and merge with user-drawn guesses
+        print("[DEBUG] Extracting and merging guess parameters...")
+        
+        gauss_count = 0
+        voigt_count = 0
+        
+        for comp in components:
+            if comp['type'] == 'gaussian':
+                # User-drawn guesses are already in comp['guess']
+                # No need to extract from lmfit to avoid accessing corrupted parameter state
+                gauss_count += 1
+            
+            elif comp['type'] == 'voigt':
+                # User-drawn guesses are already in comp['guess']
+                # No need to extract from lmfit to avoid accessing corrupted parameter state
+                voigt_count += 1
+        
+        print("[DEBUG] Successfully extracted initial guess parameters")
         
         # Extract fit data for .qsap file (store components separately)
         listfit_fit_data = []
@@ -9691,148 +12062,466 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         voigt_count = 0
         poly_count = 0
         
-        for comp in components:
-            comp_dict = {'type': comp['type']}
-            
-            if comp['type'] == 'gaussian':
-                # Use counter-based naming to match build_composite_model
-                prefix = f'g{gauss_count}_'
-                amp_name = f'{prefix}amp'
-                mean_name = f'{prefix}mean'
-                sigma_name = f'{prefix}stddev'
-                
-                if all(name in result.params for name in [amp_name, mean_name, sigma_name]):
-                    # Store initial guess values
-                    comp_dict['amp_initial'] = result.params[amp_name].init_value
-                    comp_dict['mean_initial'] = result.params[mean_name].init_value
-                    comp_dict['stddev_initial'] = result.params[sigma_name].init_value
-                    
-                    # Store best fit parameters with errors
-                    comp_dict['amp'] = result.params[amp_name].value
-                    comp_dict['amp_err'] = result.params[amp_name].stderr
-                    comp_dict['mean'] = result.params[mean_name].value
-                    comp_dict['mean_err'] = result.params[mean_name].stderr
-                    comp_dict['stddev'] = result.params[sigma_name].value
-                    comp_dict['stddev_err'] = result.params[sigma_name].stderr
-                    comp_dict['bounds'] = (left_bound, right_bound)
-                    comp_dict['is_velocity_mode'] = self.is_velocity_mode
-                
-                gauss_count += 1
-            
-            elif comp['type'] == 'voigt':
-                # Use counter-based naming to match build_composite_model
-                prefix = f'v{voigt_count}_'
-                amp_name = f'{prefix}amp'
-                mean_name = f'{prefix}center'
-                sigma_name = f'{prefix}sigma'
-                gamma_name = f'{prefix}gamma'
-                
-                if all(name in result.params for name in [amp_name, mean_name, sigma_name, gamma_name]):
-                    # Store initial guess values
-                    comp_dict['amplitude_initial'] = result.params[amp_name].init_value
-                    comp_dict['mean_initial'] = result.params[mean_name].init_value
-                    comp_dict['sigma_initial'] = result.params[sigma_name].init_value
-                    comp_dict['gamma_initial'] = result.params[gamma_name].init_value
-                    
-                    # Store best fit parameters with errors
-                    comp_dict['amplitude'] = result.params[amp_name].value
-                    comp_dict['amplitude_err'] = result.params[amp_name].stderr
-                    comp_dict['mean'] = result.params[mean_name].value
-                    comp_dict['mean_err'] = result.params[mean_name].stderr
-                    comp_dict['sigma'] = result.params[sigma_name].value
-                    comp_dict['sigma_err'] = result.params[sigma_name].stderr
-                    comp_dict['gamma'] = result.params[gamma_name].value
-                    comp_dict['gamma_err'] = result.params[gamma_name].stderr
-                    comp_dict['bounds'] = (left_bound, right_bound)
-                    comp_dict['is_velocity_mode'] = self.is_velocity_mode
-                
-                voigt_count += 1
-            
-            elif comp['type'] == 'polynomial':
-                # Use counter-based naming to match build_composite_model
-                prefix = f'p{poly_count}_'
-                coeffs_initial = []
-                coeffs = []
-                coeffs_err = []
-                order = comp.get('order', 1)
-                for i in range(order + 1):
-                    coeff_name = f'{prefix}c{i}'
-                    if coeff_name in result.params:
-                        coeffs_initial.append(result.params[coeff_name].init_value)
-                        coeffs.append(result.params[coeff_name].value)
-                        coeffs_err.append(result.params[coeff_name].stderr)
-                
-                if coeffs:
-                    comp_dict['poly_order'] = order
-                    comp_dict['coeffs_initial'] = coeffs_initial
-                    comp_dict['coeffs'] = coeffs
-                    comp_dict['coeffs_err'] = coeffs_err
-                    comp_dict['bounds'] = (left_bound, right_bound)
-                
-                poly_count += 1
-            
-            elif comp['type'] == 'polynomial_guess_mask':
-                # Store mask parameters as-is (no fit results needed)
-                comp_dict['min_lambda'] = comp.get('min_lambda')
-                comp_dict['max_lambda'] = comp.get('max_lambda')
-            
-            elif comp['type'] == 'data_mask':
-                # Store mask parameters as-is (no fit results needed)
-                comp_dict['min_lambda'] = comp.get('min_lambda')
-                comp_dict['max_lambda'] = comp.get('max_lambda')
-            
-            # Only add non-empty component dictionaries
-            if len(comp_dict) > 1:  # More than just 'type'
-                listfit_fit_data.append(comp_dict)
-        
-        # Add fit diagnostics as a special metadata entry
-        diagnostics_dict = {
-            'type': 'fit_diagnostics',
-            'ssr': float(np.sum(result.residual ** 2)) if result.residual is not None else None,
-            'ssr_nu': result.redchi if result.redchi is not None else None,
-            'chi2': float(result.chisqr) if hasattr(result, 'chisqr') and result.chisqr is not None else None,
-            'chi2_reduced': result.redchi if result.redchi is not None else None,
-            'akaike_info_criterion': result.aic if hasattr(result, 'aic') and result.aic is not None else None,
-            'bayesian_info_criterion': result.bic if hasattr(result, 'bic') and result.bic is not None else None,
-            'r_squared': None,  # Calculate if we have data
-            'n_data_points': result.ndata if hasattr(result, 'ndata') else None,
-            'n_parameters': result.nvarys if hasattr(result, 'nvarys') else None,
-            'n_degrees_freedom': result.nfree if hasattr(result, 'nfree') else None,
-            'fit_success': result.success if hasattr(result, 'success') else None
-        }
-        
-        # Calculate R-squared if possible
         try:
-            ss_res = np.sum(result.residual ** 2) if result.residual is not None else np.sum((y_fit - result.best_fit) ** 2)
-            ss_tot = np.sum((y_fit - np.mean(y_fit)) ** 2)
-            r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
-            diagnostics_dict['r_squared'] = float(r_squared)
-        except:
-            pass
+            print("[DEBUG] Starting fit data extraction...")
+            
+            for comp in components:
+                comp_dict = {'type': comp['type']}
+                
+                if comp['type'] == 'gaussian':
+                    prefix = f'g{gauss_count}_'
+                    amp_name = f'{prefix}amp'
+                    mu_name = f'{prefix}mu'
+                    sigma_name = f'{prefix}sigma'
+                    
+                    if all(name in result.params for name in [amp_name, mu_name, sigma_name]):
+                        try:
+                            # Store best fit parameters with errors - extract carefully
+                            comp_dict['amp'] = float(result.params[amp_name].value) if result.params[amp_name].value is not None else None
+                            comp_dict['amp_err'] = float(result.params[amp_name].stderr) if result.params[amp_name].stderr is not None else None
+                            comp_dict['mean'] = float(result.params[mu_name].value) if result.params[mu_name].value is not None else None
+                            comp_dict['mean_err'] = float(result.params[mu_name].stderr) if result.params[mu_name].stderr is not None else None
+                            comp_dict['stddev'] = float(result.params[sigma_name].value) if result.params[sigma_name].value is not None else None
+                            comp_dict['stddev_err'] = float(result.params[sigma_name].stderr) if result.params[sigma_name].stderr is not None else None
+                            comp_dict['bounds'] = (float(left_bound), float(right_bound))
+                            comp_dict['is_velocity_mode'] = self.is_velocity_mode
+                            
+                            # Include guess parameters if they exist (v1.3+)
+                            guess = comp.get('guess')
+                            if guess and any(v is not None for v in guess.values()):
+                                comp_dict['guess'] = guess
+                        except Exception as e:
+                            print(f"[DEBUG] Warning: Could not store Gaussian {gauss_count} fit data: {e}")
+                    
+                    gauss_count += 1
+                
+                elif comp['type'] == 'voigt':
+                    prefix = f'v{voigt_count}_'
+                    amp_name = f'{prefix}amp'
+                    mean_name = f'{prefix}center'
+                    sigma_name = f'{prefix}sigma'
+                    gamma_name = f'{prefix}gamma'
+                    
+                    if all(name in result.params for name in [amp_name, mean_name, sigma_name, gamma_name]):
+                        try:
+                            # Store best fit parameters with errors - extract carefully
+                            comp_dict['amplitude'] = float(result.params[amp_name].value) if result.params[amp_name].value is not None else None
+                            comp_dict['amplitude_err'] = float(result.params[amp_name].stderr) if result.params[amp_name].stderr is not None else None
+                            comp_dict['mean'] = float(result.params[mean_name].value) if result.params[mean_name].value is not None else None
+                            comp_dict['mean_err'] = float(result.params[mean_name].stderr) if result.params[mean_name].stderr is not None else None
+                            comp_dict['sigma'] = float(result.params[sigma_name].value) if result.params[sigma_name].value is not None else None
+                            comp_dict['sigma_err'] = float(result.params[sigma_name].stderr) if result.params[sigma_name].stderr is not None else None
+                            comp_dict['gamma'] = float(result.params[gamma_name].value) if result.params[gamma_name].value is not None else None
+                            comp_dict['gamma_err'] = float(result.params[gamma_name].stderr) if result.params[gamma_name].stderr is not None else None
+                            comp_dict['bounds'] = (float(left_bound), float(right_bound))
+                            comp_dict['is_velocity_mode'] = self.is_velocity_mode
+                            
+                            # Include guess parameters if they exist (v1.3+)
+                            guess = comp.get('guess')
+                            if guess and any(v is not None for v in guess.values()):
+                                comp_dict['guess'] = guess
+                        except Exception as e:
+                            print(f"[DEBUG] Warning: Could not store Voigt {voigt_count} fit data: {e}")
+                    
+                    voigt_count += 1
+                
+                elif comp['type'] == 'polynomial':
+                    prefix = f'p{poly_count}_'
+                    coeffs = []
+                    coeffs_err = []
+                    order = comp.get('order', 1)
+                    
+                    try:
+                        for i in range(order + 1):
+                            coeff_name = f'{prefix}c{i}'
+                            if coeff_name in result.params:
+                                try:
+                                    coeff_val = float(result.params[coeff_name].value) if result.params[coeff_name].value is not None else None
+                                    coeff_err = float(result.params[coeff_name].stderr) if result.params[coeff_name].stderr is not None else None
+                                    coeffs.append(coeff_val)
+                                    coeffs_err.append(coeff_err)
+                                except Exception as e:
+                                    print(f"[DEBUG] Warning: Could not extract coefficient {coeff_name}: {e}")
+                    except Exception as e:
+                        print(f"[DEBUG] Warning: Could not extract polynomial coefficients: {e}")
+                    
+                    if coeffs:
+                        comp_dict['poly_order'] = order
+                        comp_dict['coeffs'] = coeffs
+                        comp_dict['coeffs_err'] = coeffs_err
+                        comp_dict['bounds'] = (float(left_bound), float(right_bound))
+                elif comp['type'] == 'data_mask':
+                    # Store mask parameters as-is (no fit results needed)
+                    comp_dict['min_lambda'] = comp.get('min_lambda')
+                    comp_dict['max_lambda'] = comp.get('max_lambda')
+                
+                # Only add non-empty component dictionaries
+                if len(comp_dict) > 1:  # More than just 'type'
+                    listfit_fit_data.append(comp_dict)
+            
+            # Extract redshift parameters from result and add them to listfit_fit_data
+            # Also update profile dicts with TIED_REDSHIFT field
+            print("[DEBUG] Extracting redshift components...")
+            redshift_components = [c for c in components if c.get('type') == 'redshift']
+            
+            if redshift_components:
+                # Build a map: profile_index -> redshift_index
+                profile_to_redshift = {}
+                for idx, comp in enumerate(components):
+                    if comp.get('tied_to_redshift') and 'redshift_index' in comp:
+                        redshift_idx = comp['redshift_index']
+                        if redshift_idx not in profile_to_redshift:
+                            profile_to_redshift[redshift_idx] = []
+                        profile_to_redshift[redshift_idx].append(idx)
+                
+                # Extract each redshift
+                for redshift_num, redshift_comp in enumerate(redshift_components, 1):
+                    z_param_name = f"z{redshift_num}"
+                    
+                    if z_param_name in result.params:
+                        try:
+                            z_value = float(result.params[z_param_name].value) if result.params[z_param_name].value is not None else None
+                            z_error = float(result.params[z_param_name].stderr) if result.params[z_param_name].stderr is not None else None
+                            
+                            # Create redshift component dict
+                            redshift_dict = {
+                                'type': 'redshift',
+                                'redshift': z_value,
+                                'error_redshift': z_error,
+                                'redshift_number': redshift_num,
+                                'label': redshift_comp.get('label', f'Redshift #{redshift_num}'),
+                            }
+                            
+                            # Include initial guess if available
+                            z_initial = redshift_comp.get('guess', {}).get('z')
+                            if z_initial is not None:
+                                redshift_dict['z_initial'] = float(z_initial)
+                            
+                            # Count profiles tied to this redshift
+                            num_tied_profiles = len(profile_to_redshift.get(redshift_components.index(redshift_comp), []))
+                            if num_tied_profiles > 0:
+                                redshift_dict['num_profiles'] = num_tied_profiles
+                            
+                            listfit_fit_data.append(redshift_dict)
+                            print(f"[DEBUG] Extracted redshift {z_param_name}: z = {z_value} ± {z_error}")
+                        except Exception as e:
+                            print(f"[DEBUG] Warning: Could not extract redshift {z_param_name}: {e}")
+                
+                # Update profile dicts with TIED_REDSHIFT field
+                # Iterate through listfit_fit_data and add tied_redshift for profiles
+                for profile_idx, (comp_idx, comp) in enumerate(enumerate(components)):
+                    if comp.get('tied_to_redshift') and 'redshift_index' in comp:
+                        redshift_idx = comp['redshift_index']
+                        redshift_comp = components[redshift_idx]
+                        if redshift_comp.get('type') == 'redshift':
+                            redshift_number = redshift_comp.get('redshift_number', 1)
+                            z_symbol = f"Z{redshift_number}"
+                            
+                            # Find the corresponding profile dict in listfit_fit_data and update it
+                            # Count which profile number this is (accounting for other non-profile components before it)
+                            profile_count = sum(1 for c in components[:comp_idx] if c.get('type') in ('gaussian', 'voigt'))
+                            
+                            # Find this profile in listfit_fit_data
+                            gaussian_voigt_count = 0
+                            for fit_dict in listfit_fit_data:
+                                if fit_dict.get('type') in ('gaussian', 'voigt'):
+                                    if gaussian_voigt_count == profile_count:
+                                        fit_dict['tied_redshift'] = z_symbol
+                                        print(f"[DEBUG] Added TIED_REDSHIFT={z_symbol} to {fit_dict.get('type')} component")
+                                        break
+                                    gaussian_voigt_count += 1
+            
+            print("[DEBUG] Redshift extraction complete")
+            print("[DEBUG] Component data extraction complete. Adding diagnostics...")
+            
+            # Add fit diagnostics as a special metadata entry
+            try:
+                diagnostics_dict = {
+                    'type': 'fit_diagnostics',
+                    'ssr': None,
+                    'ssr_nu': None,
+                    'chi2': None,
+                    'chi2_reduced': None,
+                    'akaike_info_criterion': None,
+                    'bayesian_info_criterion': None,
+                    'r_squared': None,
+                    'n_data_points': None,
+                    'n_parameters': None,
+                    'n_degrees_freedom': None,
+                    'fit_success': None
+                }
+                
+                # Safely extract diagnostics
+                if result.residual is not None:
+                    try:
+                        diagnostics_dict['ssr'] = float(np.sum(result.residual ** 2))
+                    except:
+                        pass
+                
+                if hasattr(result, 'redchi') and result.redchi is not None:
+                    try:
+                        diagnostics_dict['ssr_nu'] = float(result.redchi)
+                        diagnostics_dict['chi2_reduced'] = float(result.redchi)
+                    except:
+                        pass
+                
+                if hasattr(result, 'chisqr') and result.chisqr is not None:
+                    try:
+                        diagnostics_dict['chi2'] = float(result.chisqr)
+                    except:
+                        pass
+                
+                if hasattr(result, 'aic') and result.aic is not None:
+                    try:
+                        diagnostics_dict['akaike_info_criterion'] = float(result.aic)
+                    except:
+                        pass
+                
+                if hasattr(result, 'bic') and result.bic is not None:
+                    try:
+                        diagnostics_dict['bayesian_info_criterion'] = float(result.bic)
+                    except:
+                        pass
+                
+                if hasattr(result, 'ndata'):
+                    try:
+                        diagnostics_dict['n_data_points'] = int(result.ndata)
+                    except:
+                        pass
+                
+                if hasattr(result, 'nvarys'):
+                    try:
+                        diagnostics_dict['n_parameters'] = int(result.nvarys)
+                    except:
+                        pass
+                
+                if hasattr(result, 'nfree'):
+                    try:
+                        diagnostics_dict['n_degrees_freedom'] = int(result.nfree)
+                    except:
+                        pass
+                
+                if hasattr(result, 'success'):
+                    try:
+                        diagnostics_dict['fit_success'] = bool(result.success)
+                    except:
+                        pass
+                
+                # Calculate R-squared if possible
+                try:
+                    if result.residual is not None:
+                        ss_res = float(np.sum(result.residual ** 2))
+                    else:
+                        ss_res = float(np.sum((y_fit - result.best_fit) ** 2))
+                    ss_tot = float(np.sum((y_fit - np.mean(y_fit)) ** 2))
+                    r_squared = 1.0 - (ss_res / ss_tot) if ss_tot != 0 else 0.0
+                    diagnostics_dict['r_squared'] = float(r_squared)
+                except Exception as e:
+                    print(f"[DEBUG] Could not calculate R-squared: {e}")
+                
+                listfit_fit_data.append(diagnostics_dict)
+                print("[DEBUG] Diagnostics added successfully")
+            except Exception as e:
+                print(f"[DEBUG] Error adding diagnostics: {e}")
+                import traceback
+                traceback.print_exc()
+            
+            # Add constraints information as a special metadata entry (v1.3+)
+            if constraints_info:
+                try:
+                    constraints_dict = {
+                        'type': 'constraints',
+                        'constraints': constraints_info
+                    }
+                    listfit_fit_data.append(constraints_dict)
+                    print("[DEBUG] Constraints added successfully")
+                except Exception as e:
+                    print(f"[DEBUG] Error adding constraints: {e}")
+            
+            print("[DEBUG] Fit data extraction complete. Saving to .qsap file...")
+            
+        except Exception as e:
+            print(f"[ERROR] Unexpected error during fit data extraction: {e}")
+            import traceback
+            traceback.print_exc()
         
-        # Add diagnostics to fit data
-        listfit_fit_data.append(diagnostics_dict)
+        # **Auto-calculate equivalent widths if conditions are met**
+        # EW is calculated if and only if:
+        # 1. Exactly 1 polynomial continuum is fitted
+        # 2. At least 1 non-polynomial profile (Gaussian or Voigt) is fitted
+        # NOTE: Temporarily disabled due to crashes - set ENABLE_AUTO_EW_LISTFIT=True to re-enable
+        ENABLE_AUTO_EW_LISTFIT = False
+        if ENABLE_AUTO_EW_LISTFIT:
+            try:
+                ew_results = self._auto_calculate_listfit_ew(result, components, left_bound, right_bound, x_fit, y_fit)
+                if ew_results:
+                    listfit_fit_data.append(ew_results)
+            except Exception as e:
+                print(f"[AUTO_EW] ERROR: {e}")
+                import traceback
+                traceback.print_exc()
+                # Continue without EW - don't crash the entire fit
         
         # Save fit to .qsap file
         if listfit_fit_data:
-            self.save_and_print_qsap_fit(listfit_fit_data, 'Listfit', 'Listfit')
+            print("[DEBUG] About to save fit to .qsap file...")
+            try:
+                print(f"[DEBUG] Fit data has {len(listfit_fit_data)} components")
+                
+                # Create a clean copy of the fit data to avoid any corrupted references
+                import json
+                print("[DEBUG] Serializing fit data to check for issues...")
+                
+                # Try to serialize to JSON to catch any problematic objects
+                try:
+                    clean_data = []
+                    for item in listfit_fit_data:
+                        try:
+                            # Try to serialize this item
+                            json_str = json.dumps(item, default=str)
+                            # If successful, add it back
+                            clean_data.append(item)
+                            print(f"[DEBUG]   Item type '{item.get('type', 'unknown')}' serialized OK")
+                        except (TypeError, ValueError) as se:
+                            print(f"[DEBUG]   Warning: Could not fully serialize item type '{item.get('type', 'unknown')}': {se}")
+                            # Still add it - lmfit should handle it
+                            clean_data.append(item)
+                    
+                    print("[DEBUG] All fit data items prepared")
+                except Exception as e:
+                    print(f"[DEBUG] Warning: Pre-serialization check failed: {e}")
+                    clean_data = listfit_fit_data
+                
+                print("[DEBUG] Calling save_and_print_qsap_fit...")
+                self.save_and_print_qsap_fit(clean_data, 'Listfit', 'Listfit')
+                print("[DEBUG] Successfully saved fit to .qsap file")
+            except Exception as e:
+                print(f"[ERROR] Failed to save fit to .qsap file: {e}")
+                import traceback
+                traceback.print_exc()
+                # Continue anyway - don't let save errors crash the entire UI
+        
+        # **Remove persistent guess lines from plot after successful fit**
+        print("[DEBUG] About to remove guess lines...")
+        try:
+            self._remove_guess_lines()
+            print("[DEBUG] Guess lines removed")
+        except Exception as e:
+            print(f"[ERROR] Error removing guess lines: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Clear mask regions now that fit is complete
+        print("[DEBUG] About to clear mask regions...")
+        try:
+            self._clear_mask_regions()
+            print("[DEBUG] Mask regions cleared")
+        except Exception as e:
+            print(f"[ERROR] Error clearing mask regions: {e}")
+            import traceback
+            traceback.print_exc()
         
         # Clear listfit mode
-        self.listfit_mode = False
-        for line in self.listfit_bound_lines:
-            line.remove()
-        self.listfit_bound_lines.clear()
-        self.listfit_bounds = []
+        print("[DEBUG] Clearing listfit mode...")
+        try:
+            self.listfit_mode = False
+            for line in self.listfit_bound_lines:
+                try:
+                    line.remove()
+                except:
+                    pass
+            self.listfit_bound_lines.clear()
+            self.listfit_bounds = []
+            print("[DEBUG] Listfit mode cleared")
+        except Exception as e:
+            print(f"[ERROR] Error clearing listfit mode: {e}")
+            import traceback
+            traceback.print_exc()
         
         # Reset Advanced dropdown after successful fit
-        self.reset_advanced_dropdown()
+        print("[DEBUG] Resetting advanced dropdown...")
+        try:
+            self.reset_advanced_dropdown()
+            print("[DEBUG] Advanced dropdown reset")
+        except Exception as e:
+            print(f"[ERROR] Error resetting advanced dropdown: {e}")
+            import traceback
+            traceback.print_exc()
         
-        self.fig.canvas.draw_idle()  # Redraw to show listfit results
+        print("[DEBUG] About to redraw canvas...")
+        try:
+            self.fig.canvas.draw_idle()  # Redraw to show listfit results
+            print("[DEBUG] Canvas redrawn successfully")
+        except Exception as e:
+            print(f"[ERROR] Error redrawing canvas: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        print("[DEBUG] _perform_listfit completed successfully!")
 
-    def build_composite_model(self, components, x_fit, y_fit, err_fit):
-        """Build a composite lmfit Model from component list with improved initial guesses for blended profiles"""
+    def _remove_guess_lines(self):
+        """Remove all guess profile lines from the plot"""
+        print("[DEBUG] Removing guess profile lines from plot...")
+        for comp_id in list(self.guess_lines.keys()):
+            try:
+                self.guess_lines[comp_id].remove()
+                print(f"[DEBUG] Removed guess line for component #{comp_id}")
+            except (ValueError, RuntimeError) as e:
+                print(f"[DEBUG] Warning: Could not remove guess line for component #{comp_id}: {e}")
+        self.guess_lines.clear()
+        
+        # Also remove temporary polynomial clicked points markers
+        if self.guess_polynomial_clicked_points is not None:
+            try:
+                self.guess_polynomial_clicked_points.remove()
+                print(f"[DEBUG] Removed polynomial clicked points markers")
+            except (ValueError, RuntimeError):
+                pass
+            self.guess_polynomial_clicked_points = None
+        
+        print("[DEBUG] All guess profile lines removed")
+
+    def _clear_mask_regions(self):
+        """Remove all mask region patches (data_mask and polynomial_guess_mask) from the plot.
+        
+        This is called after listfit completes (successfully or with error) to clean up
+        the gray mask regions that were displayed during the fitting process.
+        """
+        print("[DEBUG] Clearing mask regions from plot...")
+        # Find and remove all mask-type items from ItemTracker
+        items_to_remove = []
+        for item_id, item_info in self.item_id_map.items():
+            if item_info['type'] in ['data_mask', 'polynomial_guess_mask']:
+                items_to_remove.append(item_id)
+        
+        for item_id in items_to_remove:
+            try:
+                patch_obj = self.item_id_map[item_id].get('patch_obj')
+                if patch_obj:
+                    patch_obj.remove()
+                    print(f"[DEBUG] Removed mask patch: {item_id}")
+                self.unregister_item(item_id)
+                print(f"[DEBUG] Unregistered mask item: {item_id}")
+            except (ValueError, RuntimeError) as e:
+                print(f"[DEBUG] Warning: Could not remove mask {item_id}: {e}")
+        
+        print(f"[DEBUG] Cleared {len(items_to_remove)} mask region(s)")
+
+    def build_composite_model(self, components, x_fit, y_fit, err_fit, tied_parameters=None):
+        """Build a composite lmfit Model from component list with improved initial guesses for blended profiles
+        
+        Args:
+            components: List of component dicts
+            x_fit: Wavelength array
+            y_fit: Flux array
+            err_fit: Error array (optional)
+            tied_parameters: List of {'param1': str, 'param2': str} dicts for tied parameters
+        """
         from scipy.signal import find_peaks
         from lmfit import Model, Parameters
+        
+        if tied_parameters is None:
+            tied_parameters = []
         
         model = None
         gauss_count = 0
@@ -9888,8 +12577,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # For multiple Gaussians/Voigts, use region-based peak detection to handle blended profiles
         
         # Count how many Gaussians and Voigts we need to fit
-        num_gaussians = len([c for c in components if c['type'] == 'gaussian'])
-        num_voigts = len([c for c in components if c['type'] == 'voigt'])
+        # (excluding redshift-tied ones which have their center determined by redshift parameter)
+        num_gaussians = len([c for c in components if c['type'] == 'gaussian' and not c.get('tied_to_redshift')])
+        num_voigts = len([c for c in components if c['type'] == 'voigt' and not c.get('tied_to_redshift')])
         num_line_components = num_gaussians + num_voigts
         
         print(f"[DEBUG] Peak detection starting... num_gaussians={num_gaussians}, num_voigts={num_voigts}")
@@ -9918,30 +12608,46 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         peak_index_for_component = 0  # Track which peak to use next
         
         print(f"[DEBUG] Processing {len(components)} components...")
+        for i, c in enumerate(components):
+            print(f"[DEBUG]   Component {i}: type={c.get('type')}, label={c.get('label', 'N/A')}")
         
         for comp in components:
-            # Skip mask features - they're not fitted, only used for polynomial guess or data exclusion
-            if comp['type'] in ['polynomial_guess_mask', 'data_mask']:
+            # Skip mask features and redshift parameters - they're not fitted as spectral components
+            # Redshift parameters are handled after the main model is built
+            if comp['type'] in ['polynomial_guess_mask', 'data_mask', 'redshift']:
+                print(f"[DEBUG] Skipping {comp['type']} component: {comp.get('label', 'N/A')}")
                 continue
             
             if comp['type'] == 'gaussian':
-                # Assign this Gaussian to the next available peak
-                if peak_index_for_component < len(peaks):
-                    amp_guess, center_guess, sigma_guess = self._estimate_gaussian_params(
-                        x_fit, y_fit, peak_idx=peaks[peak_index_for_component]
-                    )
-                    peak_index_for_component += 1
+                print(f"[DEBUG] Processing Gaussian #{gauss_count}: label={comp.get('label', 'N/A')}")
+                # Check if user provided a guess first (interactive guess drawing)
+                user_guess = comp.get('guess', {})
+                if user_guess.get('center') is not None and user_guess.get('amp') is not None and user_guess.get('stddev') is not None:
+                    # Use user-provided guess values
+                    amp_guess = user_guess['amp']
+                    center_guess = user_guess['center']
+                    sigma_guess = user_guess['stddev']
+                    print(f"[DEBUG] Using user-provided guess for Gaussian {gauss_count}: center={center_guess:.2f}, amp={amp_guess:.2f}, stddev={sigma_guess:.2f}")
                 else:
-                    # Fallback if we run out of detected peaks
-                    amp_guess, center_guess, sigma_guess = self._estimate_gaussian_params(x_fit, y_fit)
+                    # Fall back to auto-detection if no user guess
+                    if peak_index_for_component < len(peaks):
+                        amp_guess, center_guess, sigma_guess = self._estimate_gaussian_params(
+                            x_fit, y_fit, peak_idx=peaks[peak_index_for_component]
+                        )
+                        peak_index_for_component += 1
+                    else:
+                        # Fallback if we run out of detected peaks
+                        amp_guess, center_guess, sigma_guess = self._estimate_gaussian_params(x_fit, y_fit)
                 
                 prefix = f'g{gauss_count}_'
+                print(f"[DEBUG] Creating model with prefix '{prefix}' for Gaussian {gauss_count}")
                 gauss_model = Model(self.gaussian, prefix=prefix, independent_vars=['x'])
                 
                 # Set initial guesses FIRST with the detected peak positions
                 gauss_model.set_param_hint(f'{prefix}amp', value=amp_guess)
-                gauss_model.set_param_hint(f'{prefix}mean', value=center_guess)
-                gauss_model.set_param_hint(f'{prefix}stddev', value=sigma_guess, min=1e-6)
+                gauss_model.set_param_hint(f'{prefix}mu', value=center_guess)
+                gauss_model.set_param_hint(f'{prefix}sigma', value=sigma_guess, min=1e-6)
+                print(f"[DEBUG] Set initial guesses: {prefix}amp={amp_guess}, {prefix}mu={center_guess}, {prefix}sigma={sigma_guess}")
                 
                 # Apply constraints AFTER initial guesses
                 # Constraints may override the initial guess (e.g., for fixed values or linked parameters)
@@ -9954,24 +12660,35 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 else:
                     model = model + gauss_model
                 gauss_count += 1
+                print(f"[DEBUG] Gaussian {gauss_count - 1} added. gauss_count is now {gauss_count}")
             
             elif comp['type'] == 'voigt':
-                # Assign this Voigt to the next available peak
-                if peak_index_for_component < len(peaks):
-                    amp_guess, center_guess, sigma_guess = self._estimate_gaussian_params(
-                        x_fit, y_fit, peak_idx=peaks[peak_index_for_component]
-                    )
-                    peak_index_for_component += 1
+                # Check if user provided a guess first (interactive guess drawing)
+                user_guess = comp.get('guess', {})
+                if user_guess.get('center') is not None and user_guess.get('amp') is not None and user_guess.get('sigma') is not None:
+                    # Use user-provided guess values
+                    amp_guess = user_guess['amp']
+                    center_guess = user_guess['center']
+                    sigma_guess = user_guess['sigma']
+                    gamma_guess = user_guess.get('gamma', sigma_guess * 0.01)  # Use user's gamma or default
+                    print(f"[DEBUG] Using user-provided guess for Voigt {voigt_count}: center={center_guess:.2f}, amp={amp_guess:.2f}, sigma={sigma_guess:.2f}, gamma={gamma_guess:.2f}")
                 else:
-                    # Fallback if we run out of detected peaks
-                    amp_guess, center_guess, sigma_guess = self._estimate_gaussian_params(x_fit, y_fit)
-                
-                gamma_guess = sigma_guess * 0.5  # Reasonable starting point for gamma
+                    # Fall back to auto-detection if no user guess
+                    if peak_index_for_component < len(peaks):
+                        amp_guess, center_guess, sigma_guess = self._estimate_gaussian_params(
+                            x_fit, y_fit, peak_idx=peaks[peak_index_for_component]
+                        )
+                        peak_index_for_component += 1
+                    else:
+                        # Fallback if we run out of detected peaks
+                        amp_guess, center_guess, sigma_guess = self._estimate_gaussian_params(x_fit, y_fit)
+                    
+                    gamma_guess = sigma_guess * 0.01  # Small Lorentzian contribution
                 
                 prefix = f'v{voigt_count}_'
                 voigt_model = Model(self.voigt, prefix=prefix, independent_vars=['x'])
                 
-                # Set initial guesses FIRST with the detected peak positions
+                # Set initial guesses FIRST with the detected peak positions (user's or auto-detected)
                 voigt_model.set_param_hint(f'{prefix}amp', value=amp_guess)
                 voigt_model.set_param_hint(f'{prefix}center', value=center_guess)
                 voigt_model.set_param_hint(f'{prefix}sigma', value=sigma_guess, min=1e-6)
@@ -9990,12 +12707,27 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             elif comp['type'] == 'polynomial':
                 order = comp.get('order', 1)
                 prefix = f'p{poly_count}_'
+                
+                # Check if user provided a polynomial guess (drawn line)
+                user_guess = comp.get('guess', {})
+                
                 # Create polynomial model using lmfit's built-in PolynomialModel
                 from lmfit.models import PolynomialModel
                 poly_model = PolynomialModel(degree=order, prefix=prefix, independent_vars=['x'])
                 
+                # **Use user-drawn polynomial guess if available (only for order=1)**
+                if order == 1 and user_guess.get('slope') is not None and user_guess.get('intercept') is not None:
+                    slope = user_guess['slope']
+                    intercept = user_guess['intercept']
+                    # For PolynomialModel with degree=1: y = c0 + c1*x
+                    # Our line is: y = slope*x + intercept
+                    # So: c0 = intercept, c1 = slope
+                    print(f"[DEBUG] Using user-drawn polynomial guess for {prefix}: y = {slope:.6f}*x + {intercept:.4f}")
+                    poly_model.set_param_hint(f'{prefix}c0', value=intercept)
+                    poly_model.set_param_hint(f'{prefix}c1', value=slope)
+                
                 # **Use pre-fitted polynomial parameters if available (Stage 1 results)**
-                if prefix in polynomial_fits and polynomial_fits[prefix] is not None:
+                elif prefix in polynomial_fits and polynomial_fits[prefix] is not None:
                     print(f"[DEBUG] Using pre-fitted parameters for polynomial {prefix}")
                     # Use the fitted parameters from Stage 1
                     for i in range(order + 1):
@@ -10023,6 +12755,79 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 else:
                     model = model + poly_model
                 poly_count += 1
+        
+        # **HANDLE REDSHIFT PARAMETERS AND TIED EXPRESSIONS**
+        # Add redshift parameters and tie line centers to them
+        redshift_components = [comp for comp in components if comp['type'] == 'redshift']
+        if redshift_components:
+            print(f"[DEBUG] Processing {len(redshift_components)} redshift component(s)...")
+            
+            for redshift_idx, redshift_comp in enumerate(redshift_components):
+                z_param_name = f'z{redshift_idx + 1}'  # Use z1, z2, z3 (1-indexed, not 0-indexed)
+                redshift_guess = redshift_comp.get('guess', {}).get('z')
+                
+                if model is None:
+                    # Need to create a dummy model if no other components exist
+                    # (unlikely, but handle it just in case)
+                    from lmfit import Parameters
+                    model = Model(lambda x: np.zeros_like(x), prefix='dummy_')
+                
+                # Add redshift parameter
+                print(f"[DEBUG] Adding redshift parameter '{z_param_name}'")
+                if redshift_guess is not None:
+                    model.set_param_hint(z_param_name, value=redshift_guess, min=-1.0, max=10.0)
+                    print(f"[DEBUG]   Initial guess: z = {redshift_guess}")
+                else:
+                    model.set_param_hint(z_param_name, value=0.0, min=-1.0, max=10.0)
+                    print(f"[DEBUG]   No guess provided, using default z = 0.0")
+                
+                # Find all lines tied to this redshift and create tie expressions
+                tied_line_indices = redshift_comp.get('tied_lines', [])
+                for line_idx in tied_line_indices:
+                    if line_idx >= len(components):
+                        continue
+                    
+                    line_comp = components[line_idx]
+                    if line_comp.get('tied_to_redshift') != True:
+                        continue
+                    
+                    rest_wavelength = line_comp.get('rest_wavelength')
+                    if rest_wavelength is None:
+                        print(f"[DEBUG] Warning: Line component {line_idx} missing rest_wavelength")
+                        continue
+                    
+                    # Determine parameter prefix (g for gaussian, v for voigt)
+                    line_type = line_comp.get('type')
+                    if line_type == 'gaussian':
+                        # Find which gaussian this is (count ALL gaussians up to this component, including redshift-tied)
+                        gauss_idx = 0
+                        for i, c in enumerate(components[:line_idx]):
+                            if c.get('type') == 'gaussian':  # Count ALL Gaussians
+                                gauss_idx += 1
+                        prefix = f'g{gauss_idx}_'
+                    elif line_type == 'voigt':
+                        # Find which voigt this is (count ALL voigts up to this component, including redshift-tied)
+                        voigt_idx = 0
+                        for i, c in enumerate(components[:line_idx]):
+                            if c.get('type') == 'voigt':  # Count ALL Voigts
+                                voigt_idx += 1
+                        prefix = f'v{voigt_idx}_'
+                    else:
+                        print(f"[DEBUG] Warning: Unknown line type {line_type}")
+                        continue
+                    
+                    # Set tie expression: center = (1 + z) * rest_wavelength
+                    # IMPORTANT: Use 'mu' for Gaussian (not 'mean'), 'center' for Voigt
+                    center_param = f'{prefix}mu' if line_type == 'gaussian' else f'{prefix}center'
+                    tie_expression = f'(1 + {z_param_name}) * {rest_wavelength}'
+                    print(f"[DEBUG] Tying {center_param} to redshift: {center_param} = {tie_expression}")
+                    print(f"[DEBUG]   z_param_name = '{z_param_name}' (type={type(z_param_name)})")
+                    print(f"[DEBUG]   rest_wavelength = {rest_wavelength} (type={type(rest_wavelength)})")
+                    model.set_param_hint(center_param, expr=tie_expression)
+        
+        # **APPLY TIED PARAMETERS FROM TIED_PARAMETERS LIST**
+        # NOTE: Don't apply ties via set_param_hint here - apply them after parameters are created
+        # Return both model and tied_parameters so they can be applied properly during fitting
         
         return model
 
@@ -10159,8 +12964,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         """Extract initial guesses from lmfit result and components"""
         guesses = {}
         for param_name, param in result.params.items():
-            if param.init_value is not None:
-                guesses[param_name] = param.init_value
+            try:
+                # Use safe getter that handles constrained parameters
+                init_val = param.init_value if hasattr(param, 'init_value') and param.init_value is not None else param.value
+                if init_val is not None:
+                    guesses[param_name] = init_val
+            except (AttributeError, ValueError, TypeError):
+                # Skip parameters that cause issues
+                pass
         return guesses
     
     def _extract_listfit_constraints(self, components):
@@ -10189,7 +13000,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         explanation = (
             "\n## NOTE: No error spectrum provided ##\n"
             "The fit quality metrics are reported as:\n"
-            "  • Sum of Squared Residuals (SSR) = Σ(data - model)²\n"
+            "  • Sum of Squared Residuals (SSR) = Sum[(data - model)²]\n"
             "  • Mean Squared Residual = SSR / (N - n_params)\n"
             "These are NOT true chi-squared values (which require error bars).\n"
             "Lower values indicate better fit quality.\n"
@@ -10275,134 +13086,308 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             print("="*70 + "\n")
     
     def _apply_gaussian_constraints(self, model, prefix, constraints):
-        """Apply constraints to a Gaussian model"""
+        """Apply constraints to a Gaussian model
+        
+        IMPORTANT: Combines all constraints into single set_param_hint calls
+        to avoid lmfit state corruption from multiple calls on same parameter.
+        
+        NOTE: If a parameter has a tied constraint (expression), bounds are NOT applied
+        since tied parameters are determined by their expression, not by direct fitting.
+        """
         if not constraints:
             return
         
-        # Amplitude bounds or fixed value
+        print(f"\n[DEBUG] Applying Gaussian constraints for {prefix}")
+        print(f"[DEBUG]   Raw constraint dict: {constraints}")
+        
+        # Check which parameters have linked constraints (these will use expressions)
+        linked_constraints = constraints.get('linked_constraints', [])
+        tied_parameters = {lc.get('parameter', '').lower() for lc in linked_constraints}
+        print(f"[DEBUG]   Tied parameters (with expressions): {tied_parameters}")
+        
+        # **AMPLITUDE CONSTRAINTS**
+        amp_hints = {}
         if constraints.get('amplitude_fixed'):
             fixed_val = constraints.get('amplitude_fixed_value')
             if fixed_val:
-                model.set_param_hint(f'{prefix}amp', value=float(fixed_val), vary=False)
-            else:
-                model.set_param_hint(f'{prefix}amp', vary=False)
+                amp_hints['value'] = float(fixed_val)
+            amp_hints['vary'] = False
+            print(f"[DEBUG]   Amplitude: FIXED to {fixed_val}")
         else:
             amp_min, amp_max = constraints.get('amplitude_bounds', ('', ''))
-            if amp_min:
-                model.set_param_hint(f'{prefix}amp', min=float(amp_min))
-            if amp_max:
-                model.set_param_hint(f'{prefix}amp', max=float(amp_max))
-        
-        # Mean bounds or fixed value
-        if constraints.get('mean_fixed'):
-            fixed_val = constraints.get('mean_fixed_value')
-            if fixed_val:
-                model.set_param_hint(f'{prefix}mean', value=float(fixed_val), vary=False)
+            if amp_min or amp_max:
+                if amp_min:
+                    amp_hints['min'] = float(amp_min)
+                if amp_max:
+                    amp_hints['max'] = float(amp_max)
+                print(f"[DEBUG]   Amplitude bounds: min={amp_min if amp_min else 'none'}, max={amp_max if amp_max else 'none'}")
             else:
-                model.set_param_hint(f'{prefix}mean', vary=False)
-        else:
-            mean_min, mean_max = constraints.get('mean_bounds', ('', ''))
-            if mean_min:
-                model.set_param_hint(f'{prefix}mean', min=float(mean_min))
-            if mean_max:
-                model.set_param_hint(f'{prefix}mean', max=float(mean_max))
+                print(f"[DEBUG]   Amplitude: no bounds")
         
-        # Sigma bounds or fixed value
-        if constraints.get('sigma_fixed'):
-            fixed_val = constraints.get('sigma_fixed_value')
-            if fixed_val:
-                model.set_param_hint(f'{prefix}stddev', value=float(fixed_val), vary=False)
+        # Apply amplitude hints in single call if any exist
+        if amp_hints:
+            print(f"[DEBUG]   → lmfit call: model.set_param_hint('{prefix}amp', {amp_hints})")
+            model.set_param_hint(f'{prefix}amp', **amp_hints)
+        
+        # **MEAN/CENTER CONSTRAINTS (parameter name is now 'mu')**
+        # SKIP bounds if mu is a tied parameter (has an expression)
+        mu_hints = {}
+        if 'mu' not in tied_parameters:
+            if constraints.get('mean_fixed'):
+                fixed_val = constraints.get('mean_fixed_value')
+                if fixed_val:
+                    mu_hints['value'] = float(fixed_val)
+                mu_hints['vary'] = False
+                print(f"[DEBUG]   Mu: FIXED to {fixed_val}")
             else:
-                model.set_param_hint(f'{prefix}stddev', vary=False)
+                mean_min, mean_max = constraints.get('mean_bounds', ('', ''))
+                if mean_min or mean_max:
+                    if mean_min:
+                        mu_hints['min'] = float(mean_min)
+                    if mean_max:
+                        mu_hints['max'] = float(mean_max)
+                    print(f"[DEBUG]   Mu bounds: min={mean_min if mean_min else 'none'}, max={mean_max if mean_max else 'none'}")
+                else:
+                    print(f"[DEBUG]   Mu: no bounds")
         else:
-            sigma_min, sigma_max = constraints.get('sigma_bounds', ('', ''))
-            if sigma_min:
-                model.set_param_hint(f'{prefix}stddev', min=float(sigma_min))
-            if sigma_max:
-                model.set_param_hint(f'{prefix}stddev', max=float(sigma_max))
+            print(f"[DEBUG]   Mu: TIED (bounds skipped, will use expression)")
+        
+        # Apply mu hints in single call if any exist
+        if mu_hints:
+            print(f"[DEBUG]   → lmfit call: model.set_param_hint('{prefix}mu', {mu_hints})")
+            model.set_param_hint(f'{prefix}mu', **mu_hints)
+        
+        # **SIGMA/STDDEV CONSTRAINTS (parameter name is now 'sigma')**
+        # SKIP bounds if sigma is a tied parameter (has an expression)
+        sigma_hints = {}
+        if 'sigma' not in tied_parameters:
+            if constraints.get('sigma_fixed'):
+                fixed_val = constraints.get('sigma_fixed_value')
+                if fixed_val:
+                    sigma_hints['value'] = float(fixed_val)
+                sigma_hints['vary'] = False
+                print(f"[DEBUG]   Sigma: FIXED to {fixed_val}")
+            else:
+                sigma_min, sigma_max = constraints.get('sigma_bounds', ('', ''))
+                if sigma_min or sigma_max:
+                    if sigma_min:
+                        sigma_hints['min'] = float(sigma_min)
+                    if sigma_max:
+                        sigma_hints['max'] = float(sigma_max)
+                    print(f"[DEBUG]   Sigma bounds: min={sigma_min if sigma_min else 'none'}, max={sigma_max if sigma_max else 'none'}")
+                else:
+                    print(f"[DEBUG]   Sigma: no bounds")
+        else:
+            print(f"[DEBUG]   Sigma: TIED (bounds skipped, will use expression)")
+        
+        # Apply sigma hints in single call if any exist
+        if sigma_hints:
+            print(f"[DEBUG]   → lmfit call: model.set_param_hint('{prefix}sigma', {sigma_hints})")
+            model.set_param_hint(f'{prefix}sigma', **sigma_hints)
         
         # Apply linked constraints (multiple parameter linking)
-        linked_constraints = constraints.get('linked_constraints', [])
         for linked in linked_constraints:
-            parameter = linked.get('parameter', 'mean')
+            parameter = linked.get('parameter', 'mu')
             expression = linked.get('expression', '')
             if expression:
-                # Map parameter name to parameter key
-                param_map = {'mean': 'mean', 'stddev': 'stddev', 'amp': 'amp', 'sigma': 'sigma'}
+                # Extract right-hand side if expression contains '='
+                if '=' in expression:
+                    rhs = expression.split('=', 1)[1].strip()
+                else:
+                    rhs = expression.strip()
+                
+                # Map parameter name to parameter key (use mu and sigma now)
+                param_map = {'mean': 'mu', 'mu': 'mu', 'stddev': 'sigma', 'sigma': 'sigma', 'amp': 'amp'}
                 param_key = param_map.get(parameter, parameter)
-                model.set_param_hint(f'{prefix}{param_key}', expr=expression)
+                
+                # Check if this is a plain number or an expression
+                # If it's a literal number with no operators/variables, use value= instead of expr=
+                try:
+                    # Try to parse as a float - if successful and no operators, it's a literal
+                    float_val = float(rhs)
+                    # Check if rhs contains any operators or variable references (contains letters, _, +, -, *, /, etc.)
+                    import re
+                    if not re.search(r'[a-zA-Z_+\*/(\-)\s]', rhs) or rhs == str(float_val):
+                        # It's a literal number, use value= with vary=False
+                        print(f"[DEBUG]   {parameter}: TIED to literal value {float_val}")
+                        print(f"[DEBUG]   → lmfit call: model.set_param_hint('{prefix}{param_key}', value={float_val}, vary=False)")
+                        model.set_param_hint(f'{prefix}{param_key}', value=float_val, vary=False)
+                    else:
+                        # It's an expression, use expr=
+                        print(f"[DEBUG]   {parameter}: TIED to expression '{rhs}'")
+                        print(f"[DEBUG]   → lmfit call: model.set_param_hint('{prefix}{param_key}', expr='{rhs}')")
+                        model.set_param_hint(f'{prefix}{param_key}', expr=rhs)
+                except (ValueError, TypeError):
+                    # Not a number, treat as expression
+                    print(f"[DEBUG]   {parameter}: TIED to expression '{rhs}'")
+                    print(f"[DEBUG]   → lmfit call: model.set_param_hint('{prefix}{param_key}', expr='{rhs}')")
+                    model.set_param_hint(f'{prefix}{param_key}', expr=rhs)
     
     def _apply_voigt_constraints(self, model, prefix, constraints):
-        """Apply constraints to a Voigt model"""
+        """Apply constraints to a Voigt model
+        
+        IMPORTANT: Combines all constraints into single set_param_hint calls
+        to avoid lmfit state corruption from multiple calls on same parameter.
+        
+        NOTE: If a parameter has a tied constraint (expression), bounds are NOT applied
+        since tied parameters are determined by their expression, not by direct fitting.
+        """
         if not constraints:
             return
         
-        # Amplitude bounds or fixed value
+        print(f"\n[DEBUG] Applying Voigt constraints for {prefix}")
+        print(f"[DEBUG]   Raw constraint dict: {constraints}")
+        
+        # Check which parameters have linked constraints (these will use expressions)
+        linked_constraints = constraints.get('linked_constraints', [])
+        tied_parameters = {lc.get('parameter', '').lower() for lc in linked_constraints}
+        print(f"[DEBUG]   Tied parameters (with expressions): {tied_parameters}")
+        
+        # **AMPLITUDE CONSTRAINTS**
+        amp_hints = {}
         if constraints.get('amplitude_fixed'):
             fixed_val = constraints.get('amplitude_fixed_value')
             if fixed_val:
-                model.set_param_hint(f'{prefix}amp', value=float(fixed_val), vary=False)
-            else:
-                model.set_param_hint(f'{prefix}amp', vary=False)
+                amp_hints['value'] = float(fixed_val)
+            amp_hints['vary'] = False
+            print(f"[DEBUG]   Amplitude: FIXED to {fixed_val}")
         else:
             amp_min, amp_max = constraints.get('amplitude_bounds', ('', ''))
-            if amp_min:
-                model.set_param_hint(f'{prefix}amp', min=float(amp_min))
-            if amp_max:
-                model.set_param_hint(f'{prefix}amp', max=float(amp_max))
-        
-        # Center bounds or fixed value
-        if constraints.get('center_fixed'):
-            fixed_val = constraints.get('center_fixed_value')
-            if fixed_val:
-                model.set_param_hint(f'{prefix}center', value=float(fixed_val), vary=False)
+            if amp_min or amp_max:
+                if amp_min:
+                    amp_hints['min'] = float(amp_min)
+                if amp_max:
+                    amp_hints['max'] = float(amp_max)
+                print(f"[DEBUG]   Amplitude bounds: min={amp_min if amp_min else 'none'}, max={amp_max if amp_max else 'none'}")
             else:
-                model.set_param_hint(f'{prefix}center', vary=False)
-        else:
-            center_min, center_max = constraints.get('center_bounds', ('', ''))
-            if center_min:
-                model.set_param_hint(f'{prefix}center', min=float(center_min))
-            if center_max:
-                model.set_param_hint(f'{prefix}center', max=float(center_max))
+                print(f"[DEBUG]   Amplitude: no bounds")
         
-        # Sigma bounds or fixed value
-        if constraints.get('sigma_fixed'):
-            fixed_val = constraints.get('sigma_fixed_value')
-            if fixed_val:
-                model.set_param_hint(f'{prefix}sigma', value=float(fixed_val), vary=False)
-            else:
-                model.set_param_hint(f'{prefix}sigma', vary=False)
-        else:
-            sigma_min, sigma_max = constraints.get('sigma_bounds', ('', ''))
-            if sigma_min:
-                model.set_param_hint(f'{prefix}sigma', min=float(sigma_min))
-            if sigma_max:
-                model.set_param_hint(f'{prefix}sigma', max=float(sigma_max))
+        # Apply amplitude hints in single call if any exist
+        if amp_hints:
+            print(f"[DEBUG]   → lmfit call: model.set_param_hint('{prefix}amp', {amp_hints})")
+            model.set_param_hint(f'{prefix}amp', **amp_hints)
         
-        # Gamma bounds or fixed value
-        if constraints.get('gamma_fixed'):
-            fixed_val = constraints.get('gamma_fixed_value')
-            if fixed_val:
-                model.set_param_hint(f'{prefix}gamma', value=float(fixed_val), vary=False)
+        # **CENTER CONSTRAINTS**
+        # SKIP bounds if center is a tied parameter (has an expression)
+        center_hints = {}
+        if 'center' not in tied_parameters:
+            if constraints.get('center_fixed'):
+                fixed_val = constraints.get('center_fixed_value')
+                if fixed_val:
+                    center_hints['value'] = float(fixed_val)
+                center_hints['vary'] = False
+                print(f"[DEBUG]   Center: FIXED to {fixed_val}")
             else:
-                model.set_param_hint(f'{prefix}gamma', vary=False)
+                center_min, center_max = constraints.get('center_bounds', ('', ''))
+                if center_min or center_max:
+                    if center_min:
+                        center_hints['min'] = float(center_min)
+                    if center_max:
+                        center_hints['max'] = float(center_max)
+                    print(f"[DEBUG]   Center bounds: min={center_min if center_min else 'none'}, max={center_max if center_max else 'none'}")
+                else:
+                    print(f"[DEBUG]   Center: no bounds")
         else:
-            gamma_min, gamma_max = constraints.get('gamma_bounds', ('', ''))
-            if gamma_min:
-                model.set_param_hint(f'{prefix}gamma', min=float(gamma_min))
-            if gamma_max:
-                model.set_param_hint(f'{prefix}gamma', max=float(gamma_max))
+            print(f"[DEBUG]   Center: TIED (bounds skipped, will use expression)")
+        
+        # Apply center hints in single call if any exist
+        if center_hints:
+            print(f"[DEBUG]   → lmfit call: model.set_param_hint('{prefix}center', {center_hints})")
+            model.set_param_hint(f'{prefix}center', **center_hints)
+        
+        # **SIGMA CONSTRAINTS**
+        # SKIP bounds if sigma is a tied parameter (has an expression)
+        sigma_hints = {}
+        if 'sigma' not in tied_parameters:
+            if constraints.get('sigma_fixed'):
+                fixed_val = constraints.get('sigma_fixed_value')
+                if fixed_val:
+                    sigma_hints['value'] = float(fixed_val)
+                sigma_hints['vary'] = False
+                print(f"[DEBUG]   Sigma: FIXED to {fixed_val}")
+            else:
+                sigma_min, sigma_max = constraints.get('sigma_bounds', ('', ''))
+                if sigma_min or sigma_max:
+                    if sigma_min:
+                        sigma_hints['min'] = float(sigma_min)
+                    if sigma_max:
+                        sigma_hints['max'] = float(sigma_max)
+                    print(f"[DEBUG]   Sigma bounds: min={sigma_min if sigma_min else 'none'}, max={sigma_max if sigma_max else 'none'}")
+                else:
+                    print(f"[DEBUG]   Sigma: no bounds")
+        else:
+            print(f"[DEBUG]   Sigma: TIED (bounds skipped, will use expression)")
+        
+        # Apply sigma hints in single call if any exist
+        if sigma_hints:
+            print(f"[DEBUG]   → lmfit call: model.set_param_hint('{prefix}sigma', {sigma_hints})")
+            model.set_param_hint(f'{prefix}sigma', **sigma_hints)
+        
+        # **GAMMA CONSTRAINTS**
+        # SKIP bounds if gamma is a tied parameter (has an expression)
+        gamma_hints = {}
+        if 'gamma' not in tied_parameters:
+            if constraints.get('gamma_fixed'):
+                fixed_val = constraints.get('gamma_fixed_value')
+                if fixed_val:
+                    gamma_hints['value'] = float(fixed_val)
+                gamma_hints['vary'] = False
+                print(f"[DEBUG]   Gamma: FIXED to {fixed_val}")
+            else:
+                gamma_min, gamma_max = constraints.get('gamma_bounds', ('', ''))
+                if gamma_min or gamma_max:
+                    if gamma_min:
+                        gamma_hints['min'] = float(gamma_min)
+                    if gamma_max:
+                        gamma_hints['max'] = float(gamma_max)
+                    print(f"[DEBUG]   Gamma bounds: min={gamma_min if gamma_min else 'none'}, max={gamma_max if gamma_max else 'none'}")
+                else:
+                    print(f"[DEBUG]   Gamma: no bounds")
+        else:
+            print(f"[DEBUG]   Gamma: TIED (bounds skipped, will use expression)")
+        
+        # Apply gamma hints in single call if any exist
+        if gamma_hints:
+            print(f"[DEBUG]   → lmfit call: model.set_param_hint('{prefix}gamma', {gamma_hints})")
+            model.set_param_hint(f'{prefix}gamma', **gamma_hints)
         
         # Apply linked constraints (multiple parameter linking)
-        linked_constraints = constraints.get('linked_constraints', [])
         for linked in linked_constraints:
             parameter = linked.get('parameter', 'center')
             expression = linked.get('expression', '')
             if expression:
+                # Extract right-hand side if expression contains '='
+                if '=' in expression:
+                    rhs = expression.split('=', 1)[1].strip()
+                else:
+                    rhs = expression.strip()
+                
                 # Map parameter name to parameter key
                 param_map = {'center': 'center', 'sigma': 'sigma', 'amp': 'amp', 'gamma': 'gamma'}
                 param_key = param_map.get(parameter, parameter)
-                model.set_param_hint(f'{prefix}{param_key}', expr=expression)
+                
+                # Check if this is a plain number or an expression
+                # If it's a literal number with no operators/variables, use value= instead of expr=
+                try:
+                    # Try to parse as a float - if successful and no operators, it's a literal
+                    float_val = float(rhs)
+                    # Check if rhs contains any operators or variable references (contains letters, _, +, -, *, /, etc.)
+                    import re
+                    if not re.search(r'[a-zA-Z_+\*/(\-)\s]', rhs) or rhs == str(float_val):
+                        # It's a literal number, use value= with vary=False
+                        print(f"[DEBUG]   {parameter}: TIED to literal value {float_val}")
+                        print(f"[DEBUG]   → lmfit call: model.set_param_hint('{prefix}{param_key}', value={float_val}, vary=False)")
+                        model.set_param_hint(f'{prefix}{param_key}', value=float_val, vary=False)
+                    else:
+                        # It's an expression, use expr=
+                        print(f"[DEBUG]   {parameter}: TIED to expression '{rhs}'")
+                        print(f"[DEBUG]   → lmfit call: model.set_param_hint('{prefix}{param_key}', expr='{rhs}')")
+                        model.set_param_hint(f'{prefix}{param_key}', expr=rhs)
+                except (ValueError, TypeError):
+                    # Not a number, treat as expression
+                    print(f"[DEBUG]   {parameter}: TIED to expression '{rhs}'")
+                    print(f"[DEBUG]   → lmfit call: model.set_param_hint('{prefix}{param_key}', expr='{rhs}')")
+                    model.set_param_hint(f'{prefix}{param_key}', expr=rhs)
 
     def _clamp_to_bounds(self, value, bounds):
         """Clamp a value to be within specified bounds.
@@ -10559,6 +13544,265 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         center_guess = peak_x
         
         return amp_guess, center_guess, sigma_guess
+    
+    def _extract_component_covariance(self, result, prefix, param_names):
+        """Extract covariance matrix for a specific component from lmfit result
+        
+        This builds a FULL covariance matrix that includes all component parameters.
+        For tied/constrained parameters, the covariance entries are zero (no independent uncertainty).
+        
+        Args:
+            result: lmfit fit result object
+            prefix: component prefix (e.g., 'v0_', 'g0_')
+            param_names: list of parameter names for this component (e.g., ['amp', 'center', 'sigma', 'gamma'])
+        
+        Returns:
+            Full NxN covariance matrix (N = len(param_names)) or None if not available
+            - Free parameters use values from result.covar
+            - Tied/constrained parameters have zero covariance entries
+        """
+        if result.covar is None:
+            return None
+        
+        # Get free parameters list from lmfit result
+        free_param_names = [name for name in result.params.keys() if result.params[name].vary]
+        
+        # Build full NxN covariance matrix (N = number of component parameters)
+        n_params = len(param_names)
+        full_cov = np.zeros((n_params, n_params), dtype=float)
+        
+        # Map each parameter to its index in free_params (or None if tied)
+        param_to_free_idx = {}
+        for param_name in param_names:
+            full_name = f'{prefix}{param_name}'
+            if full_name in free_param_names:
+                try:
+                    idx = free_param_names.index(full_name)
+                    param_to_free_idx[param_name] = idx
+                except ValueError:
+                    param_to_free_idx[param_name] = None
+            else:
+                param_to_free_idx[param_name] = None  # Parameter is tied/constrained
+        
+        # Fill in covariance entries from lmfit result
+        cov_array = np.array(result.covar, dtype=float)
+        for i, param_i in enumerate(param_names):
+            idx_i = param_to_free_idx[param_i]
+            if idx_i is not None:  # This parameter is free
+                for j, param_j in enumerate(param_names):
+                    idx_j = param_to_free_idx[param_j]
+                    if idx_j is not None:  # This parameter is free
+                        # Check bounds to avoid index error
+                        if idx_i < cov_array.shape[0] and idx_j < cov_array.shape[1]:
+                            full_cov[i, j] = cov_array[idx_i, idx_j]
+        
+        # Tied parameters keep zero covariance (already initialized to 0)
+        
+        return full_cov
+
+    def _auto_calculate_listfit_ew(self, result, components, left_bound, right_bound, x_fit, y_fit):
+        """Automatically calculate equivalent widths for listfit if conditions are met.
+        
+        EW is calculated if and only if:
+        1. Exactly 1 polynomial continuum is fitted
+        2. At least 1 non-polynomial profile (Gaussian or Voigt) is fitted
+        
+        Args:
+            result: lmfit fit result object
+            components: list of component dicts from listfit
+            left_bound: left wavelength bound
+            right_bound: right wavelength bound
+            x_fit: wavelength data
+            y_fit: flux data
+        
+        Returns:
+            Dictionary with EW results (type='equivalent_widths', with EWs for each component) 
+            or None if conditions not met
+        """
+        try:
+            # Count component types
+            polynomial_components = [c for c in components if c['type'] == 'polynomial']
+            profile_components = [c for c in components if c['type'] in ['gaussian', 'voigt']]
+            
+            # Check conditions: exactly 1 polynomial AND at least 1 profile
+            if len(polynomial_components) != 1 or len(profile_components) == 0:
+                # Don't calculate EW if conditions not met
+                return None
+            
+            print("[AUTO_EW] Conditions met: 1 polynomial + " + str(len(profile_components)) + " profile(s). Calculating EW...")
+            
+            # Extract polynomial continuum from the lmfit result directly
+            # (it's not in self.continuum_fits, but in the listfit components)
+            poly_comp = polynomial_components[0]
+            poly_order = poly_comp.get('order', 1)
+            
+            # The polynomial index is always 0 (we checked for exactly 1 polynomial)
+            poly_index = 0
+            prefix = f'p{poly_index}_'
+            
+            # Extract polynomial coefficients from lmfit result
+            poly_coeffs = []
+            for i in range(poly_order + 1):
+                coeff_name = f'{prefix}c{i}'
+                if coeff_name not in result.params:
+                    print(f"[AUTO_EW] Error: Polynomial coefficient {coeff_name} not found in fit result")
+                    return None
+                poly_coeffs.append(float(result.params[coeff_name].value))
+            
+            # Extract covariance for the polynomial (same method as Gaussian/Voigt)
+            poly_param_names = [f'c{i}' for i in range(poly_order + 1)]
+            poly_covariance = self._extract_component_covariance(result, prefix, poly_param_names)
+            
+            if poly_covariance is None:
+                print("[AUTO_EW] Warning: Polynomial covariance not available. Skipping EW calculation.")
+                return None
+            
+            # Ensure covariance is a proper array
+            if isinstance(poly_covariance, list):
+                poly_covariance = np.array(poly_covariance, dtype=float)
+            
+            # Build continuum_fit_dict from extracted polynomial
+            continuum_fit_dict = {
+                'coeffs': poly_coeffs,  # In ascending order (c0, c1, ..., cn)
+                'covariance': poly_covariance,
+                'bounds': (left_bound, right_bound)
+            }
+            
+            # Calculate EW for each profile component
+            ew_data = {'type': 'equivalent_widths', 'ew_results': {}}
+            
+            gauss_count = 0
+            voigt_count = 0
+            
+            for comp in components:
+                if comp['type'] == 'gaussian':
+                    prefix = f'g{gauss_count}_'
+                    comp_name = f"Gaussian {gauss_count}"
+                    
+                    # Get covariance for this component
+                    gaussian_param_names = ['amp', 'mean', 'stddev']
+                    component_covariance = self._extract_component_covariance(result, prefix, gaussian_param_names)
+                    
+                    if component_covariance is None:
+                        print(f"[AUTO_EW] Warning: No covariance for {comp_name}. Skipping EW.")
+                        gauss_count += 1
+                        continue
+                    
+                    # Get profile parameters
+                    if all(f'{prefix}{pname}' in result.params for pname in gaussian_param_names):
+                        try:
+                            # Build fit_dict structure for _calculate_equivalent_width_monte_carlo
+                            fit_dict = {
+                                'amp': float(result.params[f'{prefix}amp'].value),
+                                'mean': float(result.params[f'{prefix}mean'].value),
+                                'stddev': float(result.params[f'{prefix}stddev'].value),
+                                'bounds': (left_bound, right_bound),
+                                'covariance': component_covariance,
+                                # Add metadata for MC sampling of tied parameters
+                                'result': result,
+                                'component_prefix': prefix,
+                                'fit_type': 'gaussian',
+                                'param_names': gaussian_param_names
+                            }
+                            
+                            # Calculate EW
+                            ew_result = self._calculate_equivalent_width_monte_carlo(
+                                fit_dict, continuum_fit_dict, fit_type='gaussian'
+                            )
+                            
+                            if ew_result is not None:
+                                ew_dict = ew_result
+                                ew_median = ew_dict.get('ew')
+                                ew_1sigma = (ew_dict.get('ew_1sigma_lower', 0), ew_dict.get('ew_1sigma_upper', 0))
+                                ew_2sigma = (ew_dict.get('ew_2sigma_lower', 0), ew_dict.get('ew_2sigma_upper', 0))
+                                ew_3sigma = (ew_dict.get('ew_3sigma_lower', 0), ew_dict.get('ew_3sigma_upper', 0))
+                                
+                                ew_data['ew_results'][comp_name] = {
+                                    'ew_median': float(ew_median) if ew_median is not None else None,
+                                    'ew_1sigma': [float(ew_1sigma[0]), float(ew_1sigma[1])],
+                                    'ew_2sigma': [float(ew_2sigma[0]), float(ew_2sigma[1])],
+                                    'ew_3sigma': [float(ew_3sigma[0]), float(ew_3sigma[1])],
+                                    'profile_type': 'gaussian'
+                                }
+                                if ew_median is not None:
+                                    ew_err = (ew_1sigma[1] - ew_1sigma[0]) / 2
+                                    print(f"[AUTO_EW] {comp_name}: EW = {ew_median:.4f} ± {ew_err:.4f} Å")
+                        except Exception as ew_e:
+                            print(f"[AUTO_EW] Error calculating EW for {comp_name}: {ew_e}")
+                    
+                    gauss_count += 1
+                
+                elif comp['type'] == 'voigt':
+                    prefix = f'v{voigt_count}_'
+                    comp_name = f"Voigt {voigt_count}"
+                    
+                    # Get covariance for this component
+                    voigt_param_names = ['amp', 'center', 'sigma', 'gamma']
+                    component_covariance = self._extract_component_covariance(result, prefix, voigt_param_names)
+                    
+                    if component_covariance is None:
+                        print(f"[AUTO_EW] Warning: No covariance for {comp_name}. Skipping EW.")
+                        voigt_count += 1
+                        continue
+                    
+                    # Get profile parameters
+                    if all(f'{prefix}{pname}' in result.params for pname in voigt_param_names):
+                        try:
+                            # Build fit_dict structure for _calculate_equivalent_width_monte_carlo
+                            fit_dict = {
+                                'amp': float(result.params[f'{prefix}amp'].value),
+                                'center': float(result.params[f'{prefix}center'].value),
+                                'sigma': float(result.params[f'{prefix}sigma'].value),
+                                'gamma': float(result.params[f'{prefix}gamma'].value),
+                                'bounds': (left_bound, right_bound),
+                                'covariance': component_covariance,
+                                # Add metadata for MC sampling of tied parameters
+                                'result': result,
+                                'component_prefix': prefix,
+                                'fit_type': 'voigt',
+                                'param_names': voigt_param_names
+                            }
+                            
+                            # Calculate EW
+                            ew_result = self._calculate_equivalent_width_monte_carlo(
+                                fit_dict, continuum_fit_dict, fit_type='voigt'
+                            )
+                            
+                            if ew_result is not None:
+                                ew_dict = ew_result
+                                ew_median = ew_dict.get('ew')
+                                ew_1sigma = (ew_dict.get('ew_1sigma_lower', 0), ew_dict.get('ew_1sigma_upper', 0))
+                                ew_2sigma = (ew_dict.get('ew_2sigma_lower', 0), ew_dict.get('ew_2sigma_upper', 0))
+                                ew_3sigma = (ew_dict.get('ew_3sigma_lower', 0), ew_dict.get('ew_3sigma_upper', 0))
+                                
+                                ew_data['ew_results'][comp_name] = {
+                                    'ew_median': float(ew_median) if ew_median is not None else None,
+                                    'ew_1sigma': [float(ew_1sigma[0]), float(ew_1sigma[1])],
+                                    'ew_2sigma': [float(ew_2sigma[0]), float(ew_2sigma[1])],
+                                    'ew_3sigma': [float(ew_3sigma[0]), float(ew_3sigma[1])],
+                                    'profile_type': 'voigt'
+                                }
+                                if ew_median is not None:
+                                    ew_err = (ew_1sigma[1] - ew_1sigma[0]) / 2
+                                    print(f"[AUTO_EW] {comp_name}: EW = {ew_median:.4f} ± {ew_err:.4f} Å")
+                        except Exception as ew_e:
+                            print(f"[AUTO_EW] Error calculating EW for {comp_name}: {ew_e}")
+                    
+                    voigt_count += 1
+            
+            # Return the EW data if we calculated any
+            if ew_data['ew_results']:
+                print(f"[AUTO_EW] Completed: Calculated EW for {len(ew_data['ew_results'])} component(s)")
+                return ew_data
+            else:
+                print("[AUTO_EW] No EW results to save")
+                return None
+        
+        except Exception as e:
+            print(f"[AUTO_EW] Exception during EW calculation: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     def plot_listfit_components(self, result, components, x_fit, y_fit, err_fit, left_bound, right_bound):
         """Plot the fitted components with different colors"""
@@ -10581,10 +13825,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             max_lambda = mask.get('max_lambda')
             if min_lambda is not None and max_lambda is not None:
                 patch = self.ax.axvspan(min_lambda, max_lambda, alpha=0.2, color='gray', zorder=1)
-                # Register with ItemTracker
+                # Register with ItemTracker - include fit_dict with required fields for deletion handling
                 position_str = f"λ: {min_lambda:.2f}-{max_lambda:.2f} Å"
+                mask_fit_dict = {
+                    'listfit_bounds': (left_bound, right_bound),
+                    'min_lambda': min_lambda,
+                    'max_lambda': max_lambda,
+                    'component_obj': mask  # Store reference to the actual mask component
+                }
                 self.register_item('data_mask', f'Data Mask {mask_count+1} ({min_lambda:.2f}-{max_lambda:.2f} Å)', 
-                                 patch_obj=patch, position=position_str, color='gray')
+                                 fit_dict=mask_fit_dict, patch_obj=patch, position=position_str, color='gray')
                 mask_count += 1
         
         poly_mask_count = 0
@@ -10593,10 +13843,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             max_lambda = mask.get('max_lambda')
             if min_lambda is not None and max_lambda is not None:
                 patch = self.ax.axvspan(min_lambda, max_lambda, alpha=0.1, color='lightgray', zorder=0.5, linestyle='--', edgecolor='gray', linewidth=1)
-                # Register with ItemTracker
+                # Register with ItemTracker - include fit_dict with required fields for deletion handling
                 position_str = f"λ: {min_lambda:.2f}-{max_lambda:.2f} Å"
+                poly_mask_fit_dict = {
+                    'listfit_bounds': (left_bound, right_bound),
+                    'min_lambda': min_lambda,
+                    'max_lambda': max_lambda,
+                    'component_obj': mask  # Store reference to the actual mask component
+                }
                 self.register_item('polynomial_guess_mask', f'Poly Guess Mask {poly_mask_count+1} ({min_lambda:.2f}-{max_lambda:.2f} Å)', 
-                                 patch_obj=patch, position=position_str, color='lightgray')
+                                 fit_dict=poly_mask_fit_dict, patch_obj=patch, position=position_str, color='lightgray')
                 poly_mask_count += 1
         
         # Plot individual components
@@ -10604,11 +13860,51 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         voigt_count = 0
         poly_count = 0
         
+        # Pre-collect polynomial info from this listfit for all profiles to use
+        listfit_continuum = None
+        polynomials = [c for c in components if c.get('type') == 'polynomial']
+        print(f"[DEBUG] plot_listfit_components: Found {len(polynomials)} polynomial component(s)")
+        if len(polynomials) == 1:
+            # Get polynomial coefficients and errors from fit result
+            poly_comp = polynomials[0]
+            prefix = f'p0_'
+            order = poly_comp.get('order', 1)
+            
+            print(f"[DEBUG] Polynomial: order={order}, checking for params with prefix '{prefix}'")
+            
+            if f'{prefix}c0' in result.params:
+                poly_coeffs = []
+                poly_coeffs_err = []
+                for i in range(order + 1):
+                    coeff_val = result.params[f'{prefix}c{i}'].value
+                    coeff_err = result.params[f'{prefix}c{i}'].stderr if result.params[f'{prefix}c{i}'].stderr is not None else 0.0
+                    poly_coeffs.append(coeff_val)
+                    poly_coeffs_err.append(coeff_err)
+                
+                # Reverse coefficients for np.polyval (expects highest order first)
+                poly_coeffs_reversed = poly_coeffs[::-1]
+                poly_coeffs_err_reversed = poly_coeffs_err[::-1]
+                covariance = np.diag([e**2 if e > 0 else 1e-10 for e in poly_coeffs_err_reversed])
+                
+                # Store as continuum dict for all profiles to use
+                listfit_continuum = {
+                    'coeffs': poly_coeffs_reversed,
+                    'covariance': covariance,
+                    'bounds': (left_bound, right_bound)
+                }
+                print(f"[DEBUG] Successfully extracted polynomial continuum: coeffs={poly_coeffs_reversed}, cov_diag={np.diag(covariance)}")
+            else:
+                print(f"[DEBUG] WARNING: Polynomial parameter '{prefix}c0' not found in result.params!")
+                print(f"[DEBUG]   Available params: {list(result.params.keys())}")
+        elif len(polynomials) > 1:
+            print(f"[DEBUG] WARNING: Found {len(polynomials)} polynomials, only using first one")
+            # TODO: handle multiple polynomials
+        
         for comp in components:
             comp_type = comp['type']
             
-            # Skip mask types - they're already plotted above
-            if comp_type in ['polynomial_guess_mask', 'data_mask']:
+            # Skip mask types and redshift components - they're already plotted or not plotted as lines
+            if comp_type in ['polynomial_guess_mask', 'data_mask', 'redshift']:
                 continue
             
             color = colors[comp_type]
@@ -10624,20 +13920,24 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     continue
                 
                 g_amp = params[f'{prefix}amp'].value
-                g_mean = params[f'{prefix}mean'].value
-                g_stddev = params[f'{prefix}stddev'].value
+                g_mu = params[f'{prefix}mu'].value
+                g_sigma = params[f'{prefix}sigma'].value
                 
                 # Extract errors from lmfit results
                 g_amp_err = params[f'{prefix}amp'].stderr if params[f'{prefix}amp'].stderr is not None else 0.0
-                g_mean_err = params[f'{prefix}mean'].stderr if params[f'{prefix}mean'].stderr is not None else 0.0
-                g_stddev_err = params[f'{prefix}stddev'].stderr if params[f'{prefix}stddev'].stderr is not None else 0.0
+                g_mu_err = params[f'{prefix}mu'].stderr if params[f'{prefix}mu'].stderr is not None else 0.0
+                g_sigma_err = params[f'{prefix}sigma'].stderr if params[f'{prefix}sigma'].stderr is not None else 0.0
                 
-                y_component = self.gaussian(x_smooth, g_amp, g_mean, g_stddev)
+                y_component = self.gaussian(x_smooth, g_amp, g_mu, g_sigma)
                 # Add label only for the first listfit gaussian
                 label = 'Gaussian' if 'gaussian' not in self.legend_profile_types else None
                 line, = self.ax.plot(x_smooth, y_component, color=color, linestyle=gaussian_cfg['linestyle'], linewidth=gaussian_cfg['linewidth'], label=label)
                 if label:
                     self.legend_profile_types.add('gaussian')
+                
+                # Extract covariance for this Gaussian component
+                gaussian_param_names = ['amp', 'mu', 'sigma']
+                component_covariance = self._extract_component_covariance(result, prefix, gaussian_param_names)
                 
                 # Add to gaussian_fits for redshift mode
                 gaussian_fit = {
@@ -10645,19 +13945,27 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     'is_velocity_mode': self.is_velocity_mode,
                     'component_id': self.component_id,
                     'amp': g_amp, 'amp_err': g_amp_err,
-                    'mean': g_mean, 'mean_err': g_mean_err,
-                    'stddev': g_stddev, 'stddev_err': g_stddev_err,
+                    'mean': g_mu, 'mean_err': g_mu_err,
+                    'stddev': g_sigma, 'stddev_err': g_sigma_err,
                     'bounds': (left_bound, right_bound),
                     'line_id': None,
                     'line_wavelength': None,
                     'line': line,
                     'rest_wavelength': self.rest_wavelength,
                     'rest_id': self.rest_id,
-                    'z_sys': self.redshift
+                    'z_sys': self.redshift,
+                    'listfit_bounds': (left_bound, right_bound),
+                    'gauss_index': gauss_count,
+                    'covariance': component_covariance,
+                    'continuum_fit_dict': listfit_continuum  # Store the listfit continuum for EW calculation
                 }
+                if listfit_continuum is None:
+                    print(f"[DEBUG] Gaussian {gauss_count}: continuum_fit_dict is None!")
+                else:
+                    print(f"[DEBUG] Gaussian {gauss_count}: continuum_fit_dict = {{'coeffs': ..., 'covariance': ...}}")
                 self.gaussian_fits.append(gaussian_fit)
                 # Register with ItemTracker
-                position_str = f"λ: {g_mean:.2f} Å"
+                position_str = f"λ: {g_mu:.2f} Å"
                 item_id = self.register_item('gaussian', f'Gaussian {gauss_count+1}', fit_dict=gaussian_fit, 
                                            line_obj=line, position=position_str, color=color)
                 self.component_id += 1
@@ -10690,6 +13998,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 if label:
                     self.legend_profile_types.add('voigt')
                 
+                # Extract covariance for this Voigt component
+                voigt_param_names = ['amp', 'center', 'sigma', 'gamma']
+                component_covariance = self._extract_component_covariance(result, prefix, voigt_param_names)
+                
                 # Add to voigt_fits for redshift mode
                 voigt_fit = {
                     'fit_id': self.fit_id,
@@ -10705,8 +14017,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     'line': line,
                     'rest_wavelength': self.rest_wavelength,
                     'rest_id': self.rest_id,
-                    'z_sys': self.redshift
+                    'z_sys': self.redshift,
+                    'listfit_bounds': (left_bound, right_bound),
+                    'voigt_index': voigt_count,
+                    'covariance': component_covariance,
+                    'continuum_fit_dict': listfit_continuum  # Store the listfit continuum for EW calculation
                 }
+                if listfit_continuum is None:
+                    print(f"[DEBUG] Voigt {voigt_count}: continuum_fit_dict is None!")
+                else:
+                    print(f"[DEBUG] Voigt {voigt_count}: continuum_fit_dict = {{'coeffs': ..., 'covariance': ...}}")
                 self.voigt_fits.append(voigt_fit)
                 # Register with ItemTracker
                 position_str = f"λ: {v_center:.2f} Å"
@@ -10726,22 +14046,54 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     continue
                 
                 poly_coeffs = []
+                poly_coeffs_err = []
                 for i in range(order + 1):
-                    poly_coeffs.append(params[f'{prefix}c{i}'].value)
+                    coeff_val = params[f'{prefix}c{i}'].value
+                    coeff_err = params[f'{prefix}c{i}'].stderr if params[f'{prefix}c{i}'].stderr is not None else 0.0
+                    poly_coeffs.append(coeff_val)
+                    poly_coeffs_err.append(coeff_err)
                 # Reverse coefficients for np.polyval (expects highest order first)
-                poly_coeffs = poly_coeffs[::-1]
-                y_component = np.polyval(poly_coeffs, x_smooth)
+                poly_coeffs_reversed = poly_coeffs[::-1]
+                poly_coeffs_err_reversed = poly_coeffs_err[::-1]
+                y_component = np.polyval(poly_coeffs_reversed, x_smooth)
                 # Add label only for the first listfit polynomial
                 label = 'Continuum' if 'continuum' not in self.legend_profile_types else None
                 line, = self.ax.plot(x_smooth, y_component, color=color, linestyle=continuum_cfg['linestyle'], linewidth=continuum_cfg['linewidth'], label=label)
                 if label:
                     self.legend_profile_types.add('continuum')
-                # Register with ItemTracker - store metadata for deletion handling
+                
+                # Extract covariance for this polynomial component
+                poly_param_names = [f'c{i}' for i in range(order + 1)]
+                component_covariance = self._extract_component_covariance(result, prefix, poly_param_names)
+                
+                # Build covariance matrix from errors (diagonal approximation)
+                covariance = np.diag([e**2 if e > 0 else 1e-10 for e in poly_coeffs_err_reversed]) if poly_coeffs_err_reversed else np.diag([1e-10] * len(poly_coeffs_reversed))
+                
+                # CRITICAL FIX: Add polynomial components to continuum_fits so they appear in the total line
+                # This ensures listfit polynomials are included when toggling the total line
+                # IMPORTANT: Store coefficients REVERSED (highest to lowest degree) for np.polyval compatibility
+                continuum_fit = {
+                    'bounds': (left_bound, right_bound),
+                    'coeffs': poly_coeffs_reversed,  # ← REVERSED to match np.polyval expectations
+                    'coeffs_err': poly_coeffs_err_reversed,  # ← Also reverse errors to maintain alignment
+                    'poly_order': order,
+                    'line': line,
+                    'is_velocity_mode': self.is_velocity_mode,
+                    'listfit_source': True  # Mark this as coming from listfit
+                }
+                self.continuum_fits.append(continuum_fit)
+                
+                # Register with ItemTracker - store metadata for deletion handling AND polynomial coefficients for EW calculation
+                # Store the polynomial component object as well for identity matching
                 position_str = f"λ: {left_bound:.2f}-{right_bound:.2f} Å"
                 poly_fit_dict = {
                     'listfit_bounds': (left_bound, right_bound),
                     'poly_index': poly_count,
-                    'order': order
+                    'order': order,
+                    'coeffs': poly_coeffs_reversed,  # Store coefficients for EW calculation
+                    'coeffs_err': poly_coeffs_err_reversed,  # Store coefficient errors
+                    'covariance': covariance,  # Store covariance matrix for EW Monte Carlo
+                    'component_obj': comp  # Store reference to the actual component for deletion
                 }
                 item_id = self.register_item('polynomial', f'Polynomial (order={order})', fit_dict=poly_fit_dict, line_obj=line,
                                            position=position_str, color=color)

@@ -6,6 +6,17 @@ qsap_v0.5/*.key
 FORPAPER.md
 FORMANUAL.md
 CONSOLIDATION*.md
+FILEV*.md
+REDSHIFT*.md
+LMFIT*.md
+*ANALYSIS*.md
+
+# Local working and test files
+test/
+test_*.py
+*.txt
+qsap/text.txt
+qsap/redshift_line_selector.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

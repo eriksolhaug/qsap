@@ -216,10 +216,18 @@ class FitInformationWindow(QtWidgets.QWidget):
                     elif comp_type == 'voigt':
                         params.append(f"       center₀={comp.get('center0', 0):.4f}, σ₀={comp.get('sigma0', 0):.4e}")
             
-            # Result info if available
-            result = fit_dict.get('result')
-            if result:
-                params.append(f"Fit result: {len(result.params)} parameters")
+            # Result info if available - extract from components instead of result object
+            n_params = 0
+            if components:
+                for comp in components:
+                    if comp.get('type') == 'gaussian':
+                        n_params += 3  # amp, mean, stddev
+                    elif comp.get('type') == 'voigt':
+                        n_params += 4  # amp, center, sigma, gamma
+                    elif comp.get('type') == 'polynomial':
+                        n_params += comp.get('order', 1) + 1
+                if n_params > 0:
+                    params.append(f"Fit result: {n_params} parameters")
         
         return " | ".join(params) if params else "No parameters"
     

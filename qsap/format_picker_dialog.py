@@ -47,7 +47,8 @@ class FormatPickerDialog(QtWidgets.QDialog):
         self._detect_file_wave_unit()
         
         self.setWindowTitle("Select Spectrum Format")
-        self.setGeometry(100, 100, 600, 400)
+        self.setGeometry(100, 100, 700, 500)
+        self.setMinimumSize(600, 400)
         self.setModal(True)
         
         # Sort candidates by score (highest first)
@@ -88,8 +89,19 @@ class FormatPickerDialog(QtWidgets.QDialog):
     
     def _init_ui(self):
         """Initialize the user interface."""
-        layout = QtWidgets.QVBoxLayout()
-        layout.setContentsMargins(10, 10, 10, 10)
+        main_layout = QtWidgets.QVBoxLayout()
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(8)
+        
+        # Create a scroll area for all content except buttons
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet("QScrollArea { border: none; }")
+        
+        # Create a container widget for scrollable content
+        content_widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(content_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
         
         # File label
@@ -184,7 +196,7 @@ class FormatPickerDialog(QtWidgets.QDialog):
         self.format_list.itemSelectionChanged.connect(self._on_format_selected)
         
         # Scaling Factor Group
-        scaling_group = QtWidgets.QGroupBox("Preprocessing (optional)")
+        scaling_group = QtWidgets.QGroupBox("Scale Spectrum")
         scaling_layout = QtWidgets.QGridLayout()
         
         scaling_label = QtWidgets.QLabel("Scaling Factor:")
@@ -209,7 +221,7 @@ class FormatPickerDialog(QtWidgets.QDialog):
         layout.addWidget(scaling_group)
         
         # Replace Values Group
-        replace_values_group = QtWidgets.QGroupBox("Replace Values (NaN/Inf)")
+        replace_values_group = QtWidgets.QGroupBox("Replace Values (NaN, Inf)")
         replace_values_layout = QtWidgets.QGridLayout()
         
         # Status label (will be updated dynamically)
@@ -317,7 +329,13 @@ class FormatPickerDialog(QtWidgets.QDialog):
         # Trigger initial format selection check AFTER all UI elements are created
         self._on_format_selected()
         
-        # Buttons
+        # Set the content widget in the scroll area
+        scroll_area.setWidget(content_widget)
+        
+        # Add scroll area to main layout
+        main_layout.addWidget(scroll_area, 1)
+        
+        # Buttons (NOT scrollable, always at bottom)
         button_layout = QtWidgets.QHBoxLayout()
         button_layout.addStretch()
         
@@ -332,9 +350,9 @@ class FormatPickerDialog(QtWidgets.QDialog):
         load_btn.clicked.connect(self._on_load)
         button_layout.addWidget(load_btn)
         
-        layout.addLayout(button_layout)
+        main_layout.addLayout(button_layout)
         
-        self.setLayout(layout)
+        self.setLayout(main_layout)
     
     def _on_format_selected(self):
         """Handle format selection from list."""

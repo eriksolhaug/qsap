@@ -113,10 +113,16 @@ Examples:
                 
                 # If multiple candidates, show dialog; always show for clarity
                 print(f"\nShowing format selection dialog...\n")
-                dialog = FormatPickerDialog(args.fits_file, candidates, parent=None)
+                # Create an invisible parent widget to prevent macOS native dialogs from appearing
+                # This is a workaround for PyQt5/macOS behavior where parent=None can trigger
+                # unexpected native file dialogs
+                parent_widget = QtWidgets.QWidget()
+                parent_widget.hide()
+                dialog = FormatPickerDialog(args.fits_file, candidates, parent=parent_widget)
                 print("DEBUG: Dialog created successfully")
                 result = dialog.exec_()
                 print(f"DEBUG: Dialog result: {result}")
+                parent_widget.deleteLater()  # Clean up the temporary parent
                 
                 if result != QtWidgets.QDialog.Accepted:
                     print("Format selection cancelled")

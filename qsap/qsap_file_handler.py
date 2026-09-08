@@ -14,7 +14,7 @@ import numpy as np
 class QSAPFileHandler:
     """Manages .qsap file creation and parsing for unified fit storage"""
     
-    FILE_FORMAT_VERSION = "1.1"
+    FILE_FORMAT_VERSION = "1.3"
     
     def __init__(self, save_directory=None):
         self.save_directory = save_directory or os.path.expanduser("~/QSAP_fits")
@@ -121,6 +121,9 @@ class QSAPFileHandler:
         
         content = self._build_header('Listfit', 'Listfit', spectrum_filename, spectrum_info)
         
+        # Track type-specific counters for symbols (g0, g1, v0, p0, Z1, Z2, etc.)
+        type_counters = {'gaussian': 0, 'voigt': 0, 'polynomial': 0, 'redshift': 0}
+        
         for idx, fit in enumerate(fit_list, 1):
             fit_type = fit.get('type', 'gaussian').lower()
             
@@ -142,15 +145,27 @@ class QSAPFileHandler:
                 content += f"FIT_SUCCESS={fit.get('fit_success')}\n"
                 content += "\n"
             elif fit_type == 'gaussian':
-                content += self._build_gaussian_component(fit, idx)
+                symbol = f"g{type_counters['gaussian']}"
+                content += self._build_gaussian_component(fit, idx, symbol)
+                type_counters['gaussian'] += 1
             elif fit_type == 'voigt':
-                content += self._build_voigt_component(fit, idx)
+                symbol = f"v{type_counters['voigt']}"
+                content += self._build_voigt_component(fit, idx, symbol)
+                type_counters['voigt'] += 1
             elif fit_type == 'polynomial':
-                content += self._build_polynomial_component(fit, idx)
+                symbol = f"p{type_counters['polynomial']}"
+                content += self._build_polynomial_component(fit, idx, symbol)
+                type_counters['polynomial'] += 1
+            elif fit_type == 'redshift':
+                symbol = f"Z{type_counters['redshift'] + 1}"
+                content += self._build_redshift_component(fit, idx, symbol)
+                type_counters['redshift'] += 1
             elif fit_type == 'polynomial_guess_mask':
                 content += self._build_polynomial_guess_mask_component(fit, idx)
             elif fit_type == 'data_mask':
                 content += self._build_data_mask_component(fit, idx)
+            elif fit_type == 'constraints':
+                content += self._build_constraints_block(fit)
         
         with open(filepath, 'w') as f:
             f.write(content)
@@ -173,7 +188,7 @@ class QSAPFileHandler:
         filepath = self.generate_filename('Redshift', 'Single', spectrum_filename)
         
         content = "[METADATA]\n"
-        content += f"FILE_FORMAT_VERSION=1.1\n"
+        content += f"FILE_FORMAT_VERSION={self.FILE_FORMAT_VERSION}\n"
         content += f"TYPE=Redshift\n"
         content += f"SPECTRUM_FILE={os.path.basename(spectrum_filename)}\n"
         if parent_fit_id:
@@ -337,10 +352,18 @@ class QSAPFileHandler:
         content += "\n"
         return content
     
-    def _build_gaussian_component(self, fit, component_num):
-        """Build a single Gaussian component section"""
+    def _build_gaussian_component(self, fit, component_num, symbol=None):
+        """Build a single Gaussian component section
+        
+        Args:
+            fit: Fit dictionary
+            component_num: Component number in overall list
+            symbol: Component symbol (e.g., 'g0', 'g1') for constraint references
+        """
         content = f"[COMPONENT_{component_num}]\n"
         content += "TYPE=Gaussian\n"
+        if symbol:
+            content += f"SYMBOL={symbol}\n"
         
         # Core parameters
         if 'fit_id' in fit:
@@ -356,21 +379,23 @@ class QSAPFileHandler:
         if 'rest_wavelength' in fit and fit['rest_wavelength']:
             content += f"REST_WAVELENGTH={fit['rest_wavelength']}\n"
         
-        # Initial guesses (if provided from listfit)
+        # Initial guesses (if provided from listfit or other sources)
+        # Note: In v1.4+, use MU (μ) and SIGMA (σ) instead of MEAN and STD_DEV
+        # The parse routine will support both old (v1.3) and new (v1.4) formats for backward compatibility
         if 'amp_initial' in fit and fit['amp_initial'] is not None:
             content += f"AMPLITUDE_INITIAL={fit['amp_initial']}\n"
         if 'mean_initial' in fit and fit['mean_initial'] is not None:
-            content += f"MEAN_INITIAL={fit['mean_initial']}\n"
+            content += f"MU_INITIAL={fit['mean_initial']}\n"
         if 'stddev_initial' in fit and fit['stddev_initial'] is not None:
-            content += f"STD_DEV_INITIAL={fit['stddev_initial']}\n"
+            content += f"SIGMA_INITIAL={fit['stddev_initial']}\n"
         
         # Gaussian parameters with errors (best fit)
         if 'amp' in fit:
             content += f"AMPLITUDE={self._format_param(fit.get('amp'), fit.get('amp_err'))}\n"
         if 'mean' in fit:
-            content += f"MEAN={self._format_param(fit.get('mean'), fit.get('mean_err'))}\n"
+            content += f"MU={self._format_param(fit.get('mean'), fit.get('mean_err'))}\n"
         if 'stddev' in fit:
-            content += f"STD_DEV={self._format_param(fit.get('stddev'), fit.get('stddev_err'))}\n"
+            content += f"SIGMA={self._format_param(fit.get('stddev'), fit.get('stddev_err'))}\n"
         
         # Bounds
         if 'bounds' in fit:
@@ -436,6 +461,10 @@ class QSAPFileHandler:
         if 'z_sys' in fit and fit['z_sys']:
             content += f"SYSTEM_REDSHIFT={fit['z_sys']}\n"
         
+        # Redshift tying (for line list fitting with redshift constraints)
+        if 'tied_redshift' in fit and fit['tied_redshift']:
+            content += f"TIED_REDSHIFT={fit['tied_redshift']}\n"
+        
         # Covariance matrix (3x3 for Gaussian: amp, mean, stddev)
         if 'covariance' in fit and fit['covariance']:
             cov = fit['covariance']
@@ -449,10 +478,18 @@ class QSAPFileHandler:
         content += "\n"
         return content
     
-    def _build_voigt_component(self, fit, component_num):
-        """Build a single Voigt component section"""
+    def _build_voigt_component(self, fit, component_num, symbol=None):
+        """Build a single Voigt component section
+        
+        Args:
+            fit: Fit dictionary
+            component_num: Component number in overall list
+            symbol: Component symbol (e.g., 'v0', 'v1') for constraint references
+        """
         content = f"[COMPONENT_{component_num}]\n"
         content += "TYPE=Voigt\n"
+        if symbol:
+            content += f"SYMBOL={symbol}\n"
         
         # Core parameters
         if 'fit_id' in fit:
@@ -469,10 +506,12 @@ class QSAPFileHandler:
             content += f"REST_WAVELENGTH={fit['rest_wavelength']}\n"
         
         # Initial guesses (if provided from listfit)
+        # Note: In v1.4+, use MU (μ) and SIGMA (σ) instead of MEAN
+        # The parse routine will support both old (v1.3) and new (v1.4) formats for backward compatibility
         if 'amplitude_initial' in fit and fit['amplitude_initial'] is not None:
             content += f"AMPLITUDE_INITIAL={fit['amplitude_initial']}\n"
         if 'mean_initial' in fit and fit['mean_initial'] is not None:
-            content += f"MEAN_INITIAL={fit['mean_initial']}\n"
+            content += f"MU_INITIAL={fit['mean_initial']}\n"
         if 'sigma_initial' in fit and fit['sigma_initial'] is not None:
             content += f"SIGMA_INITIAL={fit['sigma_initial']}\n"
         if 'gamma_initial' in fit and fit['gamma_initial'] is not None:
@@ -482,9 +521,9 @@ class QSAPFileHandler:
         if 'amplitude' in fit:
             content += f"AMPLITUDE={self._format_param(fit.get('amplitude'), fit.get('amplitude_err'))}\n"
         if 'mean' in fit:
-            content += f"MEAN={self._format_param(fit.get('mean'), fit.get('mean_err'))}\n"
+            content += f"MU={self._format_param(fit.get('mean'), fit.get('mean_err'))}\n"
         elif 'center' in fit:
-            content += f"MEAN={self._format_param(fit.get('center'), fit.get('center_err'))}\n"
+            content += f"MU={self._format_param(fit.get('center'), fit.get('center_err'))}\n"
         if 'sigma' in fit:
             content += f"SIGMA={self._format_param(fit.get('sigma'), fit.get('sigma_err'))}\n"
         if 'gamma' in fit:
@@ -560,6 +599,10 @@ class QSAPFileHandler:
         if 'z_sys' in fit and fit['z_sys']:
             content += f"SYSTEM_REDSHIFT={fit['z_sys']}\n"
         
+        # Redshift tying (for line list fitting with redshift constraints)
+        if 'tied_redshift' in fit and fit['tied_redshift']:
+            content += f"TIED_REDSHIFT={fit['tied_redshift']}\n"
+        
         # Covariance matrix (for Voigt: amplitude, center, sigma, gamma)
         if 'covariance' in fit and fit['covariance']:
             cov = fit['covariance']
@@ -611,10 +654,18 @@ class QSAPFileHandler:
         content += "\n"
         return content
     
-    def _build_polynomial_component(self, fit, component_num):
-        """Build a polynomial component (used in listfit)"""
+    def _build_polynomial_component(self, fit, component_num, symbol=None):
+        """Build a polynomial component (used in listfit)
+        
+        Args:
+            fit: Fit dictionary
+            component_num: Component number in overall list
+            symbol: Component symbol (e.g., 'p0', 'p1') for constraint references
+        """
         content = f"[COMPONENT_{component_num}]\n"
         content += "TYPE=Polynomial\n"
+        if symbol:
+            content += f"SYMBOL={symbol}\n"
         
         if 'poly_order' in fit:
             content += f"POLY_ORDER={fit['poly_order']}\n"
@@ -664,6 +715,155 @@ class QSAPFileHandler:
             content += f"MIN_LAMBDA={fit['min_lambda']}\n"
         if 'max_lambda' in fit:
             content += f"MAX_LAMBDA={fit['max_lambda']}\n"
+        
+        content += "\n"
+        return content
+    
+    def _build_redshift_component(self, fit, component_num, symbol=None):
+        """Build a redshift component block for listfit
+        
+        Args:
+            fit: Fit dictionary with redshift parameters
+            component_num: Component number
+            symbol: Component symbol (e.g., 'Z1', 'Z2')
+        """
+        content = f"[COMPONENT_{component_num}]\n"
+        content += "TYPE=Redshift\n"
+        if symbol:
+            content += f"SYMBOL={symbol}\n"
+        
+        # Redshift value with uncertainties
+        if 'redshift' in fit or 'value' in fit:
+            z_value = fit.get('redshift', fit.get('value'))
+            z_err = fit.get('error_redshift', fit.get('error', fit.get('uncertainty')))
+            content += f"REDSHIFT={self._format_param(z_value, z_err)}\n"
+        
+        # Initial guess
+        if 'z_initial' in fit or 'initial' in fit:
+            z_initial = fit.get('z_initial', fit.get('initial'))
+            if z_initial is not None:
+                content += f"REDSHIFT_INITIAL={z_initial}\n"
+        
+        # Redshift label/description (if provided)
+        if 'label' in fit:
+            content += f"LABEL={fit['label']}\n"
+        
+        # Redshift number (z1, z2, z3, etc.)
+        if 'redshift_number' in fit:
+            content += f"REDSHIFT_NUMBER={fit['redshift_number']}\n"
+        
+        # Number of profiles tied to this redshift
+        if 'num_profiles' in fit:
+            content += f"NUM_TIED_PROFILES={fit['num_profiles']}\n"
+        
+        content += "\n"
+        return content
+        return content
+    
+    def _build_constraints_block(self, fit):
+        """Build the [CONSTRAINTS] block documenting all applied constraints
+        
+        Constraints include:
+        - Tied parameters (expressions): e.g., g0_mean = g1_mean * (5008/4960)
+        - Fixed values: e.g., g0_amp fixed at 150.0
+        - Bounds: e.g., g0_mean between 4300 and 4350
+        """
+        content = "[CONSTRAINTS]\n"
+        constraints_data = fit.get('constraints', {})
+        
+        if not constraints_data:
+            content += "NONE=No constraints applied\n"
+        else:
+            for comp_key, comp_constraints in constraints_data.items():
+                if not comp_constraints or all(not v for v in comp_constraints.values()):
+                    continue
+                
+                has_constraints = False
+                section_content = f"\n# Constraints for {comp_key}\n"
+                
+                # Tied/linked parameter expressions
+                linked_constraints = comp_constraints.get('linked_constraints', [])
+                if linked_constraints:
+                    for constraint in linked_constraints:
+                        if isinstance(constraint, dict):
+                            # Format: {'parameter': 'name', 'expression': 'expr'}
+                            expr = constraint.get('expression')
+                            if expr:
+                                section_content += f"  TIED_PARAMETER={expr}\n"
+                                has_constraints = True
+                        else:
+                            # Might be a string directly
+                            section_content += f"  TIED_PARAMETER={constraint}\n"
+                            has_constraints = True
+                
+                # Fixed parameters
+                if comp_constraints.get('amplitude_fixed'):
+                    section_content += f"  FIXED=amplitude\n"
+                    has_constraints = True
+                if comp_constraints.get('mean_fixed') or comp_constraints.get('center_fixed'):
+                    section_content += f"  FIXED=center/mean\n"
+                    has_constraints = True
+                if comp_constraints.get('sigma_fixed') or comp_constraints.get('stddev_fixed'):
+                    section_content += f"  FIXED=width (sigma/stddev)\n"
+                    has_constraints = True
+                if comp_constraints.get('gamma_fixed'):
+                    section_content += f"  FIXED=gamma (Voigt)\n"
+                    has_constraints = True
+                
+                # Bounds for amplitude
+                amp_bounds = comp_constraints.get('amplitude_bounds')
+                if amp_bounds and (amp_bounds[0] or amp_bounds[1]):
+                    min_val = amp_bounds[0] if amp_bounds[0] else "none"
+                    max_val = amp_bounds[1] if amp_bounds[1] else "none"
+                    section_content += f"  AMPLITUDE_BOUNDS={min_val}..{max_val}\n"
+                    has_constraints = True
+                
+                # Bounds for mean/center
+                mean_bounds = comp_constraints.get('mean_bounds')
+                if mean_bounds and (mean_bounds[0] or mean_bounds[1]):
+                    try:
+                        min_val = f"{float(mean_bounds[0]):.2f}" if mean_bounds[0] else "none"
+                    except (ValueError, TypeError):
+                        min_val = str(mean_bounds[0]) if mean_bounds[0] else "none"
+                    try:
+                        max_val = f"{float(mean_bounds[1]):.2f}" if mean_bounds[1] else "none"
+                    except (ValueError, TypeError):
+                        max_val = str(mean_bounds[1]) if mean_bounds[1] else "none"
+                    section_content += f"  CENTER_BOUNDS={min_val}..{max_val}\n"
+                    has_constraints = True
+                
+                center_bounds = comp_constraints.get('center_bounds')
+                if center_bounds and (center_bounds[0] or center_bounds[1]):
+                    try:
+                        min_val = f"{float(center_bounds[0]):.2f}" if center_bounds[0] else "none"
+                    except (ValueError, TypeError):
+                        min_val = str(center_bounds[0]) if center_bounds[0] else "none"
+                    try:
+                        max_val = f"{float(center_bounds[1]):.2f}" if center_bounds[1] else "none"
+                    except (ValueError, TypeError):
+                        max_val = str(center_bounds[1]) if center_bounds[1] else "none"
+                    section_content += f"  CENTER_BOUNDS={min_val}..{max_val}\n"
+                    has_constraints = True
+                
+                # Bounds for sigma/stddev
+                sigma_bounds = comp_constraints.get('sigma_bounds')
+                if sigma_bounds and (sigma_bounds[0] or sigma_bounds[1]):
+                    min_val = sigma_bounds[0] if sigma_bounds[0] else "none"
+                    max_val = sigma_bounds[1] if sigma_bounds[1] else "none"
+                    section_content += f"  SIGMA_BOUNDS={min_val}..{max_val}\n"
+                    has_constraints = True
+                
+                # Bounds for gamma
+                gamma_bounds = comp_constraints.get('gamma_bounds')
+                if gamma_bounds and (gamma_bounds[0] or gamma_bounds[1]):
+                    min_val = gamma_bounds[0] if gamma_bounds[0] else "none"
+                    max_val = gamma_bounds[1] if gamma_bounds[1] else "none"
+                    section_content += f"  GAMMA_BOUNDS={min_val}..{max_val}\n"
+                    has_constraints = True
+                
+                # Only add section if it has actual constraints
+                if has_constraints:
+                    content += section_content
         
         content += "\n"
         return content
@@ -738,6 +938,37 @@ class QSAPFileHandler:
                 data['metadata'] = current_component
             else:
                 data['components'].append(current_component)
+        
+        # Normalize parameter names for backward compatibility (v1.3 -> v1.4+)
+        # Maps old parameter names to new Greek letter names
+        data = self._normalize_parameter_names(data)
+        
+        return data
+    
+    def _normalize_parameter_names(self, data):
+        """Normalize old parameter names (v1.3) to new Greek letter names (v1.4+)
+        
+        Backward compatibility mapping:
+        - MEAN_INITIAL -> MU_INITIAL
+        - STD_DEV_INITIAL -> SIGMA_INITIAL
+        - MEAN -> MU
+        - STD_DEV -> SIGMA
+        - CENTER -> MU (Voigt)
+        """
+        for component in data.get('components', []):
+            # Mapping of old names to new names
+            rename_map = {
+                'MEAN_INITIAL': 'MU_INITIAL',
+                'STD_DEV_INITIAL': 'SIGMA_INITIAL',
+                'MEAN': 'MU',
+                'STD_DEV': 'SIGMA',
+                'CENTER': 'MU',  # For Voigt components stored as CENTER
+            }
+            
+            # Apply renaming: only rename if new name doesn't already exist
+            for old_name, new_name in rename_map.items():
+                if old_name in component and new_name not in component:
+                    component[new_name] = component.pop(old_name)
         
         return data
     

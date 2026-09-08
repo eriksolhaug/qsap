@@ -39,12 +39,13 @@ class LineListSelector(QtWidgets.QWidget):
         
         # List widget for available line lists
         self.linelist_table = QtWidgets.QTableWidget()
-        self.linelist_table.setColumnCount(3)
-        self.linelist_table.setHorizontalHeaderLabels(['Name', 'Lines', 'Color'])
+        self.linelist_table.setColumnCount(4)
+        self.linelist_table.setHorizontalHeaderLabels(['Name', 'Lines', 'Color', 'Update with Redshift'])
         self.linelist_table.horizontalHeader().setStretchLastSection(False)
-        self.linelist_table.setColumnWidth(0, 180)
-        self.linelist_table.setColumnWidth(1, 80)
-        self.linelist_table.setColumnWidth(2, 120)
+        self.linelist_table.setColumnWidth(0, 140)
+        self.linelist_table.setColumnWidth(1, 70)
+        self.linelist_table.setColumnWidth(2, 80)
+        self.linelist_table.setColumnWidth(3, 140)
         
         # Populate table
         self.populate_table()
@@ -125,6 +126,16 @@ class LineListSelector(QtWidgets.QWidget):
             color_button.setText("")
             color_button.setFixedSize(40, 25)
             self.linelist_table.setCellWidget(row, 2, color_button)
+            
+            # Update with Redshift column (checkbox)
+            redshift_checkbox = QtWidgets.QCheckBox()
+            # Default to checked (True) if not already set
+            if linelist.name in self.selected_line_lists:
+                redshift_checkbox.setChecked(self.selected_line_lists[linelist.name].get('apply_redshift', True))
+            else:
+                redshift_checkbox.setChecked(True)  # Default: apply redshift
+            redshift_checkbox.stateChanged.connect(self.on_redshift_checkbox_changed)
+            self.linelist_table.setCellWidget(row, 3, redshift_checkbox)
     
     def toggle_linelist(self):
         """Toggle display of selected line list"""
@@ -155,10 +166,22 @@ class LineListSelector(QtWidgets.QWidget):
                         else:
                             color = linelist.color
                         
+                        # Get redshift checkbox state
+                        redshift_checkbox = self.linelist_table.cellWidget(row, 3)
+                        apply_redshift = True
+                        if redshift_checkbox and isinstance(redshift_checkbox, QtWidgets.QCheckBox):
+                            apply_redshift = redshift_checkbox.isChecked()
+                        
                         self.selected_line_lists[linelist_name] = {
                             'linelist': linelist,
-                            'color': color
+                            'color': color,
+                            'apply_redshift': apply_redshift
                         }
+                    elif linelist and linelist_name in self.selected_line_lists:
+                        # Update existing entry to preserve all settings
+                        redshift_checkbox = self.linelist_table.cellWidget(row, 3)
+                        if redshift_checkbox and isinstance(redshift_checkbox, QtWidgets.QCheckBox):
+                            self.selected_line_lists[linelist_name]['apply_redshift'] = redshift_checkbox.isChecked()
                 else:
                     # Remove from selected
                     if linelist_name in self.selected_line_lists:
@@ -169,6 +192,20 @@ class LineListSelector(QtWidgets.QWidget):
     def on_checkbox_state_changed(self, state):
         """Handle checkbox state changes - auto-toggle display"""
         self.toggle_linelist()
+    
+    def on_redshift_checkbox_changed(self, state):
+        """Handle redshift checkbox state changes"""
+        # Update the apply_redshift flag for the corresponding line list
+        for row in range(self.linelist_table.rowCount()):
+            checkbox = self.linelist_table.cellWidget(row, 0)
+            if checkbox and isinstance(checkbox, QtWidgets.QCheckBox):
+                linelist_name = checkbox.text()
+                if checkbox.isChecked() and linelist_name in self.selected_line_lists:
+                    redshift_checkbox = self.linelist_table.cellWidget(row, 3)
+                    if redshift_checkbox and isinstance(redshift_checkbox, QtWidgets.QCheckBox):
+                        self.selected_line_lists[linelist_name]['apply_redshift'] = redshift_checkbox.isChecked()
+        self.emit_changes()
+    
     
     def on_row_double_clicked(self, index):
         """Handle double-click on a row to change color"""
