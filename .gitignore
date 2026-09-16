@@ -10,6 +10,11 @@ FILEV*.md
 REDSHIFT*.md
 LMFIT*.md
 *ANALYSIS*.md
+*_FIX_*.md
+*_AUDIT_*.md
+FIX_COMPLETE*.md
+PLOTTING_*.md
+POLYNOMIAL_*.md
 
 # Local working and test files
 test/
