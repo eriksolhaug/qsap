@@ -53,8 +53,8 @@ class ComponentListTable(QtWidgets.QTableWidget):
         component = self.listfit_window.components[row]
         comp_type = component.get('type', '').lower()
         
-        # Show context menu for Gaussian, Voigt, Polynomial, and Redshift
-        if comp_type not in ['gaussian', 'voigt', 'polynomial', 'redshift', 'data_mask', 'polynomial_guess_mask']:
+        # Show context menu for Gaussian, Voigt, Polynomial, Chebyshev, and Redshift
+        if comp_type not in ['gaussian', 'voigt', 'polynomial', 'chebyshev', 'redshift', 'data_mask', 'polynomial_guess_mask']:
             return
         
         menu = QtWidgets.QMenu()
@@ -221,6 +221,8 @@ class ConstraintEditor(QtWidgets.QWidget):
             left_layout.addWidget(self._create_voigt_constraints())
         elif comp_type == 'polynomial':
             left_layout.addWidget(self._create_polynomial_constraints())
+        elif comp_type == 'chebyshev':
+            left_layout.addWidget(self._create_chebyshev_constraints())
         
         # Constraint expression input
         expr_group = QtWidgets.QGroupBox("Link Parameters")
@@ -373,7 +375,7 @@ class ConstraintEditor(QtWidgets.QWidget):
         self.selected_component = {
             'type': comp_type,
             'idx': comp_idx,
-            'type_map': {'gaussian': 'g', 'voigt': 'v', 'polynomial': 'p'}
+            'type_map': {'gaussian': 'g', 'voigt': 'v', 'polynomial': 'p', 'chebyshev': 'c'}
         }
         
         # Populate parameter list based on component type
@@ -486,7 +488,7 @@ class ConstraintEditor(QtWidgets.QWidget):
         comp_type = self.component.get('type')
         
         # Build expected component prefix from component type
-        type_map = {'gaussian': 'g', 'voigt': 'v', 'polynomial': 'p'}
+        type_map = {'gaussian': 'g', 'voigt': 'v', 'polynomial': 'p', 'chebyshev': 'c'}
         prefix = type_map.get(comp_type, '')
         
         # Find index of this component
@@ -870,6 +872,17 @@ class ConstraintEditor(QtWidgets.QWidget):
         group.setLayout(layout)
         return group
     
+    def _create_chebyshev_constraints(self):
+        """Create constraint panel for Chebyshev"""
+        group = QtWidgets.QGroupBox("Chebyshev Constraints")
+        layout = QtWidgets.QVBoxLayout()
+        layout.addWidget(QtWidgets.QLabel("Chebyshev coefficients are unconstrained by default."))
+        layout.addWidget(QtWidgets.QLabel("Coefficients are in normalized [-1, 1] frame."))
+        layout.addWidget(QtWidgets.QLabel("Add constraints below if needed:"))
+        
+        group.setLayout(layout)
+        return group
+    
     def get_constraints(self):
         """Get constraint data from UI"""
         constraints = {}
@@ -917,6 +930,9 @@ class ConstraintEditor(QtWidgets.QWidget):
             constraints['linked_constraints'] = self.linked_constraints
         
         elif comp_type == 'polynomial':
+            constraints['linked_constraints'] = self.linked_constraints
+        
+        elif comp_type == 'chebyshev':
             constraints['linked_constraints'] = self.linked_constraints
         
         return constraints
@@ -1013,10 +1029,11 @@ class ListfitWindow(QtWidgets.QWidget):
         super().__init__()
         self.bounds = bounds
         self.resources_dir = resources_dir
-        self.components = []  # List of {'type': 'gaussian'|'voigt'|'polynomial'|'polynomial_guess_mask'|'data_mask'|'redshift', ...}
+        self.components = []  # List of {'type': 'gaussian'|'voigt'|'polynomial'|'chebyshev'|'polynomial_guess_mask'|'data_mask'|'redshift', ...}
         self.gaussian_count = 0
         self.voigt_count = 0
         self.polynomial_count = 0
+        self.chebyshev_count = 0
         self.polynomial_guess_mask_count = 0
         self.data_mask_count = 0
         self.redshift_count = 0
@@ -1098,6 +1115,39 @@ class ListfitWindow(QtWidgets.QWidget):
         poly_layout.addLayout(poly_button_layout)
         
         left_layout.addLayout(poly_layout)
+        
+        # Chebyshev controls
+        cheb_layout = QtWidgets.QVBoxLayout()
+        cheb_header = QtWidgets.QHBoxLayout()
+        self.cheb_label = QtWidgets.QLabel("Chebyshev:")
+        cheb_header.addWidget(self.cheb_label)
+        cheb_header.addStretch()
+        cheb_layout.addLayout(cheb_header)
+        
+        cheb_order_layout = QtWidgets.QHBoxLayout()
+        self.cheb_order_label = QtWidgets.QLabel("Degree:")
+        self.cheb_order_input = QtWidgets.QLineEdit("1")
+        self.cheb_order_input.setMaximumWidth(80)
+        self.cheb_order_input.setValidator(QIntValidator(0, 10))
+        cheb_order_layout.addWidget(self.cheb_order_label)
+        cheb_order_layout.addWidget(self.cheb_order_input)
+        cheb_order_layout.addStretch()
+        cheb_layout.addLayout(cheb_order_layout)
+        
+        cheb_button_layout = QtWidgets.QHBoxLayout()
+        self.btn_cheb_add = QtWidgets.QPushButton("+")
+        self.btn_cheb_add.setMaximumWidth(40)
+        self.btn_cheb_add.clicked.connect(self.add_chebyshev)
+        self.btn_cheb_remove = QtWidgets.QPushButton("-")
+        self.btn_cheb_remove.setMaximumWidth(40)
+        self.btn_cheb_remove.clicked.connect(lambda: self.remove_component('chebyshev'))
+        cheb_button_layout.addWidget(QtWidgets.QLabel(""))
+        cheb_button_layout.addWidget(self.btn_cheb_add)
+        cheb_button_layout.addWidget(self.btn_cheb_remove)
+        cheb_button_layout.addStretch()
+        cheb_layout.addLayout(cheb_button_layout)
+        
+        left_layout.addLayout(cheb_layout)
         
         # Polynomial Guess Mask controls (for masking regions in polynomial initial guess)
         poly_mask_layout = QtWidgets.QVBoxLayout()
@@ -1330,6 +1380,21 @@ class ListfitWindow(QtWidgets.QWidget):
         self.polynomial_count += 1
         self._add_component_to_table(label, component)
     
+    def add_chebyshev(self):
+        """Add Chebyshev polynomial with specified degree"""
+        try:
+            degree = int(self.cheb_order_input.text())
+            if degree < 0 or degree > 10:
+                degree = 1
+        except ValueError:
+            degree = 1
+        
+        label = f"Chebyshev (degree={degree}) #{self.chebyshev_count + 1}"
+        component = {'type': 'chebyshev', 'degree': degree, 'id': len(self.components), 'index': self.chebyshev_count, 'label': label}
+        self.components.append(component)
+        self.chebyshev_count += 1
+        self._add_component_to_table(label, component)
+    
     def add_polynomial_guess_mask(self):
         """Add polynomial guess mask with specified wavelength range"""
         try:
@@ -1523,6 +1588,8 @@ class ListfitWindow(QtWidgets.QWidget):
                         self.voigt_count = max(0, self.voigt_count - 1)
                     elif comp_type == 'polynomial':
                         self.polynomial_count = max(0, self.polynomial_count - 1)
+                    elif comp_type == 'chebyshev':
+                        self.chebyshev_count = max(0, self.chebyshev_count - 1)
                     elif comp_type == 'polynomial_guess_mask':
                         self.polynomial_guess_mask_count = max(0, self.polynomial_guess_mask_count - 1)
                     elif comp_type == 'data_mask':
@@ -1553,6 +1620,8 @@ class ListfitWindow(QtWidgets.QWidget):
             symbol = f"v{self.voigt_count - 1}"
         elif comp_type == 'polynomial':
             symbol = f"p{self.polynomial_count - 1}"
+        elif comp_type == 'chebyshev':
+            symbol = f"c{self.chebyshev_count - 1}"
         elif comp_type == 'redshift':
             redshift_number = component.get('redshift_number', 1)
             symbol = f"z{redshift_number}"
@@ -1752,6 +1821,21 @@ class ListfitWindow(QtWidgets.QWidget):
                     # Determine parameter name: c0, c1, c2, c3, etc.
                     param_name = f"c{power}"
                     coeff_display.append(f"{param_name}={coeff:.3g}")
+                
+                return " ".join(coeff_display)
+            
+            elif comp_type == 'chebyshev':
+                # For Chebyshev: display coefficients (c0, c1, c2, ...)
+                coeffs = guess.get('coefficients')
+                degree = guess.get('degree')
+                
+                if not coeffs:
+                    return "(click to set)"
+                
+                # Format Chebyshev coefficients: c0, c1, c2, etc. (NOT T0, T1, T2)
+                coeff_display = []
+                for i, coeff in enumerate(coeffs):
+                    coeff_display.append(f"c{i}={coeff:.3g}")
                 
                 return " ".join(coeff_display)
             

@@ -53,11 +53,13 @@ class QSAPMainWindow(QtWidgets.QMainWindow):
         undo_action = self.edit_menu.addAction("Undo")
         undo_action.setShortcut("Cmd+Z")
         undo_action.triggered.connect(self.on_undo)
+        undo_action.setEnabled(False)  # TODO: Implement undo/redo properly
         
         # Add Redo action
         redo_action = self.edit_menu.addAction("Redo")
         redo_action.setShortcut("Cmd+Shift+Z")
         redo_action.triggered.connect(self.on_redo)
+        redo_action.setEnabled(False)  # TODO: Implement undo/redo properly
         
         # Create View menu
         self.view_menu = menubar.addMenu("View")

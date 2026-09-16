@@ -1,5 +1,5 @@
 # qsap Spectrum Plotter --- v0.12
-"""
+r"""
 Main spectrum plotter widget for interactive spectral analysis
 
 KEYBOARD SHORTCUTS:
@@ -131,6 +131,7 @@ warnings.filterwarnings('ignore', category=UserWarning, module='pandas.core.comp
 from .linelist_window import LineListWindow
 from .listfit_window import ListfitWindow
 from .item_tracker import ItemTracker
+from .fit_diagnostics_panel import FitDiagnosticsPanel
 from .fit_information_window import FitInformationWindow
 from .linelist import get_available_line_lists
 from .linelist_selector_window import LineListSelector
@@ -463,8 +464,8 @@ class SmoothingJoystick(QtWidgets.QWidget):
         # Draw labels
         painter.setPen(QtGui.QColor("#666"))
         painter.setFont(QtGui.QFont("Arial", 7))
-        painter.drawText(rect.adjusted(5, 5, -5, -5), Qt.AlignTop | Qt.AlignLeft, "↑ Gaussian σ")
-        painter.drawText(rect.adjusted(5, 5, -5, -5), Qt.AlignBottom | Qt.AlignLeft, "← Median")
+        painter.drawText(rect.adjusted(5, 5, -5, -5), Qt.AlignTop | Qt.AlignLeft, "↕ Gaussian σ")
+        painter.drawText(rect.adjusted(5, 5, -5, -5), Qt.AlignBottom | Qt.AlignLeft, "↔ Median")
         
         painter.end()
 
@@ -538,6 +539,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.gaussian_fits = []  # Stores each Gaussian's line, x-bounds, and parameters
 
         self.continuum_mode = False
+        self.current_continuum_fit_id = None  # Track fit_id for all items in current continuum session
         self.continuum_regions = []  # Stores regions for continuum fitting
         self.continuum_patches = []
         self.continuum_fits = []
@@ -624,6 +626,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.residual_ax = None  # Placeholder for the residual axis
         self.residuals = []
 
+        # Error Spectrum and Residual Display Options
+        self.error_spectrum_mode = "Default"  # "Default" (red dashed line) or "Shaded" (light gray band)
+        self.residual_display_mode = "None"  # "None", "Sigma" (residual/error), or "Shaded"
+        self.step_error = None  # Step plot version of error line
+        self.line_error = None  # Line plot version of error line
+        self.error_band_fill = None  # Fill_between object for shaded error spectrum
+
         self.line_ids = []
         self.line_wavelengths = []
         self.band_ranges = []
@@ -644,6 +653,27 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.multi_voigt_mode = False
         self.fit_id = 0
         self.component_id = 0
+        
+        # Fit Diagnostics tracking (session-only, rebuilt from .qsap files on load)
+        # Color palette: 12 distinct, colorblind-safe colors
+        self.FIT_COLORS = [
+            '#E41A1C',  # Red
+            '#377EB8',  # Blue
+            '#4DAF4A',  # Green
+            '#FF7F00',  # Orange
+            '#984EA3',  # Purple
+            '#A65628',  # Brown
+            '#F781BF',  # Pink
+            '#999999',  # Grey
+            '#E7298A',  # Magenta
+            '#66C2A5',  # Teal
+            '#FC8D62',  # Coral
+            '#8DA0CB',  # Slate
+        ]
+        self.fit_counter = 0  # Auto-incrementing fit ID
+        self.fit_colors = {}  # Map fit_id → color hex string
+        self.fit_metadata = {}  # Map fit_id → {type, R², χ²_red, AIC, BIC, n_params, condition_num, flag, timestamp}
+        self.fit_items = {}  # Map fit_id → set of item_ids belonging to this fit
 
         self.markers = []
         self.labels = []
@@ -691,9 +721,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
 
         # Item Tracker
         self.item_tracker = ItemTracker()
+        
+        # Fit Diagnostics Panel
+        self.fit_diagnostics_panel = FitDiagnosticsPanel()
+        
         self.fit_information_window = FitInformationWindow()
         self.item_id_counter = 0
         self.item_id_map = {}  # Maps item_id to {'type': 'gaussian', 'fit': fit_dict, ...}
+        self.lmfit_results = {}  # Maps fit_id to lmfit result objects (stored separately to avoid cleanup issues)
         self.highlighted_item_ids = set()  # Track all currently highlighted items
         self.redshift_selected_line = None  # Track the line object selected for redshift
         
@@ -1580,8 +1615,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.load_directory,
             "QSAP Files (*.qsap);;CSV Files (*.csv);;All Files (*)"
         )
-        # Use Qt-styled dialog to avoid spurious Finder windows on macOS during initialization
-        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        # Use native macOS file picker for modern appearance
+        dialog.setOption(QFileDialog.DontUseNativeDialog, False)
         dialog.setFileMode(QFileDialog.ExistingFiles)
         
         if dialog.exec_() != QFileDialog.Accepted:
@@ -1592,6 +1627,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             return
             
         self.load_directory = os.path.dirname(file_paths[0])
+        file_covariance_data = None  # Initialize before loop so it's accessible after
         
         # Load all selected files
         for file_path in file_paths:
@@ -1600,7 +1636,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 
                 # Check if this is a .qsap file
                 if file_path.endswith('.qsap'):
-                    self._load_qsap_file(file_path)
+                    file_covariance_data = self._load_qsap_file(file_path)
                     print(f"Loaded fits from QSAP file: {basename}")
                 else:
                     # Legacy CSV support
@@ -1639,9 +1675,31 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # Only plot spectrum if not already loaded
             if len(self.wav) == 0 or len(self.spec) == 0:
                 self.plot_spectrum()
+            
+            # Clear 'line' objects from all loaded fits so they get redrawn properly
+            for fit in self.gaussian_fits:
+                if 'line' in fit:
+                    fit.pop('line', None)
+            for fit in self.voigt_fits:
+                if 'line' in fit:
+                    fit.pop('line', None)
+            for fit in self.continuum_fits:
+                if 'line' in fit:
+                    fit.pop('line', None)
+            print(f"[DEBUG] Cleared line objects from all loaded fits")
+            
             # Always redraw fits (will only add new ones that don't have lines yet)
             self._redraw_loaded_fits()
             self.fig.canvas.draw_idle()
+            
+            # Distribute covariance matrices to loaded fits if available
+            # (covariance_data from last loaded QSAP file, if applicable)
+            if file_covariance_data:
+                self._distribute_covariance_to_fits(file_covariance_data)
+                
+                # After covariance distribution, update the panel with covariance data
+                # This allows correlation matrix plotting for loaded fits
+                self._update_panel_with_covariance(file_covariance_data)
             
         except Exception as e:
             print(f"Error loading fit file: {e}")
@@ -1653,116 +1711,412 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         
         Args:
             filepath: Path to the .qsap file
+            
+        Returns:
+            covariance_data: Full covariance matrix info from QSAP
         """
         qsap_data = self.qsap_handler.parse_qsap_file(filepath)
         metadata = qsap_data.get('metadata', {})
         components = qsap_data.get('components', [])
         
+        # Load full covariance matrix and component registry (for MC sampling)
+        covariance_data = self.qsap_handler.load_covariance_from_qsap(filepath)
+        
         fit_type = metadata.get('TYPE', 'Unknown')
         fit_mode = metadata.get('MODE', 'Unknown')
         
         print(f"Loading {fit_type} fit (mode: {fit_mode})")
+        print(f"[DEBUG] Metadata keys: {list(metadata.keys())}")
+        print(f"[DEBUG] Components count: {len(components)}, first few component sections: {[c.get('TYPE') or list(c.keys())[0] if c else 'empty' for c in components[:5]]}")
         
         # Load scale factor from metadata if present
         if 'SCALE_FACTOR' in metadata:
             self.flux_scale_factor = metadata['SCALE_FACTOR']
             print(f"  Scale factor: {self.flux_scale_factor}")
         
+        # Extract FIT_DIAGNOSTICS section (may be in components list since parser treats all sections as components)
+        fit_diagnostics = None
+        remaining_components = []
+        for comp in components:
+            # Check if this is the FIT_DIAGNOSTICS section (has CHI2, R_SQUARED, etc.)
+            if 'CHI2' in comp or 'R_SQUARED' in comp or 'AKAIKE_INFO_CRITERION' in comp:
+                fit_diagnostics = comp
+                print(f"[DEBUG] Found FIT_DIAGNOSTICS: {list(comp.keys())}")
+            elif comp.get('TYPE'):  # This is an actual component with TYPE field
+                remaining_components.append(comp)
+            else:
+                # Skip sections without TYPE and without diagnostic keys
+                pass
+        
+        components = remaining_components  # Use only actual component sections
+        
+        # Extract quality metrics from FIT_DIAGNOSTICS section
+        quality_metrics = {}
+        if fit_diagnostics:
+            quality_metrics = {
+                'chi2': fit_diagnostics.get('CHI2') or fit_diagnostics.get('SSR'),
+                'chi2_reduced': fit_diagnostics.get('CHI2_REDUCED') or fit_diagnostics.get('SSR_NU'),
+                'r_squared': fit_diagnostics.get('R_SQUARED'),
+                'akaike': fit_diagnostics.get('AKAIKE_INFO_CRITERION'),
+                'bayesian': fit_diagnostics.get('BAYESIAN_INFO_CRITERION'),
+                'n_data': fit_diagnostics.get('N_DATA_POINTS'),
+                'n_params': fit_diagnostics.get('N_PARAMETERS'),
+            }
+            print(f"[DEBUG] Quality metrics from FIT_DIAGNOSTICS: {quality_metrics}")
+        else:
+            print(f"[DEBUG] No FIT_DIAGNOSTICS section found")
+            quality_metrics = {
+                'chi2': None,
+                'chi2_reduced': None,
+                'r_squared': None,
+                'akaike': None,
+                'bayesian': None,
+                'n_data': None,
+                'n_params': None,
+            }
+        
         # Process components based on fit type
+        # Assign one fit_id for all components of this loaded fit
+        loaded_fit_id = self.next_fit_id()
+        self.assign_fit_color(loaded_fit_id)
+        
+        # Use n_params from diagnostics if available, otherwise count components
+        n_params = quality_metrics.get('n_params') or 0
+        n_data = quality_metrics.get('n_data')
+        
         if fit_type == 'Gaussian':
             for comp in components:
                 fit_dict = self._parse_qsap_gaussian_component(comp)
                 if fit_dict:
+                    fit_dict['_fit_id'] = loaded_fit_id  # Store fit_id for color grouping during redraw
                     self.gaussian_fits.append(fit_dict)
-                    # Register with ItemTracker
-                    position_str = f"λ: {fit_dict.get('mean', 0):.2f} Å"
-                    self.register_item('gaussian', f'Gaussian', fit_dict=fit_dict, position=position_str, 
-                                     color=self.colors['profiles']['gaussian']['color'])
+                    # Only count if n_params not already from diagnostics
+                    if not quality_metrics.get('n_params'):
+                        n_params += 3  # Gaussian has 3 parameters (amplitude, mean, stddev)
             print(f"  Loaded {len(components)} Gaussian components")
+            
+            # Register metadata for Fit Diagnostics
+            self._register_loaded_fit_metadata(loaded_fit_id, 'Single Gaussian' if len(components) == 1 else 'Multi-Gaussian',
+                                             quality_metrics)
             
         elif fit_type == 'Voigt':
             for comp in components:
                 fit_dict = self._parse_qsap_voigt_component(comp)
                 if fit_dict:
+                    fit_dict['_fit_id'] = loaded_fit_id  # Store fit_id for color grouping during redraw
                     self.voigt_fits.append(fit_dict)
-                    # Register with ItemTracker
-                    position_str = f"λ: {fit_dict.get('center', 0):.2f} Å"
-                    voigt_cfg = self.colors['profiles']['voigt']
-                    self.register_item('voigt', f'Voigt', fit_dict=fit_dict, position=position_str,
-                                     color=voigt_cfg['color'])
+                    # Only count if n_params not already from diagnostics
+                    if not quality_metrics.get('n_params'):
+                        n_params += 4  # Voigt has 4 parameters (amplitude, center, sigma, gamma)
             print(f"  Loaded {len(components)} Voigt components")
+            
+            # Register metadata for Fit Diagnostics
+            self._register_loaded_fit_metadata(loaded_fit_id, 'Single Voigt' if len(components) == 1 else 'Multi-Voigt',
+                                             quality_metrics)
             
         elif fit_type == 'Continuum':
             for comp in components:
                 fit_dict = self._parse_qsap_continuum_component(comp)
                 if fit_dict:
+                    fit_dict['_fit_id'] = loaded_fit_id  # Store fit_id for color grouping during redraw
                     self.continuum_fits.append(fit_dict)
                     
-                    # Register with ItemTracker
-                    bounds = fit_dict.get('bounds', (0, 0))
-                    bounds_str = f"λ: {bounds[0]:.2f}-{bounds[1]:.2f} Å"
-                    self.register_item('continuum', f'Continuum (order {fit_dict.get("poly_order", 2)})',
-                                     fit_dict=fit_dict, position=bounds_str, 
-                                     color=self.colors['profiles']['continuum_line']['color'])
+                    # Count parameters from polynomial order
+                    poly_order = fit_dict.get('poly_order', 1)
+                    n_params += (poly_order + 1)
                     
                     # Recreate continuum regions/patches for visualization
                     # Check if individual_regions was stored, otherwise use the combined bounds
-                    individual_regions = fit_dict.get('individual_regions', [bounds])
+                    individual_regions = fit_dict.get('individual_regions')
+                    if not individual_regions and 'bounds' in fit_dict:
+                        individual_regions = [fit_dict['bounds']]
                     
-                    for region_bounds in individual_regions:
-                        if region_bounds[0] > 0 and region_bounds[1] > 0:  # Valid bounds
-                            # Add to continuum_regions list
-                            self.continuum_regions.append(region_bounds)
-                            
-                            # Create visual patch for the region
-                            try:
-                                continuum_region_cfg = self.colors['profiles']['continuum_region']
-                                patch = self.ax.axvspan(region_bounds[0], region_bounds[1], 
-                                                      color=continuum_region_cfg['color'], 
-                                                      alpha=continuum_region_cfg['alpha'], 
-                                                      hatch=continuum_region_cfg['hatch'])
-                                self.continuum_patches.append({'patch': patch, 'bounds': region_bounds})
+                    if individual_regions:
+                        for region_bounds in individual_regions:
+                            if region_bounds[0] > 0 and region_bounds[1] > 0:  # Valid bounds
+                                # Add to continuum_regions list
+                                self.continuum_regions.append(region_bounds)
                                 
-                                # Register the region with ItemTracker
-                                position_str = f"λ: {region_bounds[0]:.2f}-{region_bounds[1]:.2f} Å"
-                                self.register_item('continuum_region', f'Continuum Region', patch_obj=patch,
-                                                 position=position_str, color=continuum_region_cfg['color'], bounds=region_bounds)
-                            except Exception as e:
-                                print(f"Error creating continuum region patch: {e}")
+                                # Create visual patch for the region
+                                try:
+                                    continuum_region_cfg = self.colors['profiles']['continuum_region']
+                                    patch = self.ax.axvspan(region_bounds[0], region_bounds[1], 
+                                                          color=continuum_region_cfg['color'], 
+                                                          alpha=continuum_region_cfg['alpha'], 
+                                                          hatch=continuum_region_cfg['hatch'])
+                                    self.continuum_patches.append({'patch': patch, 'bounds': region_bounds})
+                                    
+                                    # Register the region with ItemTracker
+                                    position_str = f"λ: {region_bounds[0]:.2f}-{region_bounds[1]:.2f} Å"
+                                    self.register_item('continuum_region', f'Continuum Region', patch_obj=patch,
+                                                     position=position_str, color=continuum_region_cfg['color'], bounds=region_bounds,
+                                                     fit_id=loaded_fit_id)
+                                except Exception as e:
+                                    print(f"Error creating continuum region patch: {e}")
             print(f"  Loaded {len(components)} Continuum fits")
             
+            # Register metadata for Fit Diagnostics
+            self._register_loaded_fit_metadata(loaded_fit_id, 'Continuum', quality_metrics)
+            
         elif fit_type == 'Listfit':
+            # Assign single fit_id for all components of this listfit
+            listfit_fit_id = self.next_fit_id()
+            self.assign_fit_color(listfit_fit_id)
+            
             mask_count = 0
             poly_count = 0
+            listfit_n_params = 0
+            
+            # Extract tie expressions and covariance info for inline extraction
+            tie_expressions = {}
+            if covariance_data and 'tie_expressions' in covariance_data:
+                tie_expressions = covariance_data['tie_expressions']
+                print(f"[DEBUG_LOAD_TIES] Loaded tie_expressions from covariance_data: {tie_expressions}")
+            else:
+                print(f"[DEBUG_LOAD_TIES] WARNING: No tie_expressions in covariance_data (keys: {list(covariance_data.keys()) if covariance_data else 'None'})")
+            
+            print(f"[DEBUG_LOAD_TIES] covariance_data keys: {list(covariance_data.keys()) if covariance_data else 'None'}")
+            
+            full_cov = None
+            free_param_names = []
+            free_param_values = []  # Store best-fit values for all free parameters
+            if covariance_data and 'free_parameter_names' in covariance_data and 'free_parameter_covariance' in covariance_data:
+                full_cov = covariance_data['free_parameter_covariance']
+                free_param_names = covariance_data['free_parameter_names']
+                print(f"[DEBUG_LOAD_TIES] Extracted free_param_names: {free_param_names}")
+                print(f"[DEBUG_LOAD_TIES] Extracted full_cov shape: {full_cov.shape if hasattr(full_cov, 'shape') else type(full_cov)}")
+                # Build a list of free parameter values in the same order
+                if 'free_parameter_values' in covariance_data:
+                    free_param_values = covariance_data['free_parameter_values']
+                else:
+                    # If not directly available, try to build from _free_param_dict (fallback)
+                    if '_free_param_dict' in covariance_data:
+                        free_param_dict = covariance_data['_free_param_dict']
+                        free_param_values = [free_param_dict.get(pname, 0.0) for pname in free_param_names]
+            
+            # Track component indices for covariance extraction
+            gauss_idx = 0
+            voigt_idx = 0
+            poly_idx = 0
+            
             for comp in components:
                 if comp.get('TYPE') == 'Gaussian':
                     fit_dict = self._parse_qsap_gaussian_component(comp)
                     if fit_dict:
+                        fit_dict['component_id'] = f'gaussian_{gauss_idx}'  # Set component ID for parameter matching
+                        fit_dict['_fit_id'] = listfit_fit_id  # Store fit_id for color grouping during redraw
+                        fit_dict['is_listfit_component'] = True  # Mark as Listfit component - don't add continuum
+                        # Store tie expressions from QSAP in the component dict (for MC EW calculation)
+                        if tie_expressions:
+                            fit_dict['tie_expressions'] = tie_expressions
+                        
+                        # Store global free parameter values for MC access (e.g., z1, other global params)
+                        if free_param_names and free_param_values:
+                            fit_dict['free_param_names_all'] = free_param_names
+                            fit_dict['free_param_values_all'] = free_param_values
+
+                        
+                        # Extract covariance for this Gaussian's free parameters
+                        # For tied Gaussians, only some parameters may be free (e.g., just amplitude)
+                        if full_cov is not None and free_param_names:
+                            # Find all free parameters that belong to this Gaussian
+                            param_indices = []
+                            param_names_extracted = []
+                            
+                            # Check for parameters specific to this Gaussian index
+                            for pname in free_param_names:
+                                if pname.startswith(f'g{gauss_idx}_'):
+                                    param_indices.append(free_param_names.index(pname))
+                                    param_names_extracted.append(pname)
+                            
+                            if param_indices:
+                                try:
+                                    # Extract covariance submatrix for these parameters
+                                    if len(param_indices) == 1:
+                                        # Single parameter - covariance is just the variance
+                                        submatrix = np.array([[full_cov[param_indices[0], param_indices[0]]]])
+                                    else:
+                                        submatrix = full_cov[np.ix_(param_indices, param_indices)]
+                                    
+                                    fit_dict['covariance'] = submatrix
+                                    fit_dict['free_params_for_cov'] = param_names_extracted
+                                    fit_dict['all_free_param_names'] = free_param_names  # Store full param list for tied param resolution
+                                    fit_dict['full_covariance'] = full_cov  # Store full matrix for tied parameter access
+                                    print(f"[DEBUG] Extracted {len(param_indices)} free parameter(s) for Gaussian {gauss_idx}: {param_names_extracted}")
+                                except Exception as e:
+                                    print(f"[DEBUG] Could not extract Gaussian {gauss_idx} covariance: {e}")
+                            else:
+                                print(f"[DEBUG] WARNING: Gaussian {gauss_idx} has no free parameters in covariance matrix (fully tied?)")
+                        
                         self.gaussian_fits.append(fit_dict)
-                        position_str = f"λ: {fit_dict.get('mean', 0):.2f} Å"
-                        self.register_item('gaussian', f'Gaussian (listfit)', fit_dict=fit_dict, 
-                                         position=position_str, color=self.colors['profiles']['gaussian']['color'])
+                        bounds = fit_dict.get('bounds', 'MISSING')
+                        print(f"[DEBUG] Loaded Gaussian: mean={fit_dict.get('mean'):.2f}, bounds={bounds}")
+                        listfit_n_params += 3
+                    gauss_idx += 1
+                    
                 elif comp.get('TYPE') == 'Voigt':
                     fit_dict = self._parse_qsap_voigt_component(comp)
                     if fit_dict:
+                        fit_dict['component_id'] = f'voigt_{voigt_idx}'  # Set component ID for parameter matching
+                        fit_dict['_fit_id'] = listfit_fit_id  # Store fit_id for color grouping during redraw
+                        fit_dict['is_listfit_component'] = True  # Mark as Listfit component - don't add continuum
+                        # Store tie expressions from QSAP in the component dict (for MC EW calculation)
+                        if tie_expressions:
+                            fit_dict['tie_expressions'] = tie_expressions
+                        
+                        # Store global free parameter values for MC access (e.g., z1, other global params)
+                        if free_param_names and free_param_values:
+                            fit_dict['free_param_names_all'] = free_param_names
+                            fit_dict['free_param_values_all'] = free_param_values
+
+                        
+                        # Extract covariance for this Voigt's free parameters
+                        if full_cov is not None and free_param_names:
+                            param_indices = []
+                            param_names_extracted = []
+                            
+                            for pname in free_param_names:
+                                if pname.startswith(f'v{voigt_idx}_'):
+                                    param_indices.append(free_param_names.index(pname))
+                                    param_names_extracted.append(pname)
+                            
+                            if param_indices:
+                                try:
+                                    if len(param_indices) == 1:
+                                        submatrix = np.array([[full_cov[param_indices[0], param_indices[0]]]])
+                                    else:
+                                        submatrix = full_cov[np.ix_(param_indices, param_indices)]
+                                    
+                                    fit_dict['covariance'] = submatrix
+                                    fit_dict['free_params_for_cov'] = param_names_extracted
+                                    fit_dict['all_free_param_names'] = free_param_names
+                                    fit_dict['full_covariance'] = full_cov
+                                    print(f"[DEBUG] Extracted {len(param_indices)} free parameter(s) for Voigt {voigt_idx}: {param_names_extracted}")
+                                except Exception as e:
+                                    print(f"[DEBUG] Could not extract Voigt {voigt_idx} covariance: {e}")
+                            else:
+                                print(f"[DEBUG] WARNING: Voigt {voigt_idx} has no free parameters in covariance matrix (fully tied?)")
+                        
                         self.voigt_fits.append(fit_dict)
-                        position_str = f"λ: {fit_dict.get('center', 0):.2f} Å"
-                        voigt_cfg = self.colors['profiles']['voigt']
-                        self.register_item('voigt', f'Voigt (listfit)', fit_dict=fit_dict, 
-                                         position=position_str, color=voigt_cfg['color'])
+                        bounds = fit_dict.get('bounds', 'MISSING')
+                        print(f"[DEBUG] Loaded Voigt: center={fit_dict.get('center'):.2f}, bounds={bounds}")
+                        listfit_n_params += 4
+                    voigt_idx += 1
+                    
                 elif comp.get('TYPE') == 'Polynomial':
                     fit_dict = self._parse_qsap_polynomial_component(comp)
                     if fit_dict:
-                        # Use bounds from the parsed polynomial, or default to full spectrum
+                        # Use bounds from the parsed polynomial (should be from BOUNDS_LOWER/BOUNDS_UPPER), or default to full spectrum
                         bounds = fit_dict.get('bounds', (self.x_data.min(), self.x_data.max()))
+                        if 'bounds' not in fit_dict:
+                            print(f"[DEBUG] Polynomial bounds missing; using full spectrum: {bounds}")
+                        else:
+                            print(f"[DEBUG] Loaded Polynomial: poly_order={fit_dict.get('poly_order')}, bounds={bounds}")
                         fit_dict['bounds'] = bounds
                         fit_dict['is_velocity_mode'] = False
+                        fit_dict['component_id'] = f'polynomial_{poly_idx}'  # Set component ID for parameter matching
+                        fit_dict['_fit_id'] = listfit_fit_id  # Store fit_id for color grouping during redraw
+                        fit_dict['is_listfit_component'] = True  # Mark as Listfit component
+                        # Store tie expressions from QSAP in the component dict (for MC EW calculation)
+                        if tie_expressions:
+                            fit_dict['tie_expressions'] = tie_expressions
+                        
+                        # Store global free parameter values for MC access (e.g., z1, other global params)
+                        if free_param_names and free_param_values:
+                            fit_dict['free_param_names_all'] = free_param_names
+                            fit_dict['free_param_values_all'] = free_param_values
+
+                        
+                        # Extract polynomial covariance submatrix
+                        if full_cov is not None and free_param_names:
+                            param_indices = []
+                            param_names_extracted = []
+                            
+                            for pname in free_param_names:
+                                if pname.startswith(f'p{poly_idx}_'):
+                                    param_indices.append(free_param_names.index(pname))
+                                    param_names_extracted.append(pname)
+                            
+                            if param_indices:
+                                try:
+                                    if len(param_indices) == 1:
+                                        submatrix = np.array([[full_cov[param_indices[0], param_indices[0]]]])
+                                    else:
+                                        submatrix = full_cov[np.ix_(param_indices, param_indices)]
+                                    
+                                    fit_dict['covariance'] = submatrix
+                                    fit_dict['free_params_for_cov'] = param_names_extracted
+                                    fit_dict['all_free_param_names'] = free_param_names
+                                    fit_dict['full_covariance'] = full_cov
+                                    print(f"[DEBUG] Extracted {len(param_indices)} free parameter(s) for Polynomial {poly_idx}: {param_names_extracted}")
+                                except Exception as e:
+                                    print(f"[DEBUG] Could not extract Polynomial {poly_idx} covariance: {e}")
+                            else:
+                                print(f"[DEBUG] WARNING: Polynomial {poly_idx} has no free parameters in covariance matrix (all tied?)")
+                        
                         self.continuum_fits.append(fit_dict)
-                        position_str = f"λ: {bounds[0]:.2f}-{bounds[1]:.2f} Å"
-                        self.register_item('polynomial', f'Polynomial (listfit, order={fit_dict.get("poly_order", 1)})', 
-                                         fit_dict=fit_dict, position=position_str, 
-                                         color=self.colors['profiles']['continuum_line']['color'])
+                        print(f"[DEBUG] Added polynomial to continuum_fits (total={len(self.continuum_fits)}), has 'coeffs'={('coeffs' in fit_dict)}")
                         poly_count += 1
+                        
+                        # Count polynomial parameters
+                        poly_order = fit_dict.get('poly_order', 1)
+                        listfit_n_params += (poly_order + 1)
+                    poly_idx += 1
+                    
+                elif comp.get('TYPE') == 'Chebyshev':
+                    fit_dict = self._parse_qsap_chebyshev_component(comp)
+                    if fit_dict:
+                        # Set component ID for Chebyshev (using separate counter, prefix 'ch')
+                        cheb_count = len([f for f in self.continuum_fits if f.get('type') == 'chebyshev'])
+                        fit_dict['component_id'] = f'chebyshev_{cheb_count}'
+                        fit_dict['_fit_id'] = listfit_fit_id
+                        fit_dict['is_listfit_component'] = True
+                        fit_dict['type'] = 'chebyshev'  # Mark type explicitly
+                        fit_dict['listfit_source'] = True  # CRITICAL: Mark as from listfit so _get_listfit_continuum finds it
+                        
+                        # Store tie expressions and free parameters
+                        if tie_expressions:
+                            fit_dict['tie_expressions'] = tie_expressions
+                        if free_param_names and free_param_values:
+                            fit_dict['free_param_names_all'] = free_param_names
+                            fit_dict['free_param_values_all'] = free_param_values
+                        
+                        # Extract Chebyshev covariance submatrix
+                        # Chebyshev coefficients are named c{i}_c0, c{i}_c1, etc.
+                        cheb_idx = len([f for f in self.continuum_fits if f.get('type') == 'chebyshev'])
+                        if full_cov is not None and free_param_names:
+                            param_indices = []
+                            param_names_extracted = []
+                            
+                            for pname in free_param_names:
+                                if pname.startswith(f'c{cheb_idx}_'):
+                                    param_indices.append(free_param_names.index(pname))
+                                    param_names_extracted.append(pname)
+                            
+                            if param_indices:
+                                try:
+                                    if len(param_indices) == 1:
+                                        submatrix = np.array([[full_cov[param_indices[0], param_indices[0]]]])
+                                    else:
+                                        submatrix = full_cov[np.ix_(param_indices, param_indices)]
+                                    
+                                    fit_dict['covariance'] = submatrix
+                                    fit_dict['free_params_for_cov'] = param_names_extracted
+                                    fit_dict['all_free_param_names'] = free_param_names
+                                    fit_dict['full_covariance'] = full_cov
+                                    print(f"[DEBUG] Extracted {len(param_indices)} free parameter(s) for Chebyshev: {param_names_extracted}")
+                                except Exception as e:
+                                    print(f"[DEBUG] Could not extract Chebyshev covariance: {e}")
+                            else:
+                                print(f"[DEBUG] WARNING: Chebyshev has no free parameters in covariance matrix (all tied?)")
+                        
+                        self.continuum_fits.append(fit_dict)
+                        print(f"[DEBUG] Added Chebyshev to continuum_fits (total={len(self.continuum_fits)})")
+                        
+                        # Count Chebyshev parameters
+                        cheb_degree = fit_dict.get('degree', 1)
+                        listfit_n_params += (cheb_degree + 1)
+                
                 elif comp.get('TYPE') == 'PolynomialGuessMask':
                     mask_dict = self._parse_qsap_polynomial_guess_mask_component(comp)
                     if mask_dict:
@@ -1771,7 +2125,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         position_str = f"λ: {min_lambda:.2f}-{max_lambda:.2f} Å"
                         self.register_item('polynomial_guess_mask', f'Polynomial Guess Mask (listfit)',
                                          fit_dict=mask_dict, position=position_str,
-                                         color='lightblue', bounds=(min_lambda, max_lambda))
+                                         color='lightblue', bounds=(min_lambda, max_lambda),
+                                         fit_id=listfit_fit_id)
                         mask_count += 1
                 elif comp.get('TYPE') == 'DataMask':
                     mask_dict = self._parse_qsap_data_mask_component(comp)
@@ -1781,9 +2136,17 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         position_str = f"λ: {min_lambda:.2f}-{max_lambda:.2f} Å"
                         self.register_item('data_mask', f'Data Mask (listfit)',
                                          fit_dict=mask_dict, position=position_str,
-                                         color='lightcoral', bounds=(min_lambda, max_lambda))
+                                         color='lightcoral', bounds=(min_lambda, max_lambda),
+                                         fit_id=listfit_fit_id)
                         mask_count += 1
             print(f"  Loaded {len(components)} Listfit components (including {mask_count} masks, {poly_count} polynomials)")
+            
+            # Update n_params in quality_metrics if we calculated it and it wasn't in diagnostics
+            if not quality_metrics.get('n_params') and listfit_n_params > 0:
+                quality_metrics['n_params'] = listfit_n_params
+            
+            # Register metadata for Fit Diagnostics
+            self._register_loaded_fit_metadata(listfit_fit_id, 'Listfit', quality_metrics)
             
         elif fit_type == 'Redshift':
             redshift_value = components[0].get('REDSHIFT') if components else None
@@ -1795,6 +2158,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 print(f"  Line ID: {components[0].get('LINE_ID', 'Unknown')}")
                 print(f"  Rest Wavelength: {components[0].get('LINE_WAVELENGTH_REST', 'Unknown')} Å")
                 print(f"  Observed Wavelength: {components[0].get('LINE_WAVELENGTH_OBSERVED', 'Unknown')} Å")
+        
+        # Return covariance data for this file so caller can process it
+        return covariance_data
     
     def _parse_qsap_gaussian_component(self, comp_dict):
         """Parse a Gaussian component from QSAP format"""
@@ -1827,10 +2193,22 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             fit_dict['mean'] = val
             if err:
                 fit_dict['mean_err'] = err
+        elif 'MU' in comp_dict:
+            # Handle alternative field name (older QSAP format)
+            val, err = comp_dict['MU'] if isinstance(comp_dict['MU'], tuple) else (comp_dict['MU'], None)
+            fit_dict['mean'] = val
+            if err:
+                fit_dict['mean_err'] = err
         
         # Parse std_dev with error
         if 'STD_DEV' in comp_dict:
             val, err = comp_dict['STD_DEV'] if isinstance(comp_dict['STD_DEV'], tuple) else (comp_dict['STD_DEV'], None)
+            fit_dict['stddev'] = val
+            if err:
+                fit_dict['stddev_err'] = err
+        elif 'SIGMA' in comp_dict:
+            # Handle alternative field name (older QSAP format)
+            val, err = comp_dict['SIGMA'] if isinstance(comp_dict['SIGMA'], tuple) else (comp_dict['SIGMA'], None)
             fit_dict['stddev'] = val
             if err:
                 fit_dict['stddev_err'] = err
@@ -1842,8 +2220,15 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Quality metrics
         if 'CHI_SQUARED' in comp_dict:
             fit_dict['chi2'] = comp_dict['CHI_SQUARED']
+        elif 'SSR' in comp_dict:
+            # Handle alternative field name (Sum of Squared Residuals)
+            fit_dict['chi2'] = comp_dict['SSR']
+        
         if 'CHI_SQUARED_NU' in comp_dict:
             fit_dict['chi2_nu'] = comp_dict['CHI_SQUARED_NU']
+        elif 'SSR_NU' in comp_dict:
+            # Handle alternative field name (SSR per degree of freedom)
+            fit_dict['chi2_nu'] = comp_dict['SSR_NU']
         
         # Mode information (default to False if not present)
         fit_dict['is_velocity_mode'] = comp_dict.get('VELOCITY_MODE', False)
@@ -1851,6 +2236,19 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # System redshift
         if 'SYSTEM_REDSHIFT' in comp_dict:
             fit_dict['z_sys'] = comp_dict['SYSTEM_REDSHIFT']
+        
+        # Covariance matrix (3x3 for Gaussian: amp, mean, stddev)
+        cov_matrix = []
+        for i in range(3):
+            row = []
+            for j in range(3):
+                cov_key = f'COV_{i}_{j}'
+                if cov_key in comp_dict:
+                    row.append(comp_dict[cov_key])
+            if row:
+                cov_matrix.append(row)
+        if cov_matrix and len(cov_matrix) == 3 and all(len(row) == 3 for row in cov_matrix):
+            fit_dict['covariance'] = np.array(cov_matrix)
         
         return fit_dict if fit_dict else None
     
@@ -1887,6 +2285,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             if err:
                 fit_dict['center_err'] = err
                 fit_dict['mean_err'] = err
+        elif 'MU' in comp_dict:
+            # Handle alternative field name (older QSAP format)
+            val, err = comp_dict['MU'] if isinstance(comp_dict['MU'], tuple) else (comp_dict['MU'], None)
+            fit_dict['center'] = val
+            fit_dict['mean'] = val
+            if err:
+                fit_dict['center_err'] = err
+                fit_dict['mean_err'] = err
         
         # Parse sigma with error
         if 'SIGMA' in comp_dict:
@@ -1915,8 +2321,15 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Quality metrics
         if 'CHI_SQUARED' in comp_dict:
             fit_dict['chi2'] = comp_dict['CHI_SQUARED']
+        elif 'SSR' in comp_dict:
+            # Handle alternative field name (Sum of Squared Residuals)
+            fit_dict['chi2'] = comp_dict['SSR']
+        
         if 'CHI_SQUARED_NU' in comp_dict:
             fit_dict['chi2_nu'] = comp_dict['CHI_SQUARED_NU']
+        elif 'SSR_NU' in comp_dict:
+            # Handle alternative field name (SSR per degree of freedom)
+            fit_dict['chi2_nu'] = comp_dict['SSR_NU']
         
         # Mode information (default to False if not present)
         fit_dict['is_velocity_mode'] = comp_dict.get('VELOCITY_MODE', False)
@@ -1924,6 +2337,19 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # System redshift
         if 'SYSTEM_REDSHIFT' in comp_dict:
             fit_dict['z_sys'] = comp_dict['SYSTEM_REDSHIFT']
+        
+        # Covariance matrix (4x4 for Voigt: amplitude, center, sigma, gamma)
+        cov_matrix = []
+        for i in range(4):
+            row = []
+            for j in range(4):
+                cov_key = f'COV_{i}_{j}'
+                if cov_key in comp_dict:
+                    row.append(comp_dict[cov_key])
+            if row:
+                cov_matrix.append(row)
+        if cov_matrix and len(cov_matrix) == 4 and all(len(row) == 4 for row in cov_matrix):
+            fit_dict['covariance'] = np.array(cov_matrix)
         
         return fit_dict if fit_dict else None
     
@@ -2038,6 +2464,52 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         if coeffs:
             fit_dict['coeffs'] = np.array(coeffs)
             fit_dict['coeffs_err'] = np.array(coeffs_err)
+            print(f"[DEBUG_POLY_LOAD] Loaded polynomial: order={fit_dict.get('poly_order')}, coeffs={coeffs}, bounds={fit_dict.get('bounds')}")
+        
+        return fit_dict if fit_dict else None
+    
+    def _parse_qsap_chebyshev_component(self, comp_dict):
+        """Parse a Chebyshev polynomial component from QSAP format (for listfit)
+        
+        Chebyshev coefficients are stored in the rescaled [-1, 1] frame.
+        Domain bounds (lam_min, lam_max) are essential for proper evaluation.
+        """
+        fit_dict = {}
+        
+        # Chebyshev degree
+        if 'DEGREE' in comp_dict:
+            fit_dict['degree'] = comp_dict['DEGREE']
+        
+        # Domain bounds (CRITICAL)
+        if 'DOMAIN_MIN' in comp_dict and 'DOMAIN_MAX' in comp_dict:
+            fit_dict['lam_min'] = comp_dict['DOMAIN_MIN']
+            fit_dict['lam_max'] = comp_dict['DOMAIN_MAX']
+        else:
+            print(f"[WARNING] Chebyshev component missing domain bounds (DOMAIN_MIN/MAX) - cannot evaluate!")
+            return None
+        
+        # Fit bounds (wavelength range)
+        if 'BOUNDS_LOWER' in comp_dict and 'BOUNDS_UPPER' in comp_dict:
+            fit_dict['bounds'] = (comp_dict['BOUNDS_LOWER'], comp_dict['BOUNDS_UPPER'])
+        
+        # Chebyshev coefficients (in [-1, 1] rescaled frame)
+        coeffs = []
+        coeffs_err = []
+        coeff_idx = 0
+        while f'COEFF_{coeff_idx}' in comp_dict:
+            val = comp_dict[f'COEFF_{coeff_idx}']
+            if isinstance(val, tuple):
+                coeffs.append(val[0])
+                coeffs_err.append(val[1])
+            else:
+                coeffs.append(val)
+                coeffs_err.append(None)
+            coeff_idx += 1
+        
+        if coeffs:
+            fit_dict['coeffs'] = np.array(coeffs)
+            fit_dict['coeffs_err'] = np.array(coeffs_err)
+            print(f"[DEBUG_CHEB_LOAD] Loaded Chebyshev: degree={fit_dict.get('degree')}, domain=[{fit_dict['lam_min']:.2f}, {fit_dict['lam_max']:.2f}], coeffs={coeffs}, bounds={fit_dict.get('bounds')}")
         
         return fit_dict if fit_dict else None
     
@@ -2047,13 +2519,19 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         for idx, fit in enumerate(self.gaussian_fits):
             if fit.get('line') is None:  # Only if line hasn't been created yet
                 try:
-                    x_plot = np.linspace(fit['bounds'][0], fit['bounds'][1], 100)
-                    _, a, b = self.get_existing_continuum(fit['bounds'][0], fit['bounds'][1])
-                    if a is not None and b is not None:
-                        existing_continuum = self.continuum_model(x_plot, a, b)
-                    else:
-                        existing_continuum = np.zeros_like(x_plot)
-                    y_plot = self.gaussian(x_plot, fit['amp'], fit['mean'], fit['stddev']) + existing_continuum
+                    # For Single/Multi Gaussian mode: bounds come from user-selected fit range
+                    # For Listfit mode: bounds come from the full listfit fitting range (should be in BOUNDS_LOWER/BOUNDS_UPPER)
+                    # If bounds are missing (e.g., older .qsap files), calculate from profile parameters
+                    if 'bounds' not in fit or fit['bounds'] is None:
+                        mean = fit.get('mean', 0)
+                        stddev = fit.get('stddev', 10)
+                        fit['bounds'] = (mean - 5*stddev, mean + 5*stddev)
+                        print(f"[WARNING] Gaussian bounds missing; calculated from mean/stddev: {fit['bounds']}")
+                    x_plot = np.linspace(fit['bounds'][0], fit['bounds'][1], 2000)
+                    
+                    # Plot profile alone from y=0 (unified with Listfit convention)
+                    # The continuum is displayed separately as its own line
+                    y_plot = self.gaussian(x_plot, fit['amp'], fit['mean'], fit['stddev'])
                     gaussian_color = self.colors['profiles']['gaussian']
                     
                     # Add label only for the first gaussian
@@ -2063,9 +2541,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         self.legend_profile_types.add('gaussian')
                     
                     # Register with item tracker - use saved name if available
+                    # If this fit already has a fit_id from initial loading, use it; otherwise assign new one
                     name = fit.get('_tracker_name') or f"Gaussian (mu={fit['mean']:.1f}, sigma={fit['stddev']:.1f})"
+                    existing_fit_id = fit.get('_fit_id') if '_fit_id' in fit else None
                     self.register_item('gaussian', name, fit_dict=fit, line_obj=fit['line'], 
-                                     color=gaussian_color['color'], bounds=fit['bounds'])
+                                     color=gaussian_color['color'], bounds=fit['bounds'], fit_id=existing_fit_id)
                 except Exception as e:
                     print(f"Error redrawing Gaussian fit: {e}")
         
@@ -2073,13 +2553,19 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         for idx, fit in enumerate(self.voigt_fits):
             if fit.get('line') is None:
                 try:
-                    x_plot = np.linspace(fit['bounds'][0], fit['bounds'][1], 100)
-                    _, a, b = self.get_existing_continuum(fit['bounds'][0], fit['bounds'][1])
-                    if a is not None and b is not None:
-                        existing_continuum = self.continuum_model(x_plot, a, b)
-                    else:
-                        existing_continuum = np.zeros_like(x_plot)
-                    y_plot = self.voigt(x_plot, fit['amp'], fit['center'], fit['sigma'], fit['gamma']) + existing_continuum
+                    # For Single/Multi Voigt mode: bounds come from user-selected fit range
+                    # For Listfit mode: bounds come from the full listfit fitting range (should be in BOUNDS_LOWER/BOUNDS_UPPER)
+                    # If bounds are missing (e.g., older .qsap files), calculate from profile parameters
+                    if 'bounds' not in fit or fit['bounds'] is None:
+                        center = fit.get('center', 0)
+                        sigma = fit.get('sigma', 10)
+                        fit['bounds'] = (center - 5*sigma, center + 5*sigma)
+                        print(f"[WARNING] Voigt bounds missing; calculated from center/sigma: {fit['bounds']}")
+                    x_plot = np.linspace(fit['bounds'][0], fit['bounds'][1], 2000)
+                    
+                    # Plot profile alone from y=0 (unified with Listfit convention)
+                    # The continuum is displayed separately as its own line
+                    y_plot = self.voigt(x_plot, fit['amp'], fit['center'], fit['sigma'], fit['gamma'])
                     voigt_color = self.colors['profiles']['voigt']
                     
                     # Add label only for the first voigt
@@ -2090,8 +2576,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     
                     # Register with item tracker - use saved name if available
                     name = fit.get('_tracker_name') or f"Voigt (c={fit['center']:.1f}, sigma={fit['sigma']:.1f}, gamma={fit['gamma']:.1f})"
+                    existing_fit_id = fit.get('_fit_id') if '_fit_id' in fit else None
                     self.register_item('voigt', name, fit_dict=fit, line_obj=fit['line'],
-                                     color=voigt_color['color'], bounds=fit['bounds'])
+                                     color=voigt_color['color'], bounds=fit['bounds'], fit_id=existing_fit_id)
                 except Exception as e:
                     print(f"Error redrawing Voigt fit: {e}")
         
@@ -2099,13 +2586,38 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         for idx, fit in enumerate(self.continuum_fits):
             if fit.get('line') is None:
                 try:
-                    x_plot = np.linspace(fit['bounds'][0], fit['bounds'][1], 100)
+                    # For Single/Multi Continuum mode: bounds come from user-selected fit range  
+                    # For Listfit mode: bounds come from the full listfit fitting range (should be in BOUNDS_LOWER/BOUNDS_UPPER)
+                    # If bounds are missing (e.g., older .qsap files), use full spectrum range
+                    if 'bounds' not in fit or fit['bounds'] is None:
+                        fit['bounds'] = (self.x_data.min(), self.x_data.max())
+                        print(f"[WARNING] Continuum bounds missing; using full spectrum range: {fit['bounds']}")
+                    x_plot = np.linspace(fit['bounds'][0], fit['bounds'][1], 2000)
                     
-                    # Handle both old format (a, b) and new format (coeffs)
-                    if 'coeffs' in fit:
+                    # Check Chebyshev FIRST (before checking for 'coeffs' in general)
+                    if fit.get('type') == 'chebyshev' and 'coeffs' in fit:
+                        # Chebyshev continuum with domain rescaling
+                        print(f"[DEBUG_CONTINUUM] Redrawing Chebyshev continuum (idx={idx}):")
+                        print(f"  domain=[{fit['lam_min']:.2f}, {fit['lam_max']:.2f}], bounds={fit['bounds']}")
+                        print(f"  coeffs={fit['coeffs']}, len={len(fit['coeffs'])}")
+                        
+                        # Rescale wavelengths to [-1, 1] frame (CRITICAL for correct evaluation)
+                        x_rescaled = 2 * (x_plot - fit['lam_min']) / (fit['lam_max'] - fit['lam_min']) - 1
+                        # Evaluate Chebyshev polynomial at rescaled points
+                        y_plot = np.polynomial.chebyshev.chebval(x_rescaled, fit['coeffs'])
+                        print(f"  y_plot range: {y_plot.min():.6f} to {y_plot.max():.6f}")
+                    elif 'coeffs' in fit:
+                        # Polynomial continuum (default case)
+                        print(f"[DEBUG_CONTINUUM] Redrawing continuum (idx={idx}):")
+                        print(f"  poly_order={fit.get('poly_order')}, bounds={fit['bounds']}")
+                        print(f"  coeffs={fit['coeffs']}, len={len(fit['coeffs'])}")
+                        print(f"  x_plot range: {x_plot.min():.2f} to {x_plot.max():.2f}")
+                        # Coefficients stored as [c_N, c_{N-1}, ..., c_1, c_0] (high-to-low order, as np.polyval expects)
                         y_plot = np.polyval(fit['coeffs'], x_plot)
+                        print(f"  y_plot range: {y_plot.min():.6f} to {y_plot.max():.6f}")
                     else:
                         # Old format fallback for backward compatibility
+                        print(f"[DEBUG_CONTINUUM] Redrawing continuum (idx={idx}): using old format (a,b)")
                         y_plot = fit['a'] * x_plot + fit['b']
                     
                     continuum_color = self.colors['profiles']['continuum_line']
@@ -2125,10 +2637,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         position_str = f"λ: {bounds[0]:.2f}-{bounds[1]:.2f} Å"
                     else:
                         position_str = "Continuum"
+                    existing_fit_id = fit.get('_fit_id') if '_fit_id' in fit else None
                     self.register_item('continuum', name, fit_dict=fit, line_obj=fit['line'],
-                                     position=position_str, color=continuum_color['color'], bounds=bounds)
+                                     position=position_str, color=continuum_color['color'], bounds=bounds,
+                                     fit_id=existing_fit_id)
                 except Exception as e:
-                    print(f"Error redrawing continuum fit: {e}")
+                    print(f"Error redrawing continuum fit (idx={idx}): {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print(f"[DEBUG] Skipping continuum (idx={idx}): line already exists")
         
         # Redraw Listfit composites
         for idx, listfit in enumerate(self.listfit_fits):
@@ -2142,7 +2660,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 
                 # If we have parameters, rebuild and evaluate the model
                 if param_values:
-                    x_plot = np.linspace(bounds[0], bounds[1], 200)
+                    x_plot = np.linspace(bounds[0], bounds[1], 2000)
                     
                     # Rebuild the composite model from components
                     components = listfit.get('components', [])
@@ -2242,12 +2760,299 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         n_components = len(listfit.get('components', []))
                         chi2 = listfit.get('quality_metrics', {}).get('chisqr', 0)
                         name = listfit.get('_tracker_name') or f"Total Listfit ({n_components} components, χ²={chi2:.2f})"
+                        existing_fit_id = listfit.get('_fit_id') if '_fit_id' in listfit else None
                         self.register_item('listfit_total', name, fit_dict=listfit, line_obj=listfit_line,
-                                         color=total_color['color'], bounds=bounds)
+                                         color=total_color['color'], bounds=bounds, fit_id=existing_fit_id)
             except Exception as e:
                 print(f"Error redrawing listfit composite: {e}")
                 import traceback
                 traceback.print_exc()
+    
+    def _distribute_covariance_to_fits(self, covariance_data):
+        """Distribute covariance submatrices from global covariance to individual fit components
+        
+        Args:
+            covariance_data: Dict from load_covariance_from_qsap with:
+                - free_parameter_names: list of all free parameter names
+                - free_parameter_covariance: full NxN covariance matrix
+                - component_registry: maps component IDs to parameter lists
+        """
+        if not covariance_data or 'free_parameter_covariance' not in covariance_data:
+            return
+        
+        full_covariance = covariance_data['free_parameter_covariance']
+        free_param_names = covariance_data['free_parameter_names']
+        component_registry = covariance_data.get('component_registry', {})
+        
+        # Build mapping from parameter names to indices
+        param_to_idx = {name: idx for idx, name in enumerate(free_param_names)}
+        
+        # Distribute covariance to each component type
+        for comp_id, comp_info in component_registry.items():
+            comp_type = comp_info['type']
+            param_names = comp_info['params']
+            
+            # Get indices of this component's parameters in the full covariance matrix
+            param_indices = []
+            for pname in param_names:
+                if pname in param_to_idx:
+                    param_indices.append(param_to_idx[pname])
+            
+            if not param_indices:
+                continue  # Skip if parameters not found
+            
+            # Extract covariance submatrix for this component
+            if len(param_indices) > 0:
+                cov_submatrix = full_covariance[np.ix_(param_indices, param_indices)]
+                
+                # Match component_id (like "g0", "v1", "p0") to the fit dictionaries
+                # by looking for matching component_id stored during parsing
+                found = False
+                
+                if comp_type == 'gaussian':
+                    for fit_dict in self.gaussian_fits:
+                        # Check if this fit's component_id matches (stored as 'component_id')
+                        # or match by order if component_id not stored
+                        if fit_dict.get('component_id') == comp_id or (
+                            not found and comp_id in fit_dict.get('_component_id', '')
+                        ):
+                            fit_dict['covariance'] = cov_submatrix
+                            print(f"[DEBUG] Distributed covariance to Gaussian {comp_id}: shape {cov_submatrix.shape}")
+                            found = True
+                            break
+                
+                elif comp_type == 'voigt':
+                    for fit_dict in self.voigt_fits:
+                        if fit_dict.get('component_id') == comp_id or (
+                            not found and comp_id in fit_dict.get('_component_id', '')
+                        ):
+                            fit_dict['covariance'] = cov_submatrix
+                            print(f"[DEBUG] Distributed covariance to Voigt {comp_id}: shape {cov_submatrix.shape}")
+                            found = True
+                            break
+                
+                elif comp_type == 'polynomial':
+                    for fit_dict in self.continuum_fits:
+                        if fit_dict.get('component_id') == comp_id or (
+                            not found and comp_id in fit_dict.get('_component_id', '')
+                        ):
+                            fit_dict['covariance'] = cov_submatrix
+                            print(f"[DEBUG] Distributed covariance to Continuum {comp_id}: shape {cov_submatrix.shape}")
+                            found = True
+                            break
+                
+                if not found and len(param_indices) > 0:
+                    print(f"[WARNING] Could not match covariance for component {comp_id} ({comp_type})")
+    
+    def _update_panel_with_covariance(self, covariance_data=None):
+        """Update Fit Diagnostics panel with covariance data after distribution
+        
+        After _distribute_covariance_to_fits() adds covariance to fit dicts,
+        this method updates the panel to include the covariance for correlation matrix plotting.
+        
+        For Listfits, stores the full free-parameter covariance matrix.
+        For single components, stores component-specific submatrices.
+        
+        Args:
+            covariance_data: Full covariance data from QSAP (needed for Listfit full matrix)
+        """
+        if not hasattr(self, 'fit_diagnostics_panel') or not self.fit_diagnostics_panel:
+            print("[DEBUG] Fit Diagnostics panel not available for covariance update")
+            return
+        
+        print(f"[DEBUG] _update_panel_with_covariance called with covariance_data={covariance_data is not None}")
+        print(f"[DEBUG] fit_diagnostics_panel exists: {self.fit_diagnostics_panel}")
+        print(f"[DEBUG] fit_diagnostics_panel.fits_data exists: {hasattr(self.fit_diagnostics_panel, 'fits_data')}")
+        if hasattr(self.fit_diagnostics_panel, 'fits_data'):
+            print(f"[DEBUG] fit_diagnostics_panel.fits_data keys: {list(self.fit_diagnostics_panel.fits_data.keys())}")
+        
+        # Identify which fit_ids are Listfits (have components in multiple lists)
+        listfit_fit_ids = set()
+        for fit in self.gaussian_fits:
+            if fit.get('is_listfit_component'):
+                listfit_fit_ids.add(fit.get('_fit_id'))
+                print(f"[DEBUG] Found Gaussian with is_listfit_component, fit_id={fit.get('_fit_id')}")
+        for fit in self.voigt_fits:
+            if fit.get('is_listfit_component'):
+                listfit_fit_ids.add(fit.get('_fit_id'))
+                print(f"[DEBUG] Found Voigt with is_listfit_component, fit_id={fit.get('_fit_id')}")
+        for fit in self.continuum_fits:
+            if fit.get('is_listfit_component'):
+                listfit_fit_ids.add(fit.get('_fit_id'))
+                print(f"[DEBUG] Found Continuum with is_listfit_component, fit_id={fit.get('_fit_id')}")
+        
+        print(f"[DEBUG] Identified Listfit fit_ids: {listfit_fit_ids}")
+        
+        # For Listfits, store the full free-parameter covariance
+        if listfit_fit_ids and covariance_data and 'free_parameter_covariance' in covariance_data:
+            full_covariance = covariance_data['free_parameter_covariance']
+            free_param_names = covariance_data['free_parameter_names']
+            
+            print(f"[DEBUG] Have covariance_data with full_covariance shape {full_covariance.shape}, {len(free_param_names)} param names")
+            
+            for listfit_id in listfit_fit_ids:
+                print(f"[DEBUG] Checking if listfit_id {listfit_id} in fits_data...")
+                if listfit_id in self.fit_diagnostics_panel.fits_data:
+                    print(f"[DEBUG] Storing full covariance for Listfit {listfit_id}: shape {full_covariance.shape}, params: {free_param_names}")
+                    self.fit_diagnostics_panel.fits_data[listfit_id]['covariance'] = full_covariance
+                    self.fit_diagnostics_panel.fits_data[listfit_id]['parameter_names'] = free_param_names
+                else:
+                    print(f"[DEBUG] WARNING: Listfit {listfit_id} NOT in fits_data. Available keys: {list(self.fit_diagnostics_panel.fits_data.keys())}")
+        else:
+            print(f"[DEBUG] Cannot store Listfit covariance: listfit_fit_ids={listfit_fit_ids}, has_covariance_data={covariance_data is not None}, has_matrix={covariance_data.get('free_parameter_covariance') if covariance_data else None}")
+        
+        # Update Gaussian fits with covariance (non-Listfit or component-level)
+        for fit in self.gaussian_fits:
+            fit_id = fit.get('_fit_id')
+            # Skip if this is a Listfit component (already handled above)
+            if fit.get('is_listfit_component'):
+                continue
+            
+            if fit_id and fit.get('covariance') is not None:
+                print(f"[DEBUG] Updating Gaussian fit {fit_id} with covariance shape {fit['covariance'].shape}")
+                param_names = ['Amplitude', 'Mean', 'StdDev']
+                self.fit_diagnostics_panel.fits_data[fit_id]['covariance'] = fit['covariance']
+                self.fit_diagnostics_panel.fits_data[fit_id]['parameter_names'] = param_names
+        
+        # Update Voigt fits with covariance (non-Listfit or component-level)
+        for fit in self.voigt_fits:
+            fit_id = fit.get('_fit_id')
+            # Skip if this is a Listfit component
+            if fit.get('is_listfit_component'):
+                continue
+            
+            if fit_id and fit.get('covariance') is not None:
+                print(f"[DEBUG] Updating Voigt fit {fit_id} with covariance shape {fit['covariance'].shape}")
+                param_names = ['Amplitude', 'Center', 'Sigma', 'Gamma']
+                self.fit_diagnostics_panel.fits_data[fit_id]['covariance'] = fit['covariance']
+                self.fit_diagnostics_panel.fits_data[fit_id]['parameter_names'] = param_names
+        
+        # Update Continuum fits with covariance (non-Listfit or component-level)
+        for fit in self.continuum_fits:
+            fit_id = fit.get('_fit_id')
+            # Skip if this is a Listfit component
+            if fit.get('is_listfit_component'):
+                continue
+            
+            if fit_id and fit.get('covariance') is not None:
+                print(f"[DEBUG] Updating Continuum fit {fit_id} with covariance shape {fit['covariance'].shape}")
+                poly_order = fit.get('poly_order', 1)
+                param_names = [f'c{i}' for i in range(poly_order + 1)]
+                self.fit_diagnostics_panel.fits_data[fit_id]['covariance'] = fit['covariance']
+                self.fit_diagnostics_panel.fits_data[fit_id]['parameter_names'] = param_names
+        
+        print(f"[DEBUG] _update_panel_with_covariance COMPLETE")
+    
+    def _update_diagnostics_for_loaded_fits(self):
+        """Update Fit Diagnostics panel for all loaded fits"""
+        if not hasattr(self, 'fit_diagnostics_panel') or not self.fit_diagnostics_panel:
+            print("[DEBUG] Fit Diagnostics panel not available")
+            return
+        
+        print(f"[DEBUG] _update_diagnostics_for_loaded_fits: gaussian_fits={len(self.gaussian_fits)}, voigt_fits={len(self.voigt_fits)}, continuum_fits={len(self.continuum_fits)}, listfit_fits={len(self.listfit_fits)}")
+        
+        # Update diagnostics for Gaussian fits
+        for i, fit in enumerate(self.gaussian_fits):
+            fit_id = fit.get('_fit_id')
+            print(f"[DEBUG] Gaussian fit {i}: _fit_id={fit_id}, keys={list(fit.keys())}")
+            if fit_id is None:
+                print(f"[DEBUG] Skipping Gaussian fit {i} - no _fit_id")
+                continue
+            
+            # Build diagnostics dict from loaded fit data
+            diagnostics = {}
+            if 'chi2_nu' in fit:
+                diagnostics['chi2_reduced'] = fit['chi2_nu']
+            elif 'chi2' in fit:
+                diagnostics['chi2_reduced'] = fit['chi2']
+            
+            # Use covariance if available
+            covariance = fit.get('covariance')
+            parameter_names = None
+            
+            # Call update to add row to diagnostics table
+            color = self.fit_colors.get(fit_id, '#000000')
+            print(f"[DEBUG] Calling update_fit_diagnostics for Gaussian {fit_id} with diagnostics={diagnostics}")
+            self.fit_diagnostics_panel.update_fit_diagnostics(
+                fit_id, 'gaussian', diagnostics, color,
+                covariance=covariance, parameter_names=parameter_names
+            )
+        
+        # Update diagnostics for Voigt fits
+        for i, fit in enumerate(self.voigt_fits):
+            fit_id = fit.get('_fit_id')
+            print(f"[DEBUG] Voigt fit {i}: _fit_id={fit_id}, keys={list(fit.keys())}")
+            if fit_id is None:
+                print(f"[DEBUG] Skipping Voigt fit {i} - no _fit_id")
+                continue
+            
+            diagnostics = {}
+            if 'chi2_nu' in fit:
+                diagnostics['chi2_reduced'] = fit['chi2_nu']
+            elif 'chi2' in fit:
+                diagnostics['chi2_reduced'] = fit['chi2']
+            
+            covariance = fit.get('covariance')
+            color = self.fit_colors.get(fit_id, '#000000')
+            print(f"[DEBUG] Calling update_fit_diagnostics for Voigt {fit_id} with diagnostics={diagnostics}")
+            self.fit_diagnostics_panel.update_fit_diagnostics(
+                fit_id, 'voigt', diagnostics, color,
+                covariance=covariance, parameter_names=None
+            )
+        
+        # Update diagnostics for Continuum fits
+        for i, fit in enumerate(self.continuum_fits):
+            fit_id = fit.get('_fit_id')
+            print(f"[DEBUG] Continuum fit {i}: _fit_id={fit_id}, keys={list(fit.keys())}")
+            if fit_id is None:
+                print(f"[DEBUG] Skipping Continuum fit {i} - no _fit_id")
+                continue
+            
+            diagnostics = {}
+            if 'chi2_nu' in fit:
+                diagnostics['chi2_reduced'] = fit['chi2_nu']
+            elif 'chi2' in fit:
+                diagnostics['chi2_reduced'] = fit['chi2']
+            
+            covariance = fit.get('covariance')
+            color = self.fit_colors.get(fit_id, '#000000')
+            print(f"[DEBUG] Calling update_fit_diagnostics for Continuum {fit_id} with diagnostics={diagnostics}")
+            self.fit_diagnostics_panel.update_fit_diagnostics(
+                fit_id, 'continuum', diagnostics, color,
+                covariance=covariance, parameter_names=None
+            )
+        
+        # Update diagnostics for Listfit fits (stored quality metrics)
+        for i, fit in enumerate(self.listfit_fits):
+            fit_id = fit.get('_fit_id')
+            print(f"[DEBUG] Listfit fit {i}: _fit_id={fit_id}")
+            if fit_id is None:
+                print(f"[DEBUG] Skipping Listfit fit {i} - no _fit_id")
+                continue
+            
+            # Extract quality metrics from listfit
+            quality_metrics = fit.get('quality_metrics', {})
+            diagnostics = {}
+            
+            if 'chisqr_red' in quality_metrics:
+                diagnostics['chi2_reduced'] = quality_metrics['chisqr_red']
+            elif 'chisqr' in quality_metrics:
+                diagnostics['chi2_reduced'] = quality_metrics['chisqr']
+            
+            if 'r_squared' in quality_metrics:
+                diagnostics['r_squared'] = quality_metrics['r_squared']
+            
+            if 'akaike' in quality_metrics:
+                diagnostics['akaike'] = quality_metrics['akaike']
+            
+            if 'bayesian' in quality_metrics:
+                diagnostics['bayesian'] = quality_metrics['bayesian']
+            
+            color = self.fit_colors.get(fit_id, '#000000')
+            self.fit_diagnostics_panel.update_fit_diagnostics(
+                fit_id, 'listfit', diagnostics, color,
+                covariance=None, parameter_names=None
+            )
     
     def _load_consolidated_fits_from_dataframe(self, df):
         """Load fits from consolidated DataFrame with 'type' column"""
@@ -2753,10 +3558,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.center_splitter = center_splitter
             self.setCentralWidget(center_splitter)
             
-            # Create tab widget for dockable Control Panel + Item Tracker + Settings + Smoothing
+            # Create tab widget for dockable Control Panel + Item Tracker + Settings + Smoothing + Fit Diagnostics
             top_tab_widget = QtWidgets.QTabWidget()
             top_tab_widget.addTab(self.control_panel_container, "Control Panel")
             top_tab_widget.addTab(self.item_tracker, "Item Tracker")
+            top_tab_widget.addTab(self.fit_diagnostics_panel, "Fit Diagnostics")
             top_tab_widget.addTab(self.settings_container, "Settings")
             top_tab_widget.addTab(self.smoothing_container, "Smoothing")
             
@@ -2810,11 +3616,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Set initial plot style to match the visible plot (step plot is displayed first)
         self.is_step_plot = True
         
-        # Only plot error if errors exist
+        # Plot error spectrum using the new display mode system
         if self.err is not None:
-            self.step_error, = self.ax.step(self.x_data, self.err, color=error_cfg['color'], linestyle=error_cfg['linestyle'], alpha=error_cfg['alpha'], label='Error', where='mid', zorder=0)
-            self.line_error, = self.ax.plot(self.x_data, self.err, color=error_cfg['color'], linestyle=error_cfg['linestyle'], alpha=error_cfg['alpha'], visible=False, zorder=0)
-            self.error_line = self.step_error if self.is_step_plot else self.line_error
+            self.redraw_error_spectrum()
         else:
             self.step_error = None
             self.line_error = None
@@ -3103,6 +3907,69 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         
         main_layout.addLayout(calculate_layout)
         
+        # ===== DISPLAY SECTION TITLE =====
+        display_title = QtWidgets.QLabel("Display")
+        display_title.setStyleSheet("font-weight: bold; font-size: 12px; color: #0078d4;")
+        main_layout.addWidget(display_title)
+        
+        display_layout = QtWidgets.QVBoxLayout()
+        display_layout.setContentsMargins(15, 5, 10, 10)
+        display_layout.setSpacing(8)
+        
+        # --- ERROR SPECTRUM SUBSECTION ---
+        error_spectrum_label = QtWidgets.QLabel("Error Spectrum")
+        error_spectrum_label.setStyleSheet("font-weight: bold; font-size: 11px;")
+        display_layout.addWidget(error_spectrum_label)
+        
+        error_spectrum_group = QtWidgets.QGroupBox()
+        error_spectrum_group.setStyleSheet("QGroupBox { border: none; margin: 0px; padding: 0px; }")
+        error_spectrum_group_layout = QtWidgets.QVBoxLayout()
+        error_spectrum_group_layout.setContentsMargins(10, 5, 10, 5)
+        error_spectrum_group_layout.setSpacing(4)
+        
+        # Radio button group for error spectrum display
+        self.error_spectrum_default_radio = QtWidgets.QRadioButton("Default (red dashed line)")
+        self.error_spectrum_default_radio.setChecked(True)
+        self.error_spectrum_default_radio.toggled.connect(self.on_error_spectrum_mode_changed)
+        error_spectrum_group_layout.addWidget(self.error_spectrum_default_radio)
+        
+        self.error_spectrum_shaded_radio = QtWidgets.QRadioButton("Shaded (gray band ±error)")
+        self.error_spectrum_shaded_radio.toggled.connect(self.on_error_spectrum_mode_changed)
+        error_spectrum_group_layout.addWidget(self.error_spectrum_shaded_radio)
+        
+        error_spectrum_group.setLayout(error_spectrum_group_layout)
+        display_layout.addWidget(error_spectrum_group)
+        
+        # --- RESIDUAL SUBSECTION ---
+        residual_label = QtWidgets.QLabel("Residual")
+        residual_label.setStyleSheet("font-weight: bold; font-size: 11px;")
+        display_layout.addWidget(residual_label)
+        
+        residual_group = QtWidgets.QGroupBox()
+        residual_group.setStyleSheet("QGroupBox { border: none; margin: 0px; padding: 0px; }")
+        residual_group_layout = QtWidgets.QVBoxLayout()
+        residual_group_layout.setContentsMargins(10, 5, 10, 5)
+        residual_group_layout.setSpacing(4)
+        
+        # Radio button group for residual display
+        self.residual_none_radio = QtWidgets.QRadioButton("None (default behavior)")
+        self.residual_none_radio.setChecked(True)
+        self.residual_none_radio.toggled.connect(self.on_residual_display_mode_changed)
+        residual_group_layout.addWidget(self.residual_none_radio)
+        
+        self.residual_sigma_radio = QtWidgets.QRadioButton("Sigma (residual / error)")
+        self.residual_sigma_radio.toggled.connect(self.on_residual_display_mode_changed)
+        residual_group_layout.addWidget(self.residual_sigma_radio)
+        
+        self.residual_shaded_radio = QtWidgets.QRadioButton("Shaded")
+        self.residual_shaded_radio.toggled.connect(self.on_residual_display_mode_changed)
+        residual_group_layout.addWidget(self.residual_shaded_radio)
+        
+        residual_group.setLayout(residual_group_layout)
+        display_layout.addWidget(residual_group)
+        
+        main_layout.addLayout(display_layout)
+        
         # --- DEACTIVATE ALL BUTTON ---
         main_layout.addSpacing(5)
         deactivate_button_layout = QtWidgets.QVBoxLayout()
@@ -3220,6 +4087,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         if mode_text == "":
             # Deactivated - exit continuum mode
             self.continuum_mode = False
+            self.current_continuum_fit_id = None  # Clear fit tracking
             self.continuum_regions = []
             for patch_info in self.continuum_patches:
                 if 'patch' in patch_info:
@@ -3233,6 +4101,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         elif mode_text == "Continuum Region(s)":
             # Activate continuum mode (same as pressing 'm')
             self.continuum_mode = True
+            self.current_continuum_fit_id = self.next_fit_id()  # Assign new fit_id for this session
+            self.assign_fit_color(self.current_continuum_fit_id)
             self.continuum_regions = []
             self.continuum_patches = []
             self.continuum_enter_button.setEnabled(True)
@@ -3500,12 +4370,21 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.record_action('fit_continuum', f'Fit Continuum (order {self.poly_order})')
         
         # Save fit to .qsap file and print
-        self.save_and_print_qsap_fit(continuum_fit, 'Continuum', 'Single')
+        # Convert curve_fit covariance to lmfit-like format
+        pcov_from_dict = continuum_fit.get('covariance')
+        if pcov_from_dict is not None:
+            param_names = [f'p0_c{i}' for i in range(len(coeffs))]
+            param_values = list(coeffs)
+            mock_result = self._convert_curve_fit_to_lmfit_like(param_names, param_values, pcov_from_dict)
+            self.save_and_print_qsap_fit(continuum_fit, 'Continuum', 'Single', lmfit_result=mock_result)
+        else:
+            self.save_and_print_qsap_fit(continuum_fit, 'Continuum', 'Single')
         
         # Clean up and deactivate
         self.continuum_regions = []
         self.continuum_patches = []
         self.continuum_mode = False
+        self.current_continuum_fit_id = None  # Clear fit tracking
         
         # Reset dropdown to blank
         self.continuum_mode_dropdown.blockSignals(True)
@@ -3588,6 +4467,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Deactivate continuum mode if active
         if self.continuum_mode:
             self.continuum_mode = False
+            self.current_continuum_fit_id = None  # Clear fit tracking
             self.continuum_regions = []
             # Remove patches
             for patch_info in self.continuum_patches:
@@ -3797,11 +4677,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             from scipy.optimize import curve_fit
             params, pcov = curve_fit(self.multi_gaussian, comp_xs, continuum_subtracted_ys, sigma=sigma_param, p0=initial_guesses, bounds=(lower_bounds, upper_bounds))
             perr = np.sqrt(np.diag(pcov))
+            
+            # Store full pcov for later use when saving to .qsap
+            self._multi_gaussian_full_pcov = pcov
+            self._multi_gaussian_param_names = []
+            
             for i in range(0, len(params), 3):
                 amp, mean, stddev = params[i:i+3]
                 amp_err, mean_err, stddev_err = perr[i:i+3]
                 x_fit = self.x_data[(self.x_data >= bound_pairs[i // 3][0]) & (self.x_data <= bound_pairs[i // 3][1])]
-                y_fit = self.gaussian(x_fit, amp, mean, stddev) + continuum_ys[i // 3]
+                y_fit_plot = self.gaussian(x_fit, amp, mean, stddev)  # For display (without continuum offset)
                 continuum_sub_data = comp_ys[i // 3] - continuum_ys[i // 3]
                 residuals = continuum_sub_data - self.gaussian(x_fit, amp, mean, stddev)
                 # Calculate chi2 (simpler without errors since they're concatenated)
@@ -3812,12 +4697,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 comp_cov_indices = [i, i+1, i+2]
                 comp_cov = pcov[np.ix_(comp_cov_indices, comp_cov_indices)]
                 
+                # Track parameter names for covariance storage
+                g_idx = i // 3
+                self._multi_gaussian_param_names.extend([f'g{g_idx}_amp', f'g{g_idx}_mu', f'g{g_idx}_sigma'])
+                
                 # DEBUG: Verify covariance structure
                 print(f"[DEBUG] Multi-Gaussian component {self.component_id}: comp_cov shape = {comp_cov.shape}, has_data = {comp_cov is not None}")
                 
                 # Lazy import of scipy for interpolation
                 from scipy.interpolate import interp1d
-                interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
+                interpolator = interp1d(x_fit, y_fit_plot, kind='cubic', bounds_error=False, fill_value='extrapolate')
                 x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                 y_plt = interpolator(x_plt)
                 gaussian_cfg = self.colors['profiles']['gaussian']
@@ -3868,7 +4757,18 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     has_bounds = 'bounds' in comp
                     has_covariance = 'covariance' in comp
                     print(f"[DEBUG] Multi-Gaussian component {idx}: has_bounds={has_bounds}, has_covariance={has_covariance}")
-                self.save_and_print_qsap_fit(multi_gaussian_components, 'Gaussian', 'Multi-Gaussian')
+                
+                # Convert full curve_fit covariance to lmfit-like format
+                if hasattr(self, '_multi_gaussian_full_pcov') and self._multi_gaussian_full_pcov is not None:
+                    param_names = self._multi_gaussian_param_names if hasattr(self, '_multi_gaussian_param_names') else []
+                    param_values = list(params)  # All parameter values from curve_fit
+                    if param_names and len(param_names) == len(param_values):
+                        mock_result = self._convert_curve_fit_to_lmfit_like(param_names, param_values, self._multi_gaussian_full_pcov)
+                        self.save_and_print_qsap_fit(multi_gaussian_components, 'Gaussian', 'Multi-Gaussian', lmfit_result=mock_result)
+                    else:
+                        self.save_and_print_qsap_fit(multi_gaussian_components, 'Gaussian', 'Multi-Gaussian')
+                else:
+                    self.save_and_print_qsap_fit(multi_gaussian_components, 'Gaussian', 'Multi-Gaussian')
             
             self.fit_id += 1
             # Clear bound lines after fit
@@ -3984,6 +4884,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.ax.set_xlim(self.x_lower_bound, self.x_upper_bound)
         if self.is_residual_shown:
             self.residual_ax.set_xlim(self.x_lower_bound, self.x_upper_bound)
+            # Redraw residual panel to recalculate y-limits for new x-range
+            self.redraw_residual_panel()
         self.ax.set_ylim(self.y_lower_bound, self.y_upper_bound)
         self.fig.canvas.draw_idle()
 
@@ -4198,14 +5100,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.step_spec.set_visible(self.is_step_plot)
         self.line_spec.set_visible(not self.is_step_plot)
         
-        if self.step_error is not None:
-            self.step_error.set_visible(self.is_step_plot)
-        if self.line_error is not None:
-            self.line_error.set_visible(not self.is_step_plot)
+        # Redraw error spectrum for both Default and Shaded modes
+        # (Shaded mode needs to be cleared and redrawn to maintain correct styling)
+        if self.err is not None:
+            self.redraw_error_spectrum()
         
         self.spectrum_line = self.step_spec if self.is_step_plot else self.line_spec
-        if self.step_error is not None:
-            self.error_line = self.step_error if self.is_step_plot else self.line_error
+        
+        # Redraw residual panel if visible (to use correct step/line style)
+        if self.is_residual_shown:
+            self.redraw_residual_panel()
         
         self.fig.canvas.draw_idle()
         print("Plot style toggled:", "Step plot" if self.is_step_plot else "Line plot")
@@ -4274,6 +5178,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     x_range = self.x_data[(self.x_data >= left_bound) & (self.x_data <= right_bound)]
                     if 'coeffs' in continuum_fit:
                         # New format with polynomial coefficients
+                        # Coefficients stored as [c_N, c_{N-1}, ..., c_1, c_0] (high-to-low order, as np.polyval expects)
                         continuum_vals = np.polyval(continuum_fit['coeffs'], x_range)
                         return continuum_vals, continuum_fit['coeffs'][0], continuum_fit['coeffs'][-1]
                     else:
@@ -4406,25 +5311,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         return ew, ew_r
 
     def calculate_and_plot_residuals(self):
-        self.residuals = self.calculate_residuals()  # Custom function to calculate residuals
-        # Clear previous lines before plotting new ones
-        self.residual_ax.clear()
-        # Update plot
-        residual_cfg = self.colors['residual']
-        ref_cfg = self.colors['reference_lines']
-        self.residual_line, = self.residual_ax.step(self.x_data, self.residuals, color=residual_cfg['color'], where='mid')
-        self.residual_ax.plot(self.x_data, [0] * len(self.x_data), color=ref_cfg['color'], linestyle=ref_cfg['linestyle'], linewidth=ref_cfg['linewidth']) # Add horizontal line at y=0
-        # Restore labels after clear
-        if self.is_velocity_mode:
-            self.residual_ax.set_xlabel(r"Velocity (km s$^{-1}$)")
-        else:
-            self.residual_ax.set_xlabel(self._get_wavelength_unit_label())
-        self.residual_ax.set_ylabel("Residuals")
-        self.update_bounds()
-        self.update_residual_ticks()  # Update ticks to look nice
-        self.update_residual_ybounds()  # Update y-bounds to look nice
-        if self.is_velocity_mode:
-            self.residual_line.set_xdata(self.velocities)
+        """Legacy method - delegates to redraw_residual_panel for consistent plot styling"""
+        self.residuals = self.calculate_residuals()
+        # Use the new redraw method to ensure consistent styling with plot mode
+        self.redraw_residual_panel()
+    
         
     def toggle_residual_panel(self):
         """Toggle residual panel on/off. When shown, spectrum shrinks to make room."""
@@ -4549,7 +5440,17 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     continue  # No data points in this range
                 comp_x = self.x_data[mask]
                 coeffs = continuum_fit['coeffs']
-                continuum_sum[mask] = np.polyval(coeffs, comp_x)
+                
+                # Handle Chebyshev vs polynomial
+                if continuum_fit.get('type') == 'chebyshev':
+                    # CHEBYSHEV: Use chebval with domain rescaling
+                    lam_min = continuum_fit.get('lam_min', left_bound)
+                    lam_max = continuum_fit.get('lam_max', right_bound)
+                    x_rescaled = 2 * (comp_x - lam_min) / (lam_max - lam_min) - 1
+                    continuum_sum[mask] += np.polynomial.chebyshev.chebval(x_rescaled, coeffs)
+                else:
+                    # POLYNOMIAL: Coefficients stored as [c_N, ..., c_1, c_0] (high-to-low), use directly with polyval
+                    continuum_sum[mask] += np.polyval(coeffs, comp_x)
 
         # Add Listfit polynomial components to residuals (all active components)
         listfit_poly_sum = np.zeros_like(self.spec)
@@ -4565,19 +5466,26 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 comp_x = self.x_data[mask]
                 components = listfit['components']
                 
-                # Add polynomial components from the listfit (already filtered - deleted ones removed)
-                poly_count = 0
+                # Add polynomial and Chebyshev components from the listfit (already filtered - deleted ones removed)
                 for comp in components:
                     if comp['type'] == 'polynomial':
                         order = comp.get('order', 1)
                         # Get stored coefficients from component (precomputed during fit)
                         poly_coeffs = comp.get('coeffs', [])
                         if poly_coeffs:
-                            # Reverse coefficients for np.polyval (expects highest order first)
-                            poly_coeffs_reversed = poly_coeffs[::-1]
-                            y_poly = np.polyval(poly_coeffs_reversed, comp_x)
+                            # Coefficients stored as [c_N, ..., c_1, c_0] (high-to-low), use directly with polyval
+                            y_poly = np.polyval(poly_coeffs, comp_x)
                             listfit_poly_sum[mask] += y_poly
-                        poly_count += 1
+                    elif comp['type'] == 'chebyshev':
+                        # CHEBYSHEV: Use chebval with domain rescaling
+                        degree = comp.get('degree', 1)
+                        cheb_coeffs = comp.get('coeffs', [])
+                        if cheb_coeffs:
+                            lam_min = comp.get('lam_min', left_bound)
+                            lam_max = comp.get('lam_max', right_bound)
+                            x_rescaled = 2 * (comp_x - lam_min) / (lam_max - lam_min) - 1
+                            y_cheb = np.polynomial.chebyshev.chebval(x_rescaled, cheb_coeffs)
+                            listfit_poly_sum[mask] += y_cheb
 
         # Calculate residual as (spectrum - fitted Gaussians - Voigts - continuum - listfit polynomials)
         return self.spec - gaussian_sum - voigt_sum - continuum_sum - listfit_poly_sum
@@ -4895,6 +5803,200 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         params are coefficients for polynomial from highest to lowest order.
         """
         return np.polyval(params, x)
+
+    # ============================================================================
+    # Fit Diagnostics & Management Methods
+    # ============================================================================
+    
+    def next_fit_id(self):
+        """Increment and return next unique fit ID"""
+        self.fit_counter += 1
+        return self.fit_counter
+    
+    def assign_fit_color(self, fit_id):
+        """Assign a unique color to a fit (cycles through palette)"""
+        if fit_id not in self.fit_colors:
+            color_idx = (fit_id - 1) % len(self.FIT_COLORS)
+            self.fit_colors[fit_id] = self.FIT_COLORS[color_idx]
+        return self.fit_colors[fit_id]
+    
+    def _register_loaded_fit_metadata(self, fit_id, fit_type_str, quality_metrics):
+        """Register metadata for a loaded fit into Fit Diagnostics
+        
+        Args:
+            fit_id: Unique fit identifier
+            fit_type_str: String describing fit type ('Single Gaussian', 'Listfit', etc.)
+            quality_metrics: Dict with keys chi2, chi2_reduced, r_squared, akaike, bayesian, n_params, n_data
+        """
+        # Extract from quality metrics (from FIT_DIAGNOSTICS in QSAP)
+        chi2 = quality_metrics.get('chi2')
+        chi2_reduced = quality_metrics.get('chi2_reduced')
+        r_squared = quality_metrics.get('r_squared')
+        akaike = quality_metrics.get('akaike')
+        bayesian = quality_metrics.get('bayesian')
+        n_params = quality_metrics.get('n_params')
+        n_data = quality_metrics.get('n_data')
+        
+        # If n_data not from diagnostics, use spectrum length
+        if n_data is None:
+            n_data = len(self.wav) if hasattr(self, 'wav') and len(self.wav) > 0 else None
+        
+        print(f"[DEBUG] _register_loaded_fit_metadata: fit_id={fit_id}, type={fit_type_str}, n_params={n_params}, n_data={n_data}")
+        print(f"[DEBUG]   chi2={chi2}, chi2_reduced={chi2_reduced}, r_squared={r_squared}, akaike={akaike}, bayesian={bayesian}")
+        
+        # Build diagnostics dict with what we have
+        diagnostics_dict = {
+            'r_squared': r_squared,
+            'chi2_reduced': chi2_reduced,
+            'akaike': akaike,
+            'bayesian': bayesian,
+            'n_params': n_params,
+            'n_data': n_data,
+            'covariance': None,  # Will be populated later by _distribute_covariance_to_fits
+        }
+        
+        # Call register_fit_metadata to populate fit_metadata and Fit Diagnostics panel
+        self.register_fit_metadata(fit_id, fit_type_str, diagnostics_dict)
+    
+    def register_fit_metadata(self, fit_id, fit_type, diagnostics_dict):
+        """Store fit metadata for Fit Diagnostics tab
+        
+        Args:
+            fit_id: Unique fit identifier
+            fit_type: String describing fit type ('Single Gaussian', 'Multi-Gaussian', 'Listfit', etc.)
+            diagnostics_dict: Dict with keys:
+                - r_squared: R² goodness of fit
+                - chi2_reduced: Reduced χ²
+                - akaike: AIC value
+                - bayesian: BIC value
+                - n_params: Number of free parameters
+                - n_data: Number of data points
+                - covariance: Covariance matrix (for condition number calculation)
+        """
+        from datetime import datetime
+        
+        print(f"[DEBUG] register_fit_metadata called: fit_id={fit_id}, fit_type={fit_type}")
+        print(f"[DEBUG] fit_diagnostics_panel exists: {hasattr(self, 'fit_diagnostics_panel')}")
+        if hasattr(self, 'fit_diagnostics_panel'):
+            print(f"[DEBUG] fit_diagnostics_panel value: {self.fit_diagnostics_panel}")
+        
+        # Calculate condition number if covariance available
+        cond_num = None
+        if diagnostics_dict.get('covariance') is not None:
+            try:
+                cov_array = np.array(diagnostics_dict['covariance'], dtype=float)
+                if cov_array.size > 0:
+                    eigenvals = np.linalg.eigvalsh(cov_array)
+                    eigenvals = eigenvals[eigenvals > 1e-15]  # Filter near-zero eigenvalues
+                    if len(eigenvals) > 0:
+                        cond_num = np.max(eigenvals) / (np.min(eigenvals) + 1e-30)
+            except (np.linalg.LinAlgError, ValueError):
+                cond_num = None
+        
+        # Determine flag (Green/Yellow/Red)
+        flag = self._compute_fit_flag(
+            diagnostics_dict.get('r_squared'),
+            diagnostics_dict.get('chi2_reduced'),
+            cond_num,
+            diagnostics_dict.get('n_params'),
+            diagnostics_dict.get('n_data')
+        )
+        
+        self.fit_metadata[fit_id] = {
+            'type': fit_type,
+            'r_squared': diagnostics_dict.get('r_squared'),
+            'chi2_reduced': diagnostics_dict.get('chi2_reduced'),
+            'akaike': diagnostics_dict.get('akaike'),
+            'bayesian': diagnostics_dict.get('bayesian'),
+            'n_params': diagnostics_dict.get('n_params'),
+            'n_data': diagnostics_dict.get('n_data'),
+            'condition_num': cond_num,
+            'flag': flag,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        # Assign color if not already assigned
+        if fit_id not in self.fit_colors:
+            self.assign_fit_color(fit_id)
+        
+        # Update Fit Diagnostics panel
+        diagnostics_for_panel = {
+            'r_squared': diagnostics_dict.get('r_squared'),
+            'chi2_reduced': diagnostics_dict.get('chi2_reduced'),
+            'akaike': diagnostics_dict.get('akaike'),
+            'bayesian': diagnostics_dict.get('bayesian'),
+            'n_params': diagnostics_dict.get('n_params'),
+            'n_data': diagnostics_dict.get('n_data'),
+            'condition_num': cond_num,
+            'flag': flag,
+        }
+        
+        # Extract covariance and parameter names for visualization
+        covariance = diagnostics_dict.get('covariance')
+        parameter_names = diagnostics_dict.get('parameter_names')
+        
+        print(f"[DEBUG] About to call update_fit_diagnostics with:")
+        print(f"[DEBUG]   fit_id={fit_id}")
+        print(f"[DEBUG]   fit_type={fit_type}")
+        print(f"[DEBUG]   diagnostics_for_panel keys={list(diagnostics_for_panel.keys())}")
+        print(f"[DEBUG]   fit_colors[fit_id]={self.fit_colors.get(fit_id, 'NOT FOUND')}")
+        
+        self.fit_diagnostics_panel.update_fit_diagnostics(
+            fit_id, fit_type, diagnostics_for_panel, self.fit_colors[fit_id],
+            covariance=covariance, parameter_names=parameter_names
+        )
+        
+        print(f"[DEBUG] update_fit_diagnostics call completed")
+        print(f"[DEBUG] fit_diagnostics_panel.fits_data now contains: {list(self.fit_diagnostics_panel.fits_data.keys())}")
+
+    
+    def _compute_fit_flag(self, r2, chi2_red, cond_num, n_params, n_data):
+        """Compute diagnostic flag (Green/Yellow/Red) based on fit metrics"""
+        flags = []
+        
+        # R² check
+        if r2 is not None:
+            if r2 < 0.5:
+                flags.append('Red')  # Poor fit
+            elif r2 < 0.8:
+                flags.append('Yellow')  # Marginal
+            # else Green (good fit)
+        
+        # Condition number check (indicates ill-conditioning)
+        if cond_num is not None and cond_num > 100:
+            flags.append('Yellow' if len(flags) == 0 else ('Red' if 'Red' in flags else 'Yellow'))
+        
+        # Degrees of freedom check
+        if n_params is not None and n_data is not None:
+            dof = n_data - n_params
+            if dof < 1:
+                flags.append('Red')  # Insufficient degrees of freedom
+        
+        # Return most severe flag, default to Green
+        if 'Red' in flags:
+            return '🔴 Red'
+        elif 'Yellow' in flags:
+            return '🟡 Yellow'
+        else:
+            return '🟢 Green'
+    
+    def add_fit_item(self, fit_id, item_id):
+        """Track that an item belongs to a fit"""
+        if fit_id not in self.fit_items:
+            self.fit_items[fit_id] = set()
+        self.fit_items[fit_id].add(item_id)
+    
+    def remove_fit_if_empty(self, fit_id):
+        """Remove fit from Fit Diagnostics if it has no items left"""
+        if fit_id in self.fit_items:
+            if len(self.fit_items[fit_id]) == 0:
+                # Remove from tracking dicts
+                self.fit_items.pop(fit_id, None)
+                self.fit_metadata.pop(fit_id, None)
+                self.fit_colors.pop(fit_id, None)
+                # Notify Fit Diagnostics panel to remove the fit
+                if hasattr(self, 'fit_diagnostics_panel') and self.fit_diagnostics_panel:
+                    self.fit_diagnostics_panel.remove_fit(fit_id)
 
     # Define a function to fit the continuum
     def fit_continuum(self, x, y, err, sigma_threshold=2, max_iterations=10, tolerance=1e-4, poly_order=None):
@@ -5350,10 +6452,30 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.redshift_selected_line = None
             plt.draw()
         
-    def register_item(self, item_type, name, fit_dict=None, line_obj=None, patch_obj=None, position='', color='gray', bounds=None):
-        """Register an item with the tracker"""
+    def register_item(self, item_type, name, fit_dict=None, line_obj=None, patch_obj=None, position='', color='gray', bounds=None, fit_id=None):
+        """Register an item with the tracker
+        
+        Args:
+            item_type: Type of item ('gaussian', 'voigt', 'polynomial', 'marker', etc.)
+            name: Display name
+            fit_dict: Associated fit data dictionary
+            line_obj: Line object reference
+            patch_obj: Patch object reference
+            position: Position/bounds description
+            color: Line/patch color
+            bounds: Wavelength bounds
+            fit_id: Optional fit ID to group items. If None, creates new fit.
+        """
         item_id = f"{item_type}_{self.item_id_counter}"
         self.item_id_counter += 1
+        
+        # Assign or create fit_id
+        if fit_id is None:
+            fit_id = self.next_fit_id()
+        self.add_fit_item(fit_id, item_id)
+        
+        # Get fit color
+        fit_color = self.assign_fit_color(fit_id)
         
         # Store original linewidth for restoration on deselection
         original_linewidth = None
@@ -5372,61 +6494,268 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             'color': color,
             'bounds': bounds,
             'original_linewidth': original_linewidth,
-            'original_zorder': line_obj.get_zorder() if line_obj else None
+            'original_zorder': line_obj.get_zorder() if line_obj else None,
+            'fit_id': fit_id
         }
-        self.item_tracker.add_item(item_id, item_type, name, position=position, color=color, line_obj=line_obj)
+        # Store fit_id in the fit_dict so we can retrieve it later for redraws
+        if fit_dict is not None:
+            fit_dict['_fit_id'] = fit_id
+        self.item_tracker.add_item(item_id, item_type, name, position=position, color=color, line_obj=line_obj, 
+                                   fit_id=fit_id, fit_color=fit_color)
         # Also add to Fit Information window
         self.fit_information_window.add_fit(item_id, item_type, fit_dict, name)
         return item_id
     
+    def _extract_listfit_diagnostics(self, lmfit_result):
+        """Extract diagnostic metrics directly from lmfit result object
+        
+        Args:
+            lmfit_result: lmfit.model.ModelResult object
+            
+        Returns:
+            Dictionary with diagnostic metrics for registration
+        """
+        diagnostics = {}
+        
+        # Extract reduced chi-squared
+        if hasattr(lmfit_result, 'redchi') and lmfit_result.redchi is not None:
+            diagnostics['chi2_reduced'] = float(lmfit_result.redchi)
+        else:
+            diagnostics['chi2_reduced'] = None
+        
+        # Extract R-squared
+        if hasattr(lmfit_result, 'rsquared') and lmfit_result.rsquared is not None:
+            diagnostics['r_squared'] = float(lmfit_result.rsquared)
+        else:
+            diagnostics['r_squared'] = None
+        
+        # Extract AIC and BIC
+        if hasattr(lmfit_result, 'aic') and lmfit_result.aic is not None:
+            diagnostics['akaike'] = float(lmfit_result.aic)
+        else:
+            diagnostics['akaike'] = None
+        
+        if hasattr(lmfit_result, 'bic') and lmfit_result.bic is not None:
+            diagnostics['bayesian'] = float(lmfit_result.bic)
+        else:
+            diagnostics['bayesian'] = None
+        
+        # Extract number of parameters and data points
+        if hasattr(lmfit_result, 'nvarys') and lmfit_result.nvarys is not None:
+            diagnostics['n_params'] = int(lmfit_result.nvarys)
+        else:
+            diagnostics['n_params'] = 0
+        
+        if hasattr(lmfit_result, 'ndata') and lmfit_result.ndata is not None:
+            diagnostics['n_data'] = int(lmfit_result.ndata)
+        else:
+            diagnostics['n_data'] = 0
+        
+        # Extract covariance matrix
+        if hasattr(lmfit_result, 'covar') and lmfit_result.covar is not None:
+            diagnostics['covariance'] = lmfit_result.covar
+        else:
+            diagnostics['covariance'] = None
+        
+        # Extract parameter names from the result
+        # IMPORTANT: Use var_names (free parameters only) to match covariance matrix size
+        if hasattr(lmfit_result, 'var_names') and lmfit_result.var_names is not None:
+            # var_names contains only FREE parameters, which matches covariance dimensions
+            diagnostics['parameter_names'] = list(lmfit_result.var_names)
+        elif hasattr(lmfit_result, 'params') and lmfit_result.params is not None:
+            # Fallback: extract free parameter names from params
+            diagnostics['parameter_names'] = [name for name in lmfit_result.params.keys() 
+                                            if lmfit_result.params[name].vary]
+        else:
+            diagnostics['parameter_names'] = None
+        
+        return diagnostics
+    
+    def _extract_fit_diagnostics(self, fit_data, fit_type):
+        """Extract diagnostic metrics from fit data dict
+        
+        Args:
+            fit_data: Dictionary with fit parameters (chi2, chi2_nu, covariance, etc.)
+            fit_type: Type of fit ('Gaussian', 'Voigt', 'Continuum', 'Listfit')
+            
+        Returns:
+            Dictionary with diagnostic metrics for registration
+        """
+        diagnostics = {}
+        
+        # Extract chi2 reduced
+        diagnostics['chi2_reduced'] = fit_data.get('chi2_nu', fit_data.get('chi2', None))
+        
+        # Calculate R² from chi2_nu if possible
+        # R² = 1 - (chi2 / (n_data - 1)) / (variance of y)
+        # For now, estimate from chi2_nu: lower chi2_nu = higher R²
+        chi2_nu = fit_data.get('chi2_nu', fit_data.get('chi2', 0))
+        if chi2_nu is not None and chi2_nu > 0:
+            # Rough estimate: R² ≈ 1 - (chi2_nu / 100) clamped to [0, 1]
+            # Better estimate would need the actual y values
+            diagnostics['r_squared'] = max(0, min(1, 1 - chi2_nu / 100))
+        else:
+            diagnostics['r_squared'] = None
+        
+        # Extract or calculate AIC/BIC
+        n_params = 0
+        if fit_type in ['Gaussian', 'Voigt']:
+            n_params = 3  # amplitude, mean, stddev/FWHM
+        elif fit_type == 'Continuum':
+            n_params = fit_data.get('poly_order', 1) + 1
+        elif fit_type == 'Listfit':
+            # For Listfit, count parameters by looking at the 'type' field
+            comp_type = fit_data.get('type', 'unknown').lower()
+            if comp_type == 'gaussian' or comp_type == 'voigt':
+                n_params = 3
+            elif comp_type == 'polynomial':
+                n_params = fit_data.get('poly_order', 1) + 1
+        
+        diagnostics['n_params'] = n_params
+        
+        # Estimate n_data from bounds if available
+        n_data = None
+        if 'bounds' in fit_data:
+            left, right = fit_data['bounds']
+            mask = (self.x_data >= left) & (self.x_data <= right)
+            n_data = np.sum(mask)
+        diagnostics['n_data'] = n_data if n_data else 0
+        
+        # Calculate AIC and BIC if we have chi2 and n_data
+        chi2 = fit_data.get('chi2', 0)
+        if n_data and n_params:
+            k = n_params
+            n = n_data
+            diagnostics['akaike'] = chi2 + 2 * k  # AIC = chi2 + 2k
+            diagnostics['bayesian'] = chi2 + k * np.log(n)  # BIC = chi2 + k*ln(n)
+        else:
+            diagnostics['akaike'] = None
+            diagnostics['bayesian'] = None
+        
+        # Extract covariance matrix
+        diagnostics['covariance'] = fit_data.get('covariance', None)
+        
+        # Generate parameter names based on fit type
+        parameter_names = self._generate_parameter_names(fit_type, fit_data)
+        diagnostics['parameter_names'] = parameter_names
+        
+        return diagnostics
+    
+    def _generate_parameter_names(self, fit_type, fit_data):
+        """Generate parameter names based on fit type
+        
+        Args:
+            fit_type: Type of fit ('Gaussian', 'Voigt', 'Continuum', 'Listfit')
+            fit_data: Fit data dictionary
+            
+        Returns:
+            List of parameter names
+        """
+        names = []
+        
+        if fit_type.lower() == 'gaussian':
+            names = ['amplitude', 'mean', 'sigma']
+        elif fit_type.lower() == 'voigt':
+            names = ['amplitude', 'center', 'sigma', 'gamma']
+        elif fit_type.lower() == 'continuum':
+            poly_order = fit_data.get('poly_order', 1)
+            # Generate polynomial coefficient names (c0, c1, c2, etc.)
+            names = [f'c{i}' for i in range(poly_order + 1)]
+        elif fit_type.lower() == 'listfit':
+            # For listfit, get parameter names from fit_data if available
+            if 'param_names' in fit_data:
+                names = fit_data['param_names']
+            else:
+                # Fallback: generate based on component types
+                comp_type = fit_data.get('type', 'unknown').lower()
+                if comp_type == 'gaussian':
+                    names = ['amplitude', 'mean', 'sigma']
+                elif comp_type == 'voigt':
+                    names = ['amplitude', 'center', 'sigma', 'gamma']
+                elif comp_type == 'polynomial':
+                    poly_order = fit_data.get('poly_order', 1)
+                    names = [f'c{i}' for i in range(poly_order + 1)]
+        
+        return names if names else None
+    
     def unregister_item(self, item_id):
-        """Remove item from tracker"""
+        """Remove item from tracker and cleanup fits if empty"""
         if item_id in self.item_id_map:
+            # Get fit_id before deleting
+            fit_id = self.item_id_map[item_id].get('fit_id')
+            
             del self.item_id_map[item_id]
             # Only call item_tracker.remove_item if the item is still in the tracker
             # (to avoid double-removal during clear_all operations)
             if item_id in self.item_tracker.items:
                 self.item_tracker.remove_item(item_id)
             self.fit_information_window.remove_fit(item_id)
+            
+            # Remove item from fit tracking and check if fit is now empty
+            if fit_id is not None:
+                if fit_id in self.fit_items:
+                    self.fit_items[fit_id].discard(item_id)
+                
+                # Clean up lmfit result object if this is the last item from this fit
+                if fit_id in self.fit_items and len(self.fit_items[fit_id]) == 0:
+                    # Remove the fit's lmfit result to avoid memory leaks
+                    if fit_id in self.lmfit_results:
+                        del self.lmfit_results[fit_id]
+                # Remove fit from diagnostics if no items left
+                self.remove_fit_if_empty(fit_id)
         
         # Clean up highlighting tracking if this item was highlighted
         if item_id in self.highlighted_item_ids:
             self.highlighted_item_ids.discard(item_id)
     
-    def save_and_print_qsap_fit(self, fit_data, fit_type, fit_mode='Single'):
+    def save_and_print_qsap_fit(self, fit_data, fit_type, fit_mode='Single', lmfit_result=None):
         """Save fit to .qsap file and print contents to terminal
         
         Args:
             fit_data: Single dict or list of dicts with fit parameters
             fit_type: 'Gaussian', 'Voigt', 'Continuum', or 'Listfit'
             fit_mode: 'Single', 'Multi-Gaussian', 'Listfit', etc.
+            lmfit_result: Optional lmfit result object for extracting covariance and tie info
             
         Returns:
             Tuple of (filepath, file_content)
         """
+        # Initialize continuum_fit_dict for all paths (needed for EW calculation)
+        continuum_fit_dict = None
+        
         # Calculate equivalent width using Monte Carlo error propagation
         # Only if "Calculate EW automatically" checkbox is enabled
         if self.calculate_ew_enabled and fit_type in ['Gaussian', 'Voigt', 'Listfit']:
-            # Get the continuum fit to use for EW calculation
-            continuum_fit_dict = None
-            if self.continuum_fits:
-                # Use the most recent continuum fit
-                continuum_fit_dict = self.continuum_fits[-1]
-            
             if isinstance(fit_data, list):
+                # For Listfit, extract continuum from the component list
+                if fit_type == 'Listfit':
+                    # Find the polynomial or chebyshev component in the listfit_fit_data
+                    for component in fit_data:
+                        if component.get('type') in ['polynomial', 'chebyshev']:
+                            continuum_fit_dict = component
+                            break
+                else:
+                    # For non-listfit types, use the most recent continuum fit from self.continuum_fits
+                    if self.continuum_fits:
+                        continuum_fit_dict = self.continuum_fits[-1]
+                
                 for fit in fit_data:
                     # For Listfit, extract the actual profile type from the component
                     if fit_type == 'Listfit':
                         component_type = fit.get('type', '').lower()
+                        print(f"[DEBUG_EW_LOOP] Processing component type: {component_type}")
                         # Skip non-profile components (polynomial, masks, diagnostics)
                         if component_type not in ['gaussian', 'voigt']:
+                            print(f"[DEBUG_EW_LOOP] Skipping non-profile component type: {component_type}")
                             continue
-                        # Skip EW calculation for listfit components here
-                        # (we have a dedicated auto EW feature that runs during perform_listfit)
-                        continue
-                    
-                    # For non-listfit types (Multi-Gaussian, Multi-Voigt), use the provided fit_type
-                    component_fit_type = fit_type.lower()
+                        # For Listfit, only attempt EW if we have proper continuum info
+                        component_fit_type = component_type
+                        # Set component_id if not already present
+                        if 'component_id' not in fit:
+                            fit['component_id'] = fit.get('symbol', '?')
+                    else:
+                        # For non-listfit types (Multi-Gaussian, Multi-Voigt), use the provided fit_type
+                        component_fit_type = fit_type.lower()
                     
                     # DEBUG: Check structure of fit dict
                     component_id = fit.get('component_id', '?')
@@ -5461,6 +6790,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     except Exception as e:
                         print(f"[EW] Error calculating EW for component {component_id}: {e}")
             else:
+                # For single Gaussian/Voigt fits, get the most recent continuum fit
+                if fit_type in ['Gaussian', 'Voigt']:
+                    if self.continuum_fits:
+                        continuum_fit_dict = self.continuum_fits[-1]
+                
                 ew_result = self._calculate_equivalent_width_monte_carlo(
                     fit_data, continuum_fit_dict, fit_type.lower()
                 )
@@ -5508,7 +6842,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             )
         elif fit_type == 'Listfit':
             filepath, content = self.qsap_handler.create_listfit_qsap(
-                fit_data, self.fits_file, spectrum_info
+                fit_data, self.fits_file, spectrum_info, lmfit_result=lmfit_result
             )
         else:
             raise ValueError(f"Unknown fit type: {fit_type}")
@@ -5520,7 +6854,57 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         print(content)
         print("="*70 + "\n")
         
+        # Register fit metadata for Fit Diagnostics panel
+        if fit_type == 'Listfit' and lmfit_result is not None:
+            # For Listfit, extract diagnostics from lmfit_result and use current fit_counter
+            diagnostics = self._extract_listfit_diagnostics(lmfit_result)
+            self.register_fit_metadata(self.fit_counter, fit_type, diagnostics)
+        elif isinstance(fit_data, list):
+            # Multiple components (Multi-Gaussian, Multi-Voigt)
+            for fit in fit_data:
+                if fit.get('fit_id') is not None:
+                    diagnostics = self._extract_fit_diagnostics(fit, fit_type)
+                    self.register_fit_metadata(fit['fit_id'], fit_type, diagnostics)
+        else:
+            # Single component
+            if fit_data.get('fit_id') is not None:
+                diagnostics = self._extract_fit_diagnostics(fit_data, fit_type)
+                self.register_fit_metadata(fit_data['fit_id'], fit_type, diagnostics)
+        
         return filepath, content
+    
+    def _convert_curve_fit_to_lmfit_like(self, param_names, param_values, pcov):
+        """Convert scipy.optimize.curve_fit results to lmfit-like structure
+        
+        For storing covariance from single/multi-mode fits (which use curve_fit, not lmfit).
+        Creates a minimal mock result object with the same interface as lmfit.
+        
+        Args:
+            param_names: List of parameter names (e.g., ['amp', 'mean', 'stddev'])
+            param_values: Array of parameter values from curve_fit
+            pcov: Covariance matrix from curve_fit
+            
+        Returns:
+            Mock result object with var_names, covar, and params attributes
+        """
+        class MockCurveFitResult:
+            pass
+        
+        result = MockCurveFitResult()
+        result.var_names = list(param_names)
+        result.covar = np.array(pcov, dtype=float) if pcov is not None else None
+        
+        # Create mock parameter objects similar to lmfit
+        result.params = {}
+        for pname, pval in zip(param_names, param_values):
+            class MockParam:
+                pass
+            p = MockParam()
+            p.value = float(pval)
+            p.expr = None  # No tied parameters in curve_fit mode
+            result.params[pname] = p
+        
+        return result
     
     def _format_param_value(self, value, error=None):
         """Format parameter value with error for redshift data"""
@@ -5562,6 +6946,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                             # This continuum covers our profile region
                             x_center = (bounds[0] + bounds[1]) / 2.0
                             if 'coeffs' in cont_fit:
+                                # Coefficients stored as [c_N, c_{N-1}, ..., c_1, c_0] (high-to-low order, as np.polyval expects)
                                 continuum_level = np.polyval(cont_fit['coeffs'], x_center)
                             break
             
@@ -5587,7 +6972,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 return None
             
             # Create high-resolution wavelength grid for integration
-            x_int = np.linspace(bounds[0], bounds[1], 200)
+            x_int = np.linspace(bounds[0], bounds[1], 2000)
             
             # Evaluate profile at high resolution
             if fit_type.lower() == 'gaussian':
@@ -5707,6 +7092,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         2. Reconstructs values of all tied parameters using their tie expressions
         3. Returns dict mapping all parameter names to their values
         
+        This handles complex tie expressions including redshift-tied parameters like:
+        - g0_center = (1 + redshift) * 1215.24
+        - g1_sigma = g0_sigma * (1240.81 / 1215.24)
+        
         Args:
             result: lmfit fit result object (contains tie expressions)
             free_param_sample: array of sampled free parameter values (one-to-one with free_param_names)
@@ -5720,9 +7109,17 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         for i, name in enumerate(free_param_names):
             all_params[name] = free_param_sample[i]
         
-        # Now reconstruct tied parameters using their expressions
-        for param_name in result.params.keys():
-            if param_name not in all_params:  # This parameter is tied or fixed
+        # Iteratively reconstruct tied parameters
+        # Use multiple passes in case tied params depend on other tied params
+        max_iterations = 10
+        iteration = 0
+        unreconstructed = set(result.params.keys()) - set(all_params.keys())
+        
+        while unreconstructed and iteration < max_iterations:
+            iteration += 1
+            made_progress = False
+            
+            for param_name in list(unreconstructed):  # Iterate over copy since we'll modify set
                 param = result.params[param_name]
                 if param.expr is not None:
                     # Evaluate the tie expression using the parameters we have so far
@@ -5736,20 +7133,100 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                             'log': np.log,
                             'sin': np.sin,
                             'cos': np.cos,
-                            'abs': abs
+                            'abs': abs,
+                            'pi': np.pi
                         })
                         # Evaluate the expression
                         value = float(eval(param.expr, {"__builtins__": {}}, namespace))
                         all_params[param_name] = value
+                        unreconstructed.remove(param_name)
+                        made_progress = True
                     except Exception as e:
-                        print(f"[MC] WARNING: Could not evaluate tie expression for {param_name}: {param.expr}")
-                        print(f"[MC]   Error: {e}")
-                        print(f"[MC]   Available parameters: {list(all_params.keys())}")
-                        # Fall back to initial guess
-                        all_params[param_name] = result.params[param_name].value if result.params[param_name].value is not None else 0.0
+                        # Parameter not yet available (depends on another tied param)
+                        # Will retry in next iteration
+                        pass
                 else:
                     # Fixed parameter - use its value
                     all_params[param_name] = result.params[param_name].value if result.params[param_name].value is not None else 0.0
+                    unreconstructed.remove(param_name)
+                    made_progress = True
+            
+            if not made_progress and unreconstructed:
+                # No progress made and still parameters unreconstructed - there's a problem
+                print(f"[MC] WARNING: Could not reconstruct {len(unreconstructed)} tied parameters:")
+                for param_name in unreconstructed:
+                    param = result.params[param_name]
+                    print(f"[MC]   {param_name} = {param.expr}")
+                    print(f"[MC]     Available params: {list(all_params.keys())}")
+                
+                # Fall back to initial guess values for remaining params
+                for param_name in unreconstructed:
+                    all_params[param_name] = result.params[param_name].value if result.params[param_name].value is not None else 0.0
+                break
+        
+        return all_params
+    
+    def _reconstruct_tied_parameters_from_qsap(self, free_param_sample, free_param_names, tie_expressions):
+        """Reconstruct tied parameter values from QSAP tie expressions and free parameter samples.
+        
+        For loaded Listfits with tied parameters, this evaluates tie expressions like:
+        - g1_sigma = g0_sigma * (1240.81 / 1215.24)
+        - g0_center = (1 + z1) * 1215.24
+        
+        Args:
+            free_param_sample: array of sampled free parameter values
+            free_param_names: list of free parameter names in sample order
+            tie_expressions: dict mapping param names to expression strings (from QSAP)
+        
+        Returns:
+            Dictionary mapping all parameter names (free + tied) to their values
+        """
+        # Build initial dict with free parameters from the sample
+        all_params = {}
+        for i, name in enumerate(free_param_names):
+            all_params[name] = free_param_sample[i]
+        
+        # Evaluate tie expressions to get tied parameter values
+        # Iterate multiple times in case tied params depend on other tied params
+        max_iterations = 10
+        iteration = 0
+        unreconstructed = set(tie_expressions.keys()) - set(all_params.keys())
+        
+        while unreconstructed and iteration < max_iterations:
+            iteration += 1
+            made_progress = False
+            
+            for param_name in list(unreconstructed):
+                expr_str = tie_expressions[param_name]
+                try:
+                    # Create a safe namespace for eval()
+                    namespace = dict(all_params)
+                    namespace.update({
+                        'sqrt': np.sqrt,
+                        'exp': np.exp,
+                        'log': np.log,
+                        'sin': np.sin,
+                        'cos': np.cos,
+                        'abs': abs,
+                        'pi': np.pi
+                    })
+                    # Evaluate the tie expression
+                    value = float(eval(expr_str, {"__builtins__": {}}, namespace))
+                    all_params[param_name] = value
+                    unreconstructed.remove(param_name)
+                    made_progress = True
+                except Exception as e:
+                    # Parameter not yet available (depends on another tied param)
+                    # Will retry in next iteration
+                    pass
+            
+            if not made_progress and unreconstructed:
+                # No progress made - missing dependencies
+                print(f"[MC] WARNING: Could not evaluate {len(unreconstructed)} tie expressions")
+                print(f"[MC]   Available params: {list(all_params.keys())}")
+                for param_name in unreconstructed:
+                    print(f"[MC]   {param_name} = {tie_expressions[param_name]}")
+                break
         
         return all_params
     
@@ -5761,6 +7238,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         - Continuum polynomial and its covariance
         
         Then calculates EW, sigma, and 3-sigma credible intervals from the resulting distribution.
+        
+        IMPORTANT NOTES ON LISTFIT WITH REDSHIFT:
+        - When using redshift-tied Gaussians (e.g., g1_sigma = g0_sigma * (λ_rest/λ_rest_ref)),
+          the component covariance matrix becomes singular because tied parameters have zero degrees
+          of freedom. MC sampling requires at least one free parameter with non-zero variance.
+        - This is a mathematical constraint, not a bug: tied parameters cannot vary independently.
+        - WORKAROUND: Fit without redshift-tying, or measure EW manually using the Gaussian components.
+        - Fit quality is unaffected; only the EW uncertainty estimation fails.
         
         Args:
             fit_dict: Dictionary with fitted profile parameters and covariance
@@ -5777,30 +7262,103 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             - 'ew_samples': full array of samples (optional, for diagnostics)
         """
         try:
+            print(f"[MC] _calculate_equivalent_width_monte_carlo called with fit_type='{fit_type}'")
+            # Refuse to calculate EW for polynomials - they have no equivalent width
+            if fit_type.lower() in ['polynomial', 'continuum', 'poly']:
+                print(f"[MC] ERROR: Cannot calculate EW for profile type '{fit_type}' - only Gaussian/Voigt profiles have meaningful EW")
+                return None
+            
             # Require continuum fit to proceed
             if continuum_fit_dict is None or 'coeffs' not in continuum_fit_dict:
                 print("[MC] ERROR: Continuum fit required for MC EW calculation")
                 return None
             
             bounds = fit_dict.get('bounds')
-            if bounds[0] is None or bounds[1] is None:
+            if bounds is None or bounds[0] is None or bounds[1] is None:
+                print(f"[MC] ERROR: Invalid or missing bounds in fit_dict: {bounds}")
+                print(f"[MC]   fit_dict keys: {list(fit_dict.keys())}")
                 return None
             
+            # Check for tied parameters FIRST - if present, use free parameter covariance from result or stored full covariance
+            # Try to get result object from separate storage (not from fit_dict to avoid cleanup issues)
+            fit_id = fit_dict.get('fit_id')
+            result_obj = self.lmfit_results.get(fit_id) if fit_id else None
+            # Fallback to fit_dict (for backward compatibility with older loaded fits)
+            if result_obj is None:
+                result_obj = fit_dict.get('result')
+            has_result_obj = result_obj is not None
+            has_stored_ties = 'tie_expressions' in fit_dict and 'full_covariance' in fit_dict
+            
+            # Debug: Show what's available in fit_dict
+            print(f"[MC] DEBUG fit_dict keys: {list(fit_dict.keys())}")
+            print(f"[MC] DEBUG: fit_id={fit_id}, has_result_obj={has_result_obj}, has_tie_expressions={'tie_expressions' in fit_dict}, has_full_covariance={'full_covariance' in fit_dict}")
+            
+            # For tied parameter reconstruction, we need either:
+            # 1. A lmfit result object (from interactive fitting), OR
+            # 2. Stored tie_expressions AND full_covariance (from loaded QSAP)
+            # BUT: If it's a Listfit component with its own covariance but NO ties, 
+            #      use non-tied path with component covariance
+            is_listfit_component = 'component_prefix' in fit_dict and 'param_names' in fit_dict
+            has_component_covariance = 'covariance' in fit_dict
+            
+            will_use_tied_path = (has_result_obj or has_stored_ties)
+            # Special case: Listfit component with covariance but no ties -> use non-tied path
+            if is_listfit_component and has_component_covariance and not has_stored_ties:
+                will_use_tied_path = False
+            
+            print(f"[MC] Tie check: has_result_obj={has_result_obj}, has_stored_ties={has_stored_ties}, is_listfit={is_listfit_component}, will_use_tied_path={will_use_tied_path}")
+            
             # Get covariance matrices
-            profile_cov = fit_dict.get('covariance')
-            if profile_cov is None:
-                return None
-            if isinstance(profile_cov, list):
-                profile_cov = np.array(profile_cov, dtype=float)
-            elif not isinstance(profile_cov, np.ndarray):
-                profile_cov = np.array(profile_cov, dtype=float)
+            # CRITICAL: For tied parameters, we use the free parameter covariance from lmfit or full stored covariance
+            # For non-tied parameters, we use the component covariance
+            if will_use_tied_path:
+                # Will use full covariance for tied parameter reconstruction below
+                if has_result_obj:
+                    profile_cov = np.array(result_obj.covar, dtype=float) if result_obj.covar is not None else None
+                    if profile_cov is None:
+                        print("[MC] ERROR: Free parameter covariance not available in lmfit result")
+                        return None
+                else:
+                    # For loaded fits, keep profile_cov as None - will use full_covariance in tied path
+                    profile_cov = None
+            else:
+                # Use component covariance for non-tied fits
+                profile_cov = fit_dict.get('covariance')
+                if profile_cov is None:
+                    print(f"[MC] ERROR: No component covariance available in fit_dict")
+                    print(f"[MC]   fit_dict keys: {list(fit_dict.keys())}")
+                    print(f"[MC]   This may indicate loaded fits need covariance extraction from QSAP")
+                    return None
+                if isinstance(profile_cov, list):
+                    profile_cov = np.array(profile_cov, dtype=float)
+                elif not isinstance(profile_cov, np.ndarray):
+                    profile_cov = np.array(profile_cov, dtype=float)
             
             cont_cov = continuum_fit_dict.get('covariance') if continuum_fit_dict else None
             
-            # Get continuum polynomial if available
+            # Get continuum polynomial or Chebyshev if available
             cont_coeffs = None
+            cont_type = None  # Track continuum type: 'polynomial' or 'chebyshev'
+            cont_domain_min = None
+            cont_domain_max = None
+            
             if continuum_fit_dict and 'coeffs' in continuum_fit_dict:
-                cont_coeffs = np.array(continuum_fit_dict['coeffs'], dtype=float)
+                cont_type = continuum_fit_dict.get('type', 'polynomial')  # Default to polynomial for backward compat
+                
+                if cont_type == 'polynomial':
+                    # Coefficients stored as [c_N, c_{N-1}, ..., c_1, c_0] (high-to-low order, as np.polyval expects)
+                    cont_coeffs = np.array(continuum_fit_dict['coeffs'], dtype=float)
+                elif cont_type == 'chebyshev':
+                    # Chebyshev coefficients are stored in normalized [-1, 1] frame
+                    # NO REVERSAL needed - chebval takes them in ascending order [c0, c1, ...]
+                    cont_coeffs = np.array(continuum_fit_dict['coeffs'], dtype=float)
+                    cont_domain_min = continuum_fit_dict.get('lam_min')
+                    cont_domain_max = continuum_fit_dict.get('lam_max')
+                    
+                    if cont_domain_min is None or cont_domain_max is None:
+                        print("[MC] ERROR: Chebyshev continuum missing domain bounds (lam_min/lam_max)")
+                        return None
+                
                 if isinstance(cont_cov, list):
                     cont_cov = np.array(cont_cov, dtype=float)
                 elif cont_cov is not None and not isinstance(cont_cov, np.ndarray):
@@ -5826,9 +7384,25 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     # Replace with small default values
                     cont_cov = np.diag(np.maximum(cov_diag, 1e-20))
                     print(f"[MC]   Replaced with small defaults to avoid singular matrix")
+                
+                # Check for severely imbalanced covariance (sign of ill-conditioning)
+                # This happens when polynomial coefficients have vastly different scales
+                # NOTE: For Chebyshev, this should be much better conditioned
+                cov_diag_nonzero = cov_diag[cov_diag > 0]
+                if len(cov_diag_nonzero) > 1:
+                    diag_ratio = np.max(cov_diag_nonzero) / (np.min(cov_diag_nonzero) + 1e-30)
+                    if diag_ratio > 1e6:
+                        print(f"[MC] WARNING: Continuum covariance is severely imbalanced (ratio={diag_ratio:.1e})")
+                        print(f"[MC]   Diagonal: {cov_diag}")
+                        if cont_type == 'polynomial':
+                            print(f"[MC]   This indicates polynomial coefficients with very different scales")
+                            print(f"[MC]   Consider using Chebyshev polynomials instead")
+                        print(f"[MC]   MC sampling from this matrix will likely produce garbage values")
+                        print(f"[MC]   Consider: (1) checking the continuum fit quality, (2) using Chebyshev basis")
+                        # Still continue, but samples will be validated during MC loop
             
             # Integration grid
-            x_int = np.linspace(bounds[0], bounds[1], 200)
+            x_int = np.linspace(bounds[0], bounds[1], 2000)
             
             ew_samples = []
             profile_samples = []  # Store all realized profiles
@@ -5842,42 +7416,179 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # Convert to float array to ensure proper dtype
             profile_params = np.array(profile_params, dtype=float)
             
-            # Check if this fit has tied parameters by looking for result object in fit_dict
-            has_tied_params = 'result' in fit_dict
-            result_obj = fit_dict.get('result')
-            
+            # Determine which path to use for MC sampling
             tried_tied_path = False  # Track whether we attempted tied path
             
-            if has_tied_params and result_obj is not None:
+            if will_use_tied_path:
                 # Try MC sampling with tied parameter reconstruction
                 tried_tied_path = True
                 try:
                     print("[MC] ========== TIED PARAMETER PATH ==========")
                     print("[MC] Sampling with tied parameter reconstruction")
                     
-                    # Get free parameter names and covariance from lmfit result
-                    free_param_names = result_obj.var_names  # List of free parameter names
-                    free_param_covariance = np.array(result_obj.covar, dtype=float) if result_obj.covar is not None else None
+                    # PATH A: lmfit result object (from interactive fitting)
+                    if has_result_obj and result_obj is not None:
+                        print("[MC] Using lmfit result object for tied parameter reconstruction")
+                    # PATH B: Loaded Listfit with ties (from QSAP file)
+                    elif has_stored_ties:
+                        print("[MC] Using loaded Listfit with tie expressions")
+                        # For loaded fits, we need to reconstruct parameters from full covariance
+                        # The key insight: sample ALL free parameters, then apply tie expressions
+                        # to get the specific component's parameters
+                    
+                    # Get free parameter names and covariance
+                    if result_obj is not None:
+                        free_param_names = result_obj.var_names
+                        free_param_covariance = np.array(result_obj.covar, dtype=float) if result_obj.covar is not None else None
+                        free_param_values = np.array([result_obj.params[name].value for name in free_param_names], dtype=float)
+                    else:
+                        # Loaded Listfit - use stored full covariance and all free param names
+                        free_param_covariance = fit_dict.get('full_covariance')
+                        all_free_names = fit_dict.get('all_free_param_names', [])
+                        free_param_names = all_free_names
+                        
+                        # Check if we have pre-extracted free parameter values from covariance_data
+                        stored_free_param_names = fit_dict.get('free_param_names_all', [])
+                        stored_free_param_values = fit_dict.get('free_param_values_all', [])
+                        
+                        # Build a lookup dict from stored values if available
+                        stored_param_dict = {}
+                        if stored_free_param_names and stored_free_param_values:
+                            if len(stored_free_param_names) == len(stored_free_param_values):
+                                stored_param_dict = dict(zip(stored_free_param_names, stored_free_param_values))
+                        
+                        # Get current best-fit values for all free parameters
+                        # Strategy: use stored values first (from FREE_PARAMETER_VALUES in QSAP),
+                        # then fall back to component fit_dict lookups
+                        free_param_values = []
+                        for pname in free_param_names:
+                            val = None
+                            
+                            # FIRST TRY: Use stored parameter values from QSAP file
+                            if pname in stored_param_dict:
+                                val = stored_param_dict[pname]
+                            
+                            # FALLBACK: POLYNOMIAL PARAMETERS - Extract from continuum_fit_dict
+                            elif pname.startswith('p') and '_c' in pname:
+                                if continuum_fit_dict and 'coeffs' in continuum_fit_dict:
+                                    parts = pname.split('_c')
+                                    coeff_idx = int(parts[1])
+                                    coeffs = continuum_fit_dict.get('coeffs')
+                                    if coeffs and coeff_idx < len(coeffs):
+                                        val = coeffs[coeff_idx]
+                            
+                            # FALLBACK: CURRENT COMPONENT PARAMETERS (gaussian_0 in this EW calculation)
+                            elif pname.startswith('g') and '_' in pname:
+                                prefix, suffix = pname.split('_', 1)
+                                comp_idx = int(prefix[1:])  # Extract index from g0, g1, etc.
+                                
+                                # Check if this is the current component (from fit_dict)
+                                current_comp_id = fit_dict.get('component_id')
+                                if f'gaussian_{comp_idx}' == current_comp_id or f'g{comp_idx}' == current_comp_id:
+                                    # This is the current component - get from fit_dict
+                                    if suffix == 'amp':
+                                        val = fit_dict.get('amp')
+                                    elif suffix in ['sigma', 'std', 'stddev']:
+                                        val = fit_dict.get('stddev')
+                                    elif suffix in ['mu', 'mean', 'center']:
+                                        val = fit_dict.get('mean')
+                                else:
+                                    # This is a different gaussian - look it up in self.gaussian_fits
+                                    for gfit in self.gaussian_fits:
+                                        if gfit.get('is_listfit_component') and gfit.get('_fit_id') == fit_dict.get('_fit_id'):
+                                            gcomp_id = gfit.get('component_id')
+                                            if f'gaussian_{comp_idx}' == gcomp_id or f'g{comp_idx}' == gcomp_id:
+                                                if suffix == 'amp':
+                                                    val = gfit.get('amp')
+                                                elif suffix in ['sigma', 'std', 'stddev']:
+                                                    val = gfit.get('stddev')
+                                                elif suffix in ['mu', 'mean', 'center']:
+                                                    val = gfit.get('mean')
+                                                break
+                            
+                            # FALLBACK: VOIGT PARAMETERS - Similar to Gaussian
+                            elif pname.startswith('v') and '_' in pname:
+                                prefix, suffix = pname.split('_', 1)
+                                comp_idx = int(prefix[1:])
+                                
+                                current_comp_id = fit_dict.get('component_id')
+                                if f'voigt_{comp_idx}' == current_comp_id or f'v{comp_idx}' == current_comp_id:
+                                    if suffix == 'amp':
+                                        val = fit_dict.get('amp')
+                                    elif suffix == 'sigma':
+                                        val = fit_dict.get('stddev')
+                                    elif suffix == 'gamma':
+                                        val = fit_dict.get('gamma')
+                                    elif suffix in ['center', 'mu', 'mean']:
+                                        val = fit_dict.get('mean')
+                                else:
+                                    for vfit in self.voigt_fits:
+                                        if vfit.get('is_listfit_component') and vfit.get('_fit_id') == fit_dict.get('_fit_id'):
+                                            vcomp_id = vfit.get('component_id')
+                                            if f'voigt_{comp_idx}' == vcomp_id or f'v{comp_idx}' == vcomp_id:
+                                                if suffix == 'amp':
+                                                    val = vfit.get('amp')
+                                                elif suffix == 'sigma':
+                                                    val = vfit.get('stddev')
+                                                elif suffix == 'gamma':
+                                                    val = vfit.get('gamma')
+                                                elif suffix in ['center', 'mu', 'mean']:
+                                                    val = vfit.get('mean')
+                                                break
+                            
+                            # REDSHIFT PARAMETER - Check stored values first
+                            elif pname.startswith('z'):
+                                # NOTE: z parameters are already in stored_param_dict if loaded from QSAP
+                                if pname not in stored_param_dict:
+                                    print(f"[MC] ERROR: Redshift parameter {pname} not found in stored_param_dict")
+                                    print(f"[MC]   stored_param_dict keys: {list(stored_param_dict.keys())}")
+                                    print(f"[MC]   stored_free_param_names: {stored_free_param_names}")
+                                    print(f"[MC]   stored_free_param_values: {stored_free_param_values}")
+                            
+                            # CRITICAL: Fail if value is None (don't use fallback)
+                            if val is None:
+                                print(f"[MC] ERROR: Could not extract value for parameter {pname}")
+                                print(f"[MC]   pname={pname}, type check: starts_p={pname.startswith('p')}, starts_g={pname.startswith('g')}, starts_v={pname.startswith('v')}, starts_z={pname.startswith('z')}")
+                                if pname.startswith('g') and '_' in pname:
+                                    print(f"[MC]   Gaussian check: stored_in_dict={pname in stored_param_dict}, current_fit_component_id={fit_dict.get('component_id')}")
+                                if pname.startswith('z'):
+                                    print(f"[MC]   Redshift check: stored_param_dict has z keys: {[k for k in stored_param_dict if k.startswith('z')]}")
+                                raise RuntimeError(f"Could not extract free parameter value for {pname}")
+                            
+                            free_param_values.append(val)
+                        
+                        free_param_values = np.array(free_param_values, dtype=float)
+
                     
                     if free_param_covariance is None:
                         print("[MC] ERROR: Free parameter covariance not available")
                         raise RuntimeError("Free parameter covariance is None")
                     
-                    # Extract best-fit values of free parameters (in the order of var_names)
-                    free_param_values = np.array([result_obj.params[name].value for name in free_param_names], dtype=float)
-                    
                     # Check if free-parameter covariance is singular
                     try:
                         cov_det = np.linalg.det(free_param_covariance)
+                        cond_num = np.linalg.cond(free_param_covariance)
+                        eigenvalues = np.linalg.eigvals(free_param_covariance)
+                        print(f"[MC] Covariance matrix diagnostics:")
+                        print(f"[MC]   Shape: {free_param_covariance.shape}")
+                        print(f"[MC]   Determinant: {cov_det}")
+                        print(f"[MC]   Condition number: {cond_num}")
+                        print(f"[MC]   Eigenvalues: {eigenvalues}")
+                        print(f"[MC]   Min eigenvalue: {np.min(eigenvalues)}")
+                        print(f"[MC]   Max eigenvalue: {np.max(eigenvalues)}")
                         if abs(cov_det) < 1e-10:
                             print("[MC] WARNING: Free-parameter covariance matrix is singular!")
-                            print("[MC]   This is unexpected - lmfit should only include free params in covar")
-                    except (np.linalg.LinAlgError, ValueError):
-                        print("[MC] WARNING: Could not compute determinant of free-parameter covariance")
+                            print("[MC]   This is unexpected - should only include free params in covar")
+                        if cond_num > 1e10:
+                            print(f"[MC] WARNING: Covariance matrix is ill-conditioned (cond={cond_num:.2e})")
+                            print("[MC]   This will cause numerical instability in MC sampling")
+                    except (np.linalg.LinAlgError, ValueError) as e:
+                        print(f"[MC] WARNING: Could not analyze covariance matrix: {e}")
                     
                     print(f"[MC] Free parameters: {free_param_names}")
                     print(f"[MC] Free param values: {free_param_values}")
                     print(f"[MC] Free param covariance shape: {free_param_covariance.shape}")
+                    print(f"[MC] Free param covariance diag: {np.diag(free_param_covariance)}")
                     
                     # Monte Carlo loop with tied parameter reconstruction
                     for sample_idx in range(n_samples):
@@ -5886,24 +7597,105 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                             try:
                                 free_param_sample = np.random.multivariate_normal(free_param_values, free_param_covariance)
                             except (np.linalg.LinAlgError, ValueError) as e:
-                                print(f"[MC] ERROR: Cannot sample from free-parameter covariance: {e}")
+                                print(f"[MC] ERROR: Cannot sample from free-parameter covariance on iteration {sample_idx}: {e}")
                                 raise  # Re-raise to exit tied path and try non-tied
                             
-                            # Reconstruct all parameters (free + tied) using tie expressions
-                            all_params_dict = self._reconstruct_tied_parameters(result_obj, free_param_sample, free_param_names)
+                            # Diagnostic: log first few samples
+                            if sample_idx < 3:
+                                print(f"[MC] Sample {sample_idx}: free_param_sample = {free_param_sample}")
+                                print(f"[MC]   Deviation from mean: {free_param_sample - free_param_values}")
+                            
+                            if result_obj is not None:
+                                # Reconstruct all parameters (free + tied) using lmfit tie expressions
+                                all_params_dict = self._reconstruct_tied_parameters(result_obj, free_param_sample, free_param_names)
+                            else:
+                                # Reconstruct all parameters using QSAP tie expressions
+                                all_params_dict = self._reconstruct_tied_parameters_from_qsap(
+                                    free_param_sample, 
+                                    free_param_names,
+                                    fit_dict.get('tie_expressions', {})
+                                )
                             
                             # Extract parameters for this specific component
-                            component_prefix = fit_dict.get('component_prefix')
-                            param_names_list = fit_dict.get('param_names', [])
-                            
-                            component_params = []
-                            for pname in param_names_list:
-                                full_name = f'{component_prefix}{pname}'
-                                if full_name in all_params_dict:
-                                    component_params.append(all_params_dict[full_name])
+                            # For lmfit: use component_prefix + param_names_list
+                            # For loaded: extract by component ID from all_params_dict
+                            if result_obj is not None:
+                                component_prefix = fit_dict.get('component_prefix')
+                                param_names_list = fit_dict.get('param_names', [])
+                                
+                                component_params = []
+                                for pname in param_names_list:
+                                    full_name = f'{component_prefix}{pname}'
+                                    if full_name in all_params_dict:
+                                        component_params.append(all_params_dict[full_name])
+                                    else:
+                                        print(f"[MC] WARNING: Parameter {full_name} not found in reconstructed params")
+                                        raise RuntimeError(f"Missing parameter: {full_name}")
+                                component_params = np.array(component_params, dtype=float)
+                            else:
+                                # Loaded Listfit - extract this component's parameters from all_params_dict
+                                component_id = fit_dict.get('component_id')  # e.g., 'gaussian_0' or 'g0'
+                                
+                                # Determine component type and parameter order
+                                if fit_type.lower() == 'gaussian':
+                                    # Gaussian: need [amp, mean, sigma]
+                                    # Look for g0_amp, g0_mu (or mean), g0_sigma in all_params_dict
+                                    amp_val = None
+                                    mean_val = None
+                                    sigma_val = None
+                                    
+                                    # Try to find the parameters in reconstructed dict
+                                    # First, figure out the component index from component_id
+                                    comp_idx = 0
+                                    if 'gaussian_' in component_id:
+                                        comp_idx = int(component_id.split('_')[1])
+                                    
+                                    for pname, pval in all_params_dict.items():
+                                        if pname == f'g{comp_idx}_amp':
+                                            amp_val = pval
+                                        elif pname in [f'g{comp_idx}_mu', f'g{comp_idx}_mean', f'g{comp_idx}_center']:
+                                            mean_val = pval
+                                        elif pname in [f'g{comp_idx}_sigma', f'g{comp_idx}_std']:
+                                            sigma_val = pval
+                                    
+                                    # Use reconstructed values if available, else use fit_dict values
+                                    if amp_val is None:
+                                        amp_val = fit_dict.get('amp', 1.0)
+                                    if mean_val is None:
+                                        mean_val = fit_dict.get('mean', 5000.0)
+                                    if sigma_val is None:
+                                        sigma_val = fit_dict.get('stddev', 1.0)
+                                    
+                                    component_params = np.array([amp_val, mean_val, sigma_val], dtype=float)
+                                    
+                                elif fit_type.lower() == 'voigt':
+                                    # Voigt: need [amp, center, sigma, gamma]
+                                    comp_idx = 0
+                                    if 'voigt_' in component_id:
+                                        comp_idx = int(component_id.split('_')[1])
+                                    
+                                    amp_val = all_params_dict.get(f'v{comp_idx}_amp', fit_dict.get('amp', 1.0))
+                                    center_val = all_params_dict.get(f'v{comp_idx}_center', fit_dict.get('mean', 5000.0))
+                                    sigma_val = all_params_dict.get(f'v{comp_idx}_sigma', fit_dict.get('stddev', 1.0))
+                                    gamma_val = all_params_dict.get(f'v{comp_idx}_gamma', fit_dict.get('gamma', 0.1))
+                                    
+                                    component_params = np.array([amp_val, center_val, sigma_val, gamma_val], dtype=float)
                                 else:
-                                    print(f"[MC] WARNING: Parameter {full_name} not found in reconstructed params")
-                                    raise RuntimeError(f"Missing parameter: {full_name}")
+                                    raise RuntimeError(f"Unknown fit_type: {fit_type}")
+                            
+                            # CRITICAL: Validate reconstructed sample for NaN/inf and physical validity
+                            if np.any(np.isnan(component_params)) or np.any(np.isinf(component_params)):
+                                raise RuntimeError(f"Reconstructed component parameters contain NaN/inf: {component_params}")
+                            
+                            # Check for physical validity based on fit type
+                            if fit_type.lower() == 'gaussian':
+                                # stddev MUST be positive
+                                if component_params[2] <= 0:
+                                    raise RuntimeError(f"Invalid Gaussian stddev: {component_params[2]}")
+                            elif fit_type.lower() == 'voigt':
+                                # sigma MUST be positive, gamma MUST be non-negative
+                                if component_params[2] <= 0 or component_params[3] < 0:
+                                    raise RuntimeError(f"Invalid Voigt sigma/gamma: {component_params[2]}/{component_params[3]}")
                             
                             # Evaluate profile with reconstructed parameters
                             profile = self._evaluate_profile(x_int, fit_type, component_params)
@@ -5914,11 +7706,61 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                                     cont_sample = np.random.multivariate_normal(cont_coeffs, cont_cov)
                                 except (np.linalg.LinAlgError, ValueError) as e:
                                     print(f"[MC] ERROR in continuum sampling (sample {sample_idx}): {e}")
+                                    print(f"[MC]   cont_coeffs={cont_coeffs}, cont_cov shape={cont_cov.shape}")
                                     raise  # Re-raise to exit tied path
-                                continuum = np.polyval(cont_sample, x_int)
+                                
+                                # Diagnostic: log first few continuum samples
+                                if sample_idx < 3:
+                                    print(f"[MC] Sample {sample_idx} continuum ({cont_type}): coeffs={cont_sample}")
+                                    if cont_type == 'polynomial':
+                                        eval_x = x_int[0]
+                                        eval_y = np.polyval(cont_sample, eval_x)
+                                        print(f"[MC]   Evaluation at x={eval_x:.1f}: y={eval_y:.3e}")
+                                        eval_x = x_int[-1]
+                                        eval_y = np.polyval(cont_sample, eval_x)
+                                        print(f"[MC]   Evaluation at x={eval_x:.1f}: y={eval_y:.3e}")
+                                    elif cont_type == 'chebyshev':
+                                        eval_x = x_int[0]
+                                        x_rescaled = 2 * (eval_x - cont_domain_min) / (cont_domain_max - cont_domain_min) - 1
+                                        eval_y = np.polynomial.chebyshev.chebval(x_rescaled, cont_sample)
+                                        print(f"[MC]   Evaluation at x={eval_x:.1f} (rescaled={x_rescaled:.4f}): y={eval_y:.3e}")
+                                        eval_x = x_int[-1]
+                                        x_rescaled = 2 * (eval_x - cont_domain_min) / (cont_domain_max - cont_domain_min) - 1
+                                        eval_y = np.polynomial.chebyshev.chebval(x_rescaled, cont_sample)
+                                        print(f"[MC]   Evaluation at x={eval_x:.1f} (rescaled={x_rescaled:.4f}): y={eval_y:.3e}")
+                                
+                                # Validate sampled polynomial coefficients
+                                if np.any(np.isnan(cont_sample)) or np.any(np.isinf(cont_sample)):
+                                    raise RuntimeError(f"Continuum sample contains NaN/inf: {cont_sample}")
+                                
+                                # Evaluate continuum at integration grid based on type
+                                if cont_type == 'polynomial':
+                                    continuum = np.polyval(cont_sample, x_int)
+                                elif cont_type == 'chebyshev':
+                                    # Rescale wavelengths to [-1, 1]
+                                    x_rescaled = 2 * (x_int - cont_domain_min) / (cont_domain_max - cont_domain_min) - 1
+                                    continuum = np.polynomial.chebyshev.chebval(x_rescaled, cont_sample)
+                                else:
+                                    raise RuntimeError(f"Unknown continuum type: {cont_type}")
+                                
+                                # Validate continuum for pathological behavior
+                                if np.any(np.isnan(continuum)) or np.any(np.isinf(continuum)):
+                                    raise RuntimeError("Continuum evaluation produced NaN/inf")
+                                
+                                # Check if continuum varies wildly (sign of singular matrix)
+                                # For a polynomial fit, large variations at the edges are expected,
+                                # but variance should not change by orders of magnitude
+                                cont_min = np.min(continuum)
+                                cont_max = np.max(continuum)
+                                cont_range_ratio = cont_max / (cont_min + 1e-10)
+                                
+                                # If continuum varies by more than 100x, likely singular matrix
+                                if cont_range_ratio > 100:
+                                    raise RuntimeError(f"Continuum varies wildly (ratio={cont_range_ratio:.1f}), suggests singular covariance")
                             else:
                                 print("[MC] ERROR: Cannot compute MC EW without continuum covariance matrix")
                                 raise RuntimeError("Continuum covariance missing")
+
                             
                             # Ensure non-zero continuum to avoid division issues
                             continuum = np.maximum(continuum, 1e-10)
@@ -5930,6 +7772,15 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                             # Calculate EW for this sample
                             normalized = -profile / continuum
                             ew = trapz_compat(normalized, x_int)
+                            
+                            # Diagnostic: log first few EW calculations
+                            if sample_idx < 3:
+                                print(f"[MC] Sample {sample_idx} EW calc:")
+                                print(f"[MC]   profile: min={np.min(profile):.3e}, max={np.max(profile):.3e}")
+                                print(f"[MC]   continuum: min={np.min(continuum):.3e}, max={np.max(continuum):.3e}")
+                                print(f"[MC]   normalized: min={np.min(normalized):.3e}, max={np.max(normalized):.3e}")
+                                print(f"[MC]   EW={ew:.3e}")
+
                             ew_samples.append(ew)
                         
                         except Exception as e:
@@ -5949,8 +7800,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     continuum_samples = []
             
             # If tied path was attempted and produced samples, we're done
-            # Otherwise, try the non-tied path
-            if not ew_samples:
+            # Otherwise, try the non-tied path (but ONLY if we have profile covariance)
+            if not ew_samples and profile_cov is not None:
                 # Original MC sampling without tied parameters (component covariance is non-singular)
                 print("[MC] ========== NON-TIED PARAMETER PATH ==========")
                 print("[MC] Sampling without tied parameters")
@@ -5990,6 +7841,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     # If there are issues, the loop will catch them and return None
                     
                     # Monte Carlo loop (standard path for non-tied parameters)
+                    invalid_sample_count = 0
                     for sample_idx in range(n_samples):
                         try:
                             # Sample profile parameters from multivariate normal
@@ -6001,26 +7853,94 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                                 print(f"[MC]   MC sampling failed - cannot calculate EW with proper uncertainties")
                                 raise  # Re-raise to exit non-tied path
                             
+                            # CRITICAL: Validate sample for NaN/inf and physical validity
+                            # (NaN/inf can occur with singular/near-singular covariance matrices)
+                            if np.any(np.isnan(profile_sample)) or np.any(np.isinf(profile_sample)):
+                                invalid_sample_count += 1
+                                if sample_idx < 3:  # Log first few occurrences
+                                    print(f"[MC] WARNING: Sample {sample_idx} contains NaN/inf: {profile_sample}")
+                                continue  # Skip this invalid sample
+                            
+                            # Check for physical validity based on fit type
+                            if fit_type.lower() == 'gaussian':
+                                # amplitude can be negative (absorption), mean is positive wavelength, stddev MUST be positive
+                                if profile_sample[2] <= 0:  # stddev must be positive
+                                    invalid_sample_count += 1
+                                    if sample_idx < 3:
+                                        print(f"[MC] WARNING: Sample {sample_idx} has invalid stddev: {profile_sample[2]}")
+                                    continue
+                            elif fit_type.lower() == 'voigt':
+                                # sigma MUST be positive, gamma MUST be non-negative
+                                if profile_sample[2] <= 0 or profile_sample[3] < 0:
+                                    invalid_sample_count += 1
+                                    if sample_idx < 3:
+                                        print(f"[MC] WARNING: Sample {sample_idx} has invalid sigma/gamma: {profile_sample[2]}/{profile_sample[3]}")
+                                    continue
+                            
                             # Evaluate profile at high resolution
                             profile = self._evaluate_profile(x_int, fit_type, profile_sample)
                             
-                            # Sample continuum polynomial if available
-                            if cont_coeffs is not None and cont_cov is not None:
-                                try:
-                                    cont_sample = np.random.multivariate_normal(cont_coeffs, cont_cov)
-                                except (np.linalg.LinAlgError, ValueError) as e:
-                                    print(f"[MC] ERROR in continuum sampling (sample {sample_idx}): {e}")
-                                    print(f"[MC]   Coefficients: {cont_coeffs}")
-                                    print(f"[MC]   Covariance shape: {cont_cov.shape}, diagonal: {np.diag(cont_cov)}")
-                                    raise  # Re-raise to exit non-tied path
-                                continuum = np.polyval(cont_sample, x_int)
+                            # Sample or use continuum polynomial/Chebyshev
+                            if cont_coeffs is not None:
+                                if cont_cov is not None:
+                                    # Sample continuum from covariance (when continuum has free parameters)
+                                    try:
+                                        cont_sample = np.random.multivariate_normal(cont_coeffs, cont_cov)
+                                    except (np.linalg.LinAlgError, ValueError) as e:
+                                        print(f"[MC] ERROR in continuum sampling (sample {sample_idx}): {e}")
+                                        print(f"[MC]   Coefficients: {cont_coeffs}")
+                                        print(f"[MC]   Covariance shape: {cont_cov.shape}, diagonal: {np.diag(cont_cov)}")
+                                        raise  # Re-raise to exit non-tied path
+                                else:
+                                    # Use fixed continuum coefficients (when all continuum parameters are tied)
+                                    cont_sample = cont_coeffs
+                                
+                                # Validate sampled polynomial coefficients
+                                if np.any(np.isnan(cont_sample)) or np.any(np.isinf(cont_sample)):
+                                    invalid_sample_count += 1
+                                    if sample_idx < 3:
+                                        print(f"[MC] WARNING: Sample {sample_idx} continuum has NaN/inf coefficients")
+                                    continue
+                                
+                                if cont_type == 'polynomial':
+                                    continuum = np.polyval(cont_sample, x_int)
+                                elif cont_type == 'chebyshev':
+                                    # Rescale wavelengths to [-1, 1]
+                                    x_rescaled = 2 * (x_int - cont_domain_min) / (cont_domain_max - cont_domain_min) - 1
+                                    continuum = np.polynomial.chebyshev.chebval(x_rescaled, cont_sample)
+                                else:
+                                    raise RuntimeError(f"Unknown continuum type: {cont_type}")
+                                
+                                # Validate continuum for pathological behavior
+                                if np.any(np.isnan(continuum)) or np.any(np.isinf(continuum)):
+                                    invalid_sample_count += 1
+                                    if sample_idx < 3:
+                                        print(f"[MC] WARNING: Sample {sample_idx} continuum evaluation produced NaN/inf")
+                                    continue
+                                
+                                # Check if continuum varies wildly (sign of singular matrix)
+                                cont_min = np.min(continuum)
+                                cont_max = np.max(continuum)
+                                cont_range_ratio = cont_max / (cont_min + 1e-10)
+                                
+                                # If continuum varies by more than 100x, likely singular matrix
+                                if cont_range_ratio > 100:
+                                    invalid_sample_count += 1
+                                    if sample_idx < 3:
+                                        print(f"[MC] WARNING: Sample {sample_idx} continuum varies wildly (ratio={cont_range_ratio:.1f})")
+                                    continue
                             else:
-                                # Cannot proceed without continuum if one was used in the fit
-                                print("[MC] ERROR: Cannot compute MC EW without continuum covariance matrix")
-                                raise RuntimeError("Continuum covariance missing")
+                                # Cannot proceed without continuum coefficients
+                                print("[MC] ERROR: Cannot compute MC EW without continuum coefficients")
+                                raise RuntimeError("Continuum coefficients missing")
                             
-                            # Ensure non-zero continuum to avoid division issues
-                            continuum = np.maximum(continuum, 1e-10)
+                            # NOTE: We do NOT artificially floor negative continuum values to 1e-10
+                            # If the polynomial covariance is ill-conditioned, some MC samples will
+                            # naturally produce negative continuum. This is an honest representation of
+                            # the underlying singular covariance matrix and must be fixed at the source
+                            # (not masked by sample rejection or artificial flooring).
+                            # The fix is Chebyshev polynomials (Step 3), which have well-conditioned
+                            # orthogonal basis. Until then, we show the true pathology.
                             
                             # Store samples for later plotting
                             profile_samples.append(profile)
@@ -6041,6 +7961,15 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                                 traceback.print_exc()
                             # Continue with remaining samples
                             continue
+                    
+                    # Check if too many samples were invalid (sign of singular covariance)
+                    if invalid_sample_count > n_samples * 0.1:  # More than 10% invalid
+                        print(f"[MC] ERROR: {invalid_sample_count}/{n_samples} samples were invalid (NaN/inf or unphysical)")
+                        print(f"[MC]   This indicates a singular/near-singular covariance matrix")
+                        print(f"[MC]   Likely cause: tied parameters with zero variance not properly reconstructed")
+                        raise RuntimeError(f"Too many invalid samples ({invalid_sample_count}/{n_samples})")
+                    elif invalid_sample_count > 0:
+                        print(f"[MC] WARNING: {invalid_sample_count} samples were invalid and skipped")
                 
                 except Exception as e:
                     # Non-tied path also failed
@@ -6050,6 +7979,14 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # At this point, ew_samples should be populated from either tied or non-tied path
             if not ew_samples:
                 print("[MC] ERROR: No EW samples generated")
+                print("[MC]")
+                print("[MC] ===== DIAGNOSIS =====")
+                print("[MC] This typically occurs when:")
+                print("[MC]   1. Listfit with redshift: Tied parameters cause singular covariance")
+                print("[MC]   2. Continuum polynomial: Coefficients have vastly different scales")
+                print("[MC]   3. Too few free parameters: Complex ties reduce degrees of freedom")
+                print("[MC]   4. Missing or None covariance matrices")
+                print("[MC]")
                 return None
             
             ew_samples = np.array(ew_samples)
@@ -6073,6 +8010,94 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 print("[MC] ERROR: All samples are NaN/inf - cannot compute EW statistics")
                 return None
             
+            # ============= STEP 1 DIAGNOSTICS: Fat-tail detection =============
+            print("[MC] ========== STEP 1 DIAGNOSTICS: EW Distribution Analysis ==========")
+            
+            # 1. Percentile distribution and max
+            percentiles = np.percentile(valid_ew_samples, [1, 16, 50, 84, 99])
+            max_ew = np.max(valid_ew_samples)
+            min_ew = np.min(valid_ew_samples)
+            p99_ew = percentiles[4]
+            ratio_max_to_p99 = abs(max_ew) / (abs(p99_ew) + 1e-30)
+            
+            print(f"[MC] 1. EW Percentiles:")
+            print(f"[MC]   1st percentile:  {percentiles[0]:.6e}")
+            print(f"[MC]   16th percentile: {percentiles[1]:.6e}")
+            print(f"[MC]   50th (median):   {percentiles[2]:.6e}")
+            print(f"[MC]   84th percentile: {percentiles[3]:.6e}")
+            print(f"[MC]   99th percentile: {percentiles[4]:.6e}")
+            print(f"[MC]   Min EW:          {min_ew:.6e}")
+            print(f"[MC]   Max EW:          {max_ew:.6e}")
+            print(f"[MC]   Max/99th ratio:  {ratio_max_to_p99:.2e}")
+            if ratio_max_to_p99 > 10:
+                print(f"[MC]   FAT TAIL DETECTED: max is {ratio_max_to_p99:.1f}x larger than 99th percentile")
+            
+            # 2. Count continuum samples hitting the 1e-10 floor
+            if len(continuum_samples_array) > 0:
+                floor_value = 1e-10
+                n_clipped_points = 0
+                n_clipped_samples = 0
+                
+                for cont_sample in continuum_samples_array:
+                    n_below_floor = np.sum(cont_sample <= floor_value)
+                    if n_below_floor > 0:
+                        n_clipped_points += n_below_floor
+                        n_clipped_samples += 1
+                
+                print(f"[MC] 2. Continuum Clipping at 1e-10 floor:")
+                print(f"[MC]   Samples with clipped points: {n_clipped_samples}/{len(continuum_samples_array)}")
+                print(f"[MC]   Total clipped grid points: {n_clipped_points}/{len(continuum_samples_array) * len(x_int)}")
+                print(f"[MC]   Fraction of samples clipped: {100*n_clipped_samples/len(continuum_samples_array):.1f}%")
+                if n_clipped_samples > len(continuum_samples_array) * 0.01:
+                    print(f"[MC]   WARNING: >1% of samples had clipped continuum points")
+            
+            # 3. Continuum covariance conditioning
+            if cont_cov is not None:
+                try:
+                    cont_cond = np.linalg.cond(cont_cov)
+                    print(f"[MC] 3. Continuum Polynomial Covariance Conditioning:")
+                    print(f"[MC]   Condition number: {cont_cond:.2e}")
+                    if cont_cond > 1e8:
+                        print(f"[MC]   WARNING: Highly ill-conditioned (cond > 1e8)")
+                except (np.linalg.LinAlgError, ValueError) as e:
+                    print(f"[MC] 3. Could not compute continuum covariance condition number: {e}")
+            
+            # 4. Eigenvalue analysis
+            if cont_cov is not None:
+                try:
+                    eigvals = np.linalg.eigvalsh(cont_cov)
+                    min_eig = np.min(eigvals)
+                    max_eig = np.max(eigvals)
+                    eig_ratio = max_eig / (abs(min_eig) + 1e-30)
+                    print(f"[MC] 4. Continuum Covariance Eigenvalue Analysis:")
+                    print(f"[MC]   Eigenvalues: {eigvals}")
+                    print(f"[MC]   Min eigenvalue: {min_eig:.6e}")
+                    print(f"[MC]   Max eigenvalue: {max_eig:.6e}")
+                    print(f"[MC]   Max/min ratio: {eig_ratio:.2e}")
+                    if min_eig < 0:
+                        print(f"[MC]   ERROR: Negative eigenvalue detected (non-positive-definite matrix)")
+                    elif min_eig < 1e-15 * max_eig:
+                        print(f"[MC]   WARNING: Smallest eigenvalue near machine epsilon relative to largest")
+                except (np.linalg.LinAlgError, ValueError) as e:
+                    print(f"[MC] 4. Could not compute eigenvalues: {e}")
+            
+            # 5. Bounds vs fit window extrapolation check
+            if 'bounds' in fit_dict and continuum_fit_dict:
+                ew_bounds = fit_dict.get('bounds')
+                cont_bounds = continuum_fit_dict.get('bounds')
+                if ew_bounds and cont_bounds:
+                    if ew_bounds[0] < cont_bounds[0] or ew_bounds[1] > cont_bounds[1]:
+                        print(f"[MC] 5. BOUNDS EXTRAPOLATION DETECTED:")
+                        print(f"[MC]   EW integration bounds:     {ew_bounds[0]:.2f} - {ew_bounds[1]:.2f} Å")
+                        print(f"[MC]   Continuum fit bounds:      {cont_bounds[0]:.2f} - {cont_bounds[1]:.2f} Å")
+                        print(f"[MC]   EW extends beyond continuum fit region")
+                        print(f"[MC]   LEFT:  fit={cont_bounds[0]:.2f}, EW={ew_bounds[0]:.2f}, extrapolate={max(0, cont_bounds[0] - ew_bounds[0]):.2f} Å")
+                        print(f"[MC]   RIGHT: fit={cont_bounds[1]:.2f}, EW={ew_bounds[1]:.2f}, extrapolate={max(0, ew_bounds[1] - cont_bounds[1]):.2f} Å")
+                    else:
+                        print(f"[MC] 5. Bounds OK: EW integration within continuum fit region")
+            
+            print("[MC] ========== END STEP 1 DIAGNOSTICS ==========")
+            
             # Calculate statistics from the distribution
             median_ew = np.percentile(valid_ew_samples, 50)
             mean_ew = np.mean(valid_ew_samples)
@@ -6081,7 +8106,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             profile_params, _ = self._get_profile_params_from_dict(fit_dict, fit_type)
             best_profile = self._evaluate_profile(x_int, fit_type, profile_params)
             if cont_coeffs is not None:
-                best_continuum = np.polyval(cont_coeffs, x_int)
+                # Check if continuum is Chebyshev (has type and domain fields)
+                if continuum_fit_dict and continuum_fit_dict.get('type') == 'chebyshev':
+                    # Chebyshev evaluation with domain rescaling
+                    lam_min = continuum_fit_dict.get('lam_min', bounds[0])
+                    lam_max = continuum_fit_dict.get('lam_max', bounds[1])
+                    x_rescaled = 2 * (x_int - lam_min) / (lam_max - lam_min) - 1
+                    best_continuum = np.polynomial.chebyshev.chebval(x_rescaled, cont_coeffs)
+                else:
+                    # Standard polynomial evaluation (coefficients reversed for polyval)
+                    best_continuum = np.polyval(cont_coeffs, x_int)
             else:
                 continuum_level = self._get_continuum_level_estimate(bounds)
                 if continuum_level is None or continuum_level <= 0:
@@ -6215,6 +8249,28 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                                 comp.get('index') == poly_index):
                                 components.pop(i)
                                 print(f"[DEBUG] Removed polynomial (index={poly_index}) from listfit components")
+                                break
+                        break
+        
+        # Handle Chebyshev deletion - remove from listfit components list
+        elif item_type == 'chebyshev':
+            fit_dict = item_info.get('fit_dict', {})
+            listfit_bounds = fit_dict.get('listfit_bounds')
+            cheb_index = fit_dict.get('cheb_index')
+            
+            # Find the listfit this chebyshev belongs to and remove the component
+            if listfit_bounds is not None and cheb_index is not None:
+                for listfit in self.listfit_fits:
+                    if listfit.get('bounds') == listfit_bounds:
+                        # Remove the component from the listfit's components list
+                        components = listfit.get('components', [])
+                        # Remove component by matching type and index
+                        for i in range(len(components) - 1, -1, -1):  # Iterate backwards to avoid index shifting
+                            comp = components[i]
+                            if (comp.get('type') == 'chebyshev' and 
+                                comp.get('index') == cheb_index):
+                                components.pop(i)
+                                print(f"[DEBUG] Removed chebyshev (index={cheb_index}) from listfit components")
                                 break
                         break
         
@@ -6458,15 +8514,27 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         
     def on_calculate_ew_from_tracker(self, item_id):
         """Handle calculate equivalent width action from ItemTracker context menu"""
+        print(f"[DEBUG_ON_EW] on_calculate_ew_from_tracker called with item_id={item_id}")
         if item_id not in self.item_id_map:
+            print(f"[DEBUG_ON_EW] item_id {item_id} not in item_id_map, returning")
             return
         
         item_info = self.item_id_map[item_id]
         item_type = item_info.get('type')
         fit_dict = item_info.get('fit_dict')
         
+        print(f"[DEBUG_ON_EW] item_type={item_type}, has_fit_dict={fit_dict is not None}")
+        
         if not fit_dict:
             print("[EW] No fit dictionary found for this item")
+            return
+        
+        # Skip EW calculation for polynomials - they don't have meaningful equivalent width
+        if item_type == 'polynomial' or item_type == 'continuum':
+            print(f"[EW] Skipping EW calculation for {item_type} - not a spectral feature")
+            print(f"[DEBUG_TRACE] on_calculate_ew_from_tracker called for {item_type} item - printing traceback:")
+            import traceback
+            traceback.print_stack()
             return
         
         # Determine if this is from a listfit or a regular fit
@@ -6496,7 +8564,13 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 continuum_fit_dict = self.continuum_fits[-1] if self.continuum_fits else None
         
         # Calculate EW
-        ew_result = self._calculate_equivalent_width_monte_carlo(fit_dict, continuum_fit_dict, fit_type)
+        try:
+            ew_result = self._calculate_equivalent_width_monte_carlo(fit_dict, continuum_fit_dict, fit_type)
+        except Exception as e:
+            print(f"[EW] Exception during MC calculation: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            ew_result = None
         
         if ew_result:
             print(f"\n[EW Calculation Results for {item_type.capitalize()}]")
@@ -6532,6 +8606,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         
         Returns continuum fit dict if there's exactly 1 polynomial, None otherwise
         """
+        print(f"[DEBUG_CONT] _get_listfit_continuum called, printing traceback:")
+        import traceback
+        traceback.print_stack()
+        
         listfit_bounds = listfit_profile_dict.get('listfit_bounds')
         if listfit_bounds is None:
             return None
@@ -6549,31 +8627,45 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         
         if len(listfit_continua) == 1:
             continuum = listfit_continua[0]
-            print(f"[EW] Found polynomial in continuum_fits: order={continuum.get('poly_order')}")
+            cont_type = continuum.get('type', 'polynomial')
+            print(f"[EW] Found {cont_type} in continuum_fits: order={continuum.get('poly_order')}")
             # Return as continuum dict for MC calculation
-            return {
+            # Use stored covariance if available (from loaded .qsap), otherwise build from coeffs_err
+            covariance = continuum.get('covariance')
+            if covariance is None and continuum.get('coeffs_err') is not None:
+                covariance = np.diag([(e**2 if e > 0 else 1e-10) for e in continuum.get('coeffs_err', [])])
+            elif covariance is None:
+                covariance = np.diag([1e-10] * len(continuum.get('coeffs', [])))
+            
+            result_dict = {
                 'coeffs': continuum.get('coeffs', []),
-                'covariance': np.diag([(e**2 if e > 0 else 1e-10) for e in continuum.get('coeffs_err', [])]),
-                'bounds': listfit_bounds
+                'covariance': covariance,
+                'bounds': listfit_bounds,
+                'type': cont_type  # Include type for proper evaluation in MC
             }
+            # Add domain bounds for Chebyshev
+            if cont_type == 'chebyshev':
+                result_dict['lam_min'] = continuum.get('lam_min')
+                result_dict['lam_max'] = continuum.get('lam_max')
+            return result_dict
         elif len(listfit_continua) > 1:
             print(f"[EW] Found {len(listfit_continua)} polynomials in continuum_fits (need exactly 1)")
             return None
         
-        # THIRD: Fall back to looking in listfit_fits for polynomial components
+        # THIRD: Fall back to looking in listfit_fits for polynomial or Chebyshev components
         for listfit in self.listfit_fits:
             if listfit.get('bounds') == listfit_bounds:
-                # Extract all polynomials from this listfit
+                # Extract all continuum components (polynomial or Chebyshev) from this listfit
                 components = listfit.get('components', [])
-                polynomials = [c for c in components if c.get('type') == 'polynomial']
+                continuum_comps = [c for c in components if c.get('type') in ['polynomial', 'chebyshev']]
                 
-                # Return the continuum only if there's exactly 1 polynomial
-                if len(polynomials) == 1:
-                    poly_comp = polynomials[0]
+                # Return the continuum only if there's exactly 1 continuum component
+                if len(continuum_comps) == 1:
+                    cont_comp = continuum_comps[0]
                     
-                    # Get coefficients from the stored polynomial component
-                    coeffs = poly_comp.get('coeffs', [])
-                    coeffs_err = poly_comp.get('coeffs_err', [])
+                    # Get coefficients from the stored continuum component
+                    coeffs = cont_comp.get('coeffs', [])
+                    coeffs_err = cont_comp.get('coeffs_err', [])
                     
                     if not coeffs:
                         return None
@@ -6584,12 +8676,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     continuum_dict = {
                         'coeffs': coeffs,
                         'covariance': covariance,
-                        'bounds': listfit.get('bounds')
+                        'bounds': listfit.get('bounds'),
+                        'type': cont_comp.get('type'),  # Store type so MC calculation knows if it's Chebyshev
+                        'lam_min': cont_comp.get('lam_min'),
+                        'lam_max': cont_comp.get('lam_max')
                     }
-                    print("[EW] Found polynomial in listfit_fits components")
+                    comp_type = cont_comp.get('type')
+                    print(f"[EW] Found {comp_type} in listfit_fits components")
                     return continuum_dict
                 else:
-                    print(f"[EW] Listfit has {len(polynomials)} polynomials (need exactly 1)")
+                    print(f"[EW] Listfit has {len(continuum_comps)} continuum components (need exactly 1)")
                     return None
         
         print("[EW] No continuum polynomial found for this listfit")
@@ -6606,6 +8702,268 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         self.plot_mc_profiles_enabled = (state == QtCore.Qt.Checked)
         status = "enabled" if self.plot_mc_profiles_enabled else "disabled"
         print(f"MC Profile plotting {status}")
+    
+    def on_error_spectrum_mode_changed(self):
+        """Handle change in error spectrum display mode (Default or Shaded)"""
+        if self.error_spectrum_default_radio.isChecked():
+            self.error_spectrum_mode = "Default"
+            print("Error spectrum mode: Default (red dashed line)")
+        else:
+            self.error_spectrum_mode = "Shaded"
+            print("Error spectrum mode: Shaded (gray band ±error)")
+        
+        # Redraw error spectrum
+        self.redraw_error_spectrum()
+    
+    def on_residual_display_mode_changed(self):
+        """Handle change in residual display mode (None, Sigma, or Shaded)"""
+        if self.residual_none_radio.isChecked():
+            self.residual_display_mode = "None"
+            print("Residual display mode: None (default)")
+        elif self.residual_sigma_radio.isChecked():
+            self.residual_display_mode = "Sigma"
+            print("Residual display mode: Sigma (residual / error)")
+        else:
+            self.residual_display_mode = "Shaded"
+            print("Residual display mode: Shaded")
+        
+        # Redraw residual panel if visible
+        if self.is_residual_shown:
+            self.redraw_residual_panel()
+    
+    def redraw_error_spectrum(self):
+        """Redraw error spectrum based on current mode (Default or Shaded)"""
+        try:
+            if not hasattr(self, 'ax') or self.ax is None or self.err is None:
+                return
+            
+            # Get error color configuration
+            error_cfg = self.colors['spectrum']['error']
+            
+            # Remove old error spectrum visualizations
+            if self.error_band_fill is not None:
+                try:
+                    self.error_band_fill.remove()
+                except (ValueError, AttributeError):
+                    pass
+                self.error_band_fill = None
+            
+            if self.error_line is not None:
+                try:
+                    self.error_line.remove()
+                except (ValueError, AttributeError):
+                    pass
+                self.error_line = None
+            
+            if self.step_error is not None:
+                try:
+                    self.step_error.remove()
+                except (ValueError, AttributeError):
+                    pass
+                self.step_error = None
+            
+            if self.line_error is not None:
+                try:
+                    self.line_error.remove()
+                except (ValueError, AttributeError):
+                    pass
+                self.line_error = None
+            
+            # Draw error spectrum based on mode
+            if self.error_spectrum_mode == "Shaded":
+                # Draw shaded band (spectrum ± error) with semi-transparent gray
+                if self.is_step_plot:
+                    self.error_band_fill = self.ax.fill_between(
+                        self.x_data, 
+                        self.spec - self.err, 
+                        self.spec + self.err,
+                        step='mid',
+                        alpha=0.15,
+                        color='gray',
+                        label='Error',
+                        zorder=1
+                    )
+                else:
+                    self.error_band_fill = self.ax.fill_between(
+                        self.x_data, 
+                        self.spec - self.err, 
+                        self.spec + self.err,
+                        alpha=0.15,
+                        color='gray',
+                        label='Error',
+                        zorder=1
+                    )
+            else:  # Default mode - plot error values as red dashed line (original behavior)
+                if self.is_step_plot:
+                    # Step plot version
+                    self.step_error, = self.ax.step(
+                        self.x_data, self.err,
+                        where='mid', 
+                        color=error_cfg['color'], 
+                        linestyle=error_cfg['linestyle'], 
+                        linewidth=1.0,
+                        alpha=error_cfg['alpha'], 
+                        label='Error',
+                        zorder=0
+                    )
+                    self.error_line = self.step_error
+                else:
+                    # Line plot version
+                    self.line_error, = self.ax.plot(
+                        self.x_data, self.err,
+                        color=error_cfg['color'], 
+                        linestyle=error_cfg['linestyle'], 
+                        linewidth=1.0,
+                        alpha=error_cfg['alpha'], 
+                        label='Error',
+                        zorder=0
+                    )
+                    self.error_line = self.line_error
+            
+            # Update legend
+            if hasattr(self, 'ax') and self.ax is not None:
+                self.update_legend()
+            
+            # Redraw canvas
+            self.ax.figure.canvas.draw_idle()
+            
+        except Exception as e:
+            print(f"Error redrawing error spectrum: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def redraw_residual_panel(self):
+        """Redraw residual panel based on current display mode"""
+        try:
+            if not hasattr(self, 'residual_ax') or self.residual_ax is None:
+                return
+            
+            # Clear residual panel
+            self.residual_ax.clear()
+            
+            # Get residuals
+            residuals = self.calculate_residuals()
+            if residuals is None or len(residuals) == 0:
+                return
+            
+            # Get color configuration for residuals
+            residual_cfg = self.colors['residual']
+            residual_color = residual_cfg['color']
+            
+            # Plot based on mode
+            if self.residual_display_mode == "Sigma":
+                # Plot residual / error
+                if self.err is not None and len(self.err) == len(residuals):
+                    # Avoid division by zero
+                    sigma_residuals = np.divide(
+                        residuals, 
+                        self.err,
+                        out=np.zeros_like(residuals),
+                        where=self.err!=0
+                    )
+                    if self.is_step_plot:
+                        self.residual_ax.step(
+                            self.x_data, sigma_residuals,
+                            where='mid', color=residual_color, linewidth=1.0
+                        )
+                    else:
+                        self.residual_ax.plot(
+                            self.x_data, sigma_residuals,
+                            color=residual_color, linewidth=1.0
+                        )
+                    # Set y-axis label for sigma
+                    self.residual_ax.set_ylabel(r"Residuals ($\sigma$)", fontsize=10)
+                else:
+                    # Fallback to regular residuals if no error
+                    if self.is_step_plot:
+                        self.residual_ax.step(
+                            self.x_data, residuals,
+                            where='mid', color=residual_color, linewidth=1.0
+                        )
+                    else:
+                        self.residual_ax.plot(
+                            self.x_data, residuals,
+                            color=residual_color, linewidth=1.0
+                        )
+                    self.residual_ax.set_ylabel("Residuals", fontsize=10)
+            elif self.residual_display_mode == "Shaded":
+                # Plot residuals with shaded confidence band
+                if self.is_step_plot:
+                    self.residual_ax.step(
+                        self.x_data, residuals,
+                        where='mid', color=residual_color, linewidth=1.0
+                    )
+                else:
+                    self.residual_ax.plot(
+                        self.x_data, residuals,
+                        color=residual_color, linewidth=1.0
+                    )
+                # Add shaded band around residuals using error spectrum
+                if self.err is not None and len(self.err) == len(residuals):
+                    if self.is_step_plot:
+                        self.residual_ax.fill_between(
+                            self.x_data,
+                            residuals - self.err,
+                            residuals + self.err,
+                            step='mid',
+                            alpha=0.15,
+                            color='lightgray',
+                            zorder=0
+                        )
+                    else:
+                        self.residual_ax.fill_between(
+                            self.x_data,
+                            residuals - self.err,
+                            residuals + self.err,
+                            alpha=0.15,
+                            color='lightgray',
+                            zorder=0
+                        )
+                self.residual_ax.set_ylabel("Residuals", fontsize=10)
+            else:  # "None" mode (default)
+                # Regular residuals plot
+                if self.is_step_plot:
+                    self.residual_ax.step(
+                        self.x_data, residuals,
+                        where='mid', color=residual_color, linewidth=1.0
+                    )
+                else:
+                    self.residual_ax.plot(
+                        self.x_data, residuals,
+                        color=residual_color, linewidth=1.0
+                    )
+                self.residual_ax.set_ylabel("Residuals", fontsize=10)
+            
+            # Draw zero reference line
+            ref_cfg = self.colors['reference_lines']
+            self.residual_ax.axhline(y=0, color=ref_cfg['color'], linestyle=ref_cfg['linestyle'], linewidth=ref_cfg['linewidth'])
+            
+            # Set x-axis label based on velocity mode
+            if self.is_velocity_mode:
+                self.residual_ax.set_xlabel(r"Velocity (km s$^{-1}$)", fontsize=10)
+            else:
+                self.residual_ax.set_xlabel(self._get_wavelength_unit_label(), fontsize=10)
+            
+            # Sync x-axis bounds with spectrum
+            if self.ax is not None:
+                self.residual_ax.set_xlim(self.ax.get_xlim())
+            
+            # Update formatting and limits
+            self.update_residual_ticks()
+            self.update_residual_ybounds()
+            
+            # Update x-data for velocity mode if needed
+            if self.is_velocity_mode and hasattr(self, 'velocities') and len(self.velocities) == len(self.x_data):
+                # Residual lines already plotted, but update if needed
+                pass
+            
+            # Redraw canvas
+            self.residual_ax.figure.canvas.draw_idle()
+            
+        except Exception as e:
+            print(f"Error redrawing residual panel: {e}")
+            import traceback
+            traceback.print_exc()
     
     def save_ew_qsap_file(self, ew_result, fit_dict, fit_type):
         """Save Equivalent Width results to a dedicated .qsap file
@@ -7954,7 +10312,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.mask_drag_start_x = event.xdata
             return
         
-        # Handle guess drawing mode - click-drag to draw, or multi-point click for polynomial
+        # Handle guess drawing mode - click-drag to draw, or multi-point click for polynomial/chebyshev
         if self.guess_drawing_mode and event.inaxes == self.ax and event.xdata is not None:
             comp_type = self.current_component_for_guess.get('type', '').lower()
             
@@ -7962,6 +10320,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             if comp_type == 'polynomial':
                 self._add_polynomial_point(event.xdata, event.ydata)
                 return  # Don't start a drag for polynomial
+            
+            # Chebyshev: multi-point click mode (same as polynomial)
+            if comp_type == 'chebyshev':
+                self._add_chebyshev_point(event.xdata, event.ydata)
+                return  # Don't start a drag for chebyshev
             
             # Gaussian/Voigt: drag mode
             self.guess_mouse_down = True
@@ -8258,8 +10621,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         amp_compensated = amp * (sigma * s2pi)
                         y_preview = self.voigt(x_preview, amp_compensated, center, sigma, gamma)
                     
-                    # Add polynomial baseline to preview (floor for profiles to stand on)
-                    poly_guesses = [c for c in self.listfit_components if c.get('type') == 'polynomial' and c.get('guess')]
+                    # Add polynomial or chebyshev baseline to preview (floor for profiles to stand on)
+                    poly_guesses = [c for c in self.listfit_components if c.get('type') in ['polynomial', 'chebyshev'] and c.get('guess')]
                     poly_baseline_for_profile = np.zeros_like(x_preview)
                     
                     # Remove old polynomial baseline line preview
@@ -8636,29 +10999,37 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         x_plot = np.linspace(self.x_data.min(), self.x_data.max(), 10000)
         total_y = np.zeros_like(x_plot)
         
+        print(f"[DEBUG_TOTAL_LINE] Starting total line calculation, x_plot range: {x_plot.min():.2f} to {x_plot.max():.2f}")
+        
         # Simple approach: sum all profile lines from the item tracker
-        # The item tracker's items dict contains all plotted profiles (gaussian, voigt, continuum, polynomial, etc.)
+        # The item tracker's items dict contains all plotted profiles (gaussian, voigt, continuum, polynomial, chebyshev, etc.)
         if hasattr(self, 'item_tracker') and self.item_tracker and hasattr(self.item_tracker, 'items'):
             for item_id, item_data in self.item_tracker.items.items():
                 item_type = item_data.get('type')
                 line_obj = item_data.get('line_obj')
                 
                 # Only sum actual profile lines (not masks or other non-profile items)
-                if item_type in ['gaussian', 'voigt', 'continuum', 'polynomial'] and line_obj is not None:
+                if item_type in ['gaussian', 'voigt', 'continuum', 'polynomial', 'chebyshev'] and line_obj is not None:
                     try:
                         # Get the plotted data from the line object
                         fit_x = line_obj.get_xdata()
                         fit_y = line_obj.get_ydata()
                         
+                        print(f"[DEBUG_TOTAL_LINE] Adding {item_type} line: x range {fit_x.min():.2f}-{fit_x.max():.2f}, y range {fit_y.min():.6f}-{fit_y.max():.6f}")
+                        
                         if len(fit_x) > 0 and len(fit_y) > 0:
                             # Interpolate to common x grid
                             from scipy.interpolate import interp1d
                             interp_func = interp1d(fit_x, fit_y, kind='linear', bounds_error=False, fill_value=0)
-                            total_y += interp_func(x_plot)
+                            interpolated = interp_func(x_plot)
+                            total_y += interpolated
+                            print(f"[DEBUG_TOTAL_LINE]   Interpolated y range: {interpolated.min():.6f}-{interpolated.max():.6f}")
                     except Exception as e:
                         # Skip lines that can't be interpolated
                         print(f"[DEBUG] Warning: Could not add {item_type} line to total: {e}")
                         continue
+        
+        print(f"[DEBUG_TOTAL_LINE] Final total_y range: {total_y.min():.6f} to {total_y.max():.6f}")
         
         # Plot the total line using the configured color
         total_line_cfg = self.colors['profiles']['total_line']
@@ -8931,6 +11302,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             if self.continuum_mode:
                 # Already in continuum mode, so pressing 'm' again exits it
                 self.continuum_mode = False
+                self.current_continuum_fit_id = None  # Clear fit tracking
                 self.continuum_regions = []  # Clear any defined regions
                 # Update dropdown to blank
                 self.continuum_mode_dropdown.blockSignals(True)
@@ -8940,6 +11312,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             else:
                 # Enter continuum mode
                 self.continuum_mode = True
+                self.current_continuum_fit_id = self.next_fit_id()  # Assign new fit_id for this session
+                self.assign_fit_color(self.current_continuum_fit_id)
                 # Update dropdown to show active mode
                 self.continuum_mode_dropdown.blockSignals(True)
                 self.continuum_mode_dropdown.setCurrentText("Continuum Region(s)")
@@ -8962,6 +11336,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # Check if we have valid continuum regions
             if not self.continuum_regions:
                 self.continuum_mode = False
+                self.current_continuum_fit_id = None  # Clear fit tracking
                 # Reset dropdown to blank
                 self.continuum_mode_dropdown.blockSignals(True)
                 self.continuum_mode_dropdown.setCurrentIndex(0)
@@ -8990,6 +11365,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 region_bounds = (min(region[0] for region in self.continuum_regions), max(region[1] for region in self.continuum_regions))
             except (ValueError, TypeError) as e:
                 self.continuum_mode = False
+                self.current_continuum_fit_id = None  # Clear fit tracking
                 # Reset dropdown to blank
                 self.continuum_mode_dropdown.blockSignals(True)
                 self.continuum_mode_dropdown.setCurrentIndex(0)
@@ -9038,17 +11414,30 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 'is_velocity_mode': self.is_velocity_mode
             }
             self.continuum_fits.append(continuum_fit)
-            # Register with ItemTracker
+            # Register with ItemTracker - use same fit_id as the regions
             bounds_str = f"λ: {region_bounds[0]:.2f}-{region_bounds[1]:.2f} Å"
             continuum_cfg = self.colors['profiles']['continuum_line']
             self.register_item('continuum', f'Continuum (order {self.poly_order})', fit_dict=continuum_fit,
-                             line_obj=continuum_line, position=bounds_str, color=continuum_cfg['color'])
+                             line_obj=continuum_line, position=bounds_str, color=continuum_cfg['color'],
+                             fit_id=self.current_continuum_fit_id)
             
             # Record action for undo/redo
             self.record_action('fit_continuum', f'Fit Continuum (order {self.poly_order})')
             
+            # Exit continuum mode and clear fit tracking
+            self.continuum_mode = False
+            self.current_continuum_fit_id = None
+            
             # Save fit to .qsap file and print
-            self.save_and_print_qsap_fit(continuum_fit, 'Continuum', 'Single')
+            # Convert curve_fit covariance to lmfit-like format
+            pcov_from_dict = continuum_fit.get('covariance')
+            if pcov_from_dict is not None:
+                param_names = [f'p0_c{i}' for i in range(len(coeffs))]
+                param_values = list(coeffs)
+                mock_result = self._convert_curve_fit_to_lmfit_like(param_names, param_values, pcov_from_dict)
+                self.save_and_print_qsap_fit(continuum_fit, 'Continuum', 'Single', lmfit_result=mock_result)
+            else:
+                self.save_and_print_qsap_fit(continuum_fit, 'Continuum', 'Single')
             
             self.continuum_regions = [] # Clear continuum_regions
             self.continuum_mode = False # Exit continuum mode
@@ -9079,7 +11468,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 # Register the region patch with ItemTracker
                 position_str = f"λ: {region_bounds[0]:.2f}-{region_bounds[1]:.2f} Å"
                 self.register_item('continuum_region', f'Continuum Region', patch_obj=patch, 
-                                 position=position_str, color=continuum_region_cfg['color'], bounds=region_bounds)
+                                 position=position_str, color=continuum_region_cfg['color'], bounds=region_bounds,
+                                 fit_id=self.current_continuum_fit_id)
                 # Record action for defining a continuum region
                 self.record_action('define_continuum_region', f'Define Continuum Region λ: {region_bounds[0]:.2f}-{region_bounds[1]:.2f} Å')
                 # self.continuum_patches.append(patch) # Store the patch
@@ -9343,8 +11733,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
 
                     # Plot the fit and store fit info
                     x_fit = comp_x
-                    y_fit = self.gaussian(x_fit, amp, mean, stddev) + continuum_for_plot
-                    residuals = comp_y - y_fit
+                    y_fit_full = self.gaussian(x_fit, amp, mean, stddev) + continuum_for_plot  # For residuals
+                    y_fit_plot = self.gaussian(x_fit, amp, mean, stddev)  # For display (without continuum offset)
+                    residuals = comp_y - y_fit_full
                     # Calculate chi2 with optional errors
                     if comp_err is not None:
                         chi2 = np.sum((residuals ** 2) / comp_err) # Calculate chi2
@@ -9354,7 +11745,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     
                     # Lazy import of scipy for interpolation
                     from scipy.interpolate import interp1d
-                    interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
+                    interpolator = interp1d(x_fit, y_fit_plot, kind='cubic', bounds_error=False, fill_value='extrapolate')
                     x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                     y_plt = interpolator(x_plt)
                     gaussian_cfg = self.colors['profiles']['gaussian']
@@ -9387,7 +11778,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     self.record_action('fit_gaussian', f'Fit Gaussian at λ={mean:.2f} Å')
                     
                     # Save fit to .qsap file and print
-                    self.save_and_print_qsap_fit(self.gaussian_fits[-1], 'Gaussian', 'Single')
+                    # Convert curve_fit covariance to lmfit-like format
+                    fit_gaussian = self.gaussian_fits[-1]
+                    pcov_from_dict = fit_gaussian.get('covariance')
+                    if pcov_from_dict is not None:
+                        param_names = ['amp', 'mean', 'stddev']
+                        param_values = [fit_gaussian['amp'], fit_gaussian['mean'], fit_gaussian['stddev']]
+                        mock_result = self._convert_curve_fit_to_lmfit_like(param_names, param_values, pcov_from_dict)
+                        self.save_and_print_qsap_fit(fit_gaussian, 'Gaussian', 'Single', lmfit_result=mock_result)
+                    else:
+                        self.save_and_print_qsap_fit(fit_gaussian, 'Gaussian', 'Single')
 
                     self.component_id += 1
                     # Force immediate redraw of the canvas
@@ -9502,6 +11902,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 params, pcov = curve_fit(self.multi_gaussian, comp_xs, continuum_subtracted_ys, sigma=sigma_param, p0=initial_guesses, bounds=(lower_bounds, upper_bounds)) # NOT SHARED SIGMA
                 perr = np.sqrt(np.diag(pcov))
                 
+                # Store full pcov for later use when saving to .qsap
+                self._multi_gaussian_full_pcov = pcov
+                self._multi_gaussian_param_names = []
+                
                 # Track component boundaries in concatenated arrays for later chi2 calculation
                 component_boundaries = []
                 cumulative_idx = 0
@@ -9512,13 +11916,17 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     amp, mean, stddev = params[i:i+3]
                     amp_err, mean_err, stddev_err = perr[i:i+3]
                     x_fit = self.x_data[(self.x_data >= bound_pairs[i // 3][0]) & (self.x_data <= bound_pairs[i // 3][1])]
-                    y_fit = self.gaussian(x_fit, amp, mean, stddev) + continuum_ys[i // 3]
+                    y_fit_plot = self.gaussian(x_fit, amp, mean, stddev)  # For display (without continuum offset)
                     continuum_sub_data = comp_ys[i // 3] - continuum_ys[i // 3]
                     residuals = continuum_sub_data - self.gaussian(x_fit, amp, mean, stddev)
                     
                     # Extract this component's covariance from the full covariance matrix
                     comp_cov_indices = [i, i+1, i+2]
                     comp_cov = pcov[np.ix_(comp_cov_indices, comp_cov_indices)]
+                    
+                    # Track parameter names for covariance storage
+                    g_idx = i // 3
+                    self._multi_gaussian_param_names.extend([f'g{g_idx}_amp', f'g{g_idx}_mu', f'g{g_idx}_sigma'])
                     
                     # Calculate chi2 or SSR depending on whether errors are available
                     if sigma_param is not None and i // 3 < len(component_boundaries):
@@ -9528,7 +11936,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     else:
                         chi2 = np.sum(residuals ** 2)  # SSR without errors
                     chi2_nu = chi2 / (len(x_fit) - 3)  # 3 params per component
-                    interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
+                    interpolator = interp1d(x_fit, y_fit_plot, kind='cubic', bounds_error=False, fill_value='extrapolate')
                     x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                     y_plt = interpolator(x_plt)
                     gaussian_cfg = self.colors['profiles']['gaussian']
@@ -9592,7 +12000,17 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 # Save multi-gaussian fit to .qsap file
                 multi_gaussian_components = [g for g in self.gaussian_fits if g.get('fit_id') == self.fit_id - 1]
                 if multi_gaussian_components:
-                    self.save_and_print_qsap_fit(multi_gaussian_components, 'Gaussian', 'Multi-Gaussian')
+                    # Convert full curve_fit covariance to lmfit-like format
+                    if hasattr(self, '_multi_gaussian_full_pcov') and self._multi_gaussian_full_pcov is not None:
+                        param_names = self._multi_gaussian_param_names if hasattr(self, '_multi_gaussian_param_names') else []
+                        param_values = list(params)  # All parameter values from curve_fit
+                        if param_names and len(param_names) == len(param_values):
+                            mock_result = self._convert_curve_fit_to_lmfit_like(param_names, param_values, self._multi_gaussian_full_pcov)
+                            self.save_and_print_qsap_fit(multi_gaussian_components, 'Gaussian', 'Multi-Gaussian', lmfit_result=mock_result)
+                        else:
+                            self.save_and_print_qsap_fit(multi_gaussian_components, 'Gaussian', 'Multi-Gaussian')
+                    else:
+                        self.save_and_print_qsap_fit(multi_gaussian_components, 'Gaussian', 'Multi-Gaussian')
 
         # Enter Voigt fit mode
         if event.key == 'n':
@@ -9720,8 +12138,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 self.ax.figure.canvas.draw_idle()  # Redraw to show bound lines removed
                 # Visualize the fit
                 x_fit = np.linspace(left_bound, right_bound, len(continuum_for_plot))
-                y_fit = result.eval(x=x_fit) + continuum_for_plot
-                residuals = comp_y - y_fit
+                y_fit_full = result.eval(x=x_fit) + continuum_for_plot  # For residuals
+                y_fit_plot = result.eval(x=x_fit)  # For display (without continuum offset)
+                residuals = comp_y - y_fit_full
                 # Calculate chi2 with optional errors
                 if comp_err is not None:
                     chi2 = np.sum((residuals ** 2) / comp_err) # Calculate combined chi2
@@ -9729,7 +12148,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     chi2 = np.sum(residuals ** 2) # Chi2 without errors
                 chi2_nu = chi2 / (len(x_fit) - len(result.params)) # Calculate chi2 d.o.f.
                 from scipy.interpolate import interp1d
-                interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
+                interpolator = interp1d(x_fit, y_fit_plot, kind='cubic', bounds_error=False, fill_value='extrapolate')
                 x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                 y_plt = interpolator(x_plt)
                 voigt_cfg = self.colors['profiles']['voigt']
@@ -9781,7 +12200,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 self.record_action('fit_voigt', f'Fit Voigt at λ={fit_results.get("center", fit_results.get("mean", 0)):.2f} Å')
                 
                 # Save fit to .qsap file and print
-                self.save_and_print_qsap_fit(fit_results, 'Voigt', 'Single')
+                self.save_and_print_qsap_fit(fit_results, 'Voigt', 'Single', lmfit_result=result)
                 
                 # Reset Advanced dropdown if Bayes mode was active
                 if self.bayes_mode:
@@ -9961,9 +12380,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 existing_continuum, _, _ = self.get_existing_continuum(left_bound, right_bound)
                 # Generate data for plotting
                 x_fit = np.linspace(left_bound, right_bound, len(existing_continuum))
-                y_fit = self.voigt(x_fit, amp, center, sigma, gamma) + existing_continuum
+                y_fit_full = self.voigt(x_fit, amp, center, sigma, gamma) + existing_continuum  # For residuals
+                y_fit_plot = self.voigt(x_fit, amp, center, sigma, gamma)  # For display
                 from scipy.interpolate import interp1d
-                interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
+                interpolator = interp1d(x_fit, y_fit_plot, kind='cubic', bounds_error=False, fill_value='extrapolate')
                 # Higher resolution for smooth plotting
                 x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                 y_plt = interpolator(x_plt)
@@ -10215,9 +12635,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 existing_continuum, _, _ = self.get_existing_continuum(left_bound, right_bound)
                 # Generate data for plotting
                 x_fit = np.linspace(left_bound, right_bound, len(existing_continuum))
-                y_fit = self.gaussian(x_fit, amp, mean, stddev) + existing_continuum
+                y_fit_full = self.gaussian(x_fit, amp, mean, stddev) + existing_continuum  # For residuals
+                y_fit_plot = self.gaussian(x_fit, amp, mean, stddev)  # For display
                 from scipy.interpolate import interp1d
-                interpolator = interp1d(x_fit, y_fit, kind='cubic', bounds_error=False, fill_value='extrapolate')
+                interpolator = interp1d(x_fit, y_fit_plot, kind='cubic', bounds_error=False, fill_value='extrapolate')
                 # Higher resolution for smooth plotting
                 x_plt = np.linspace(x_fit.min(), x_fit.max(), 10 * len(x_fit))
                 y_plt = interpolator(x_plt)
@@ -10887,6 +13308,15 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             print(f"    - The polynomial will be fit through the clicked points")
             print(f"  • Press ENTER/RETURN to confirm guess")
             print(f"  • Press ESC to cancel")
+        elif comp_type == 'chebyshev':
+            degree = component.get('degree', 1)
+            points_needed = degree + 2  # Need at least degree+1 points, use degree+2 for robustness
+            print(f"  • CLICK on the plot to set points for Chebyshev guess:")
+            print(f"    - Chebyshev degree: {degree}")
+            print(f"    - Points needed: at least {degree + 1} (recommended {points_needed})")
+            print(f"    - The Chebyshev polynomial will be fit through the clicked points")
+            print(f"  • Press ENTER/RETURN to confirm guess")
+            print(f"  • Press ESC to cancel")
         print(f"{'='*70}\n")
     
     def on_request_set_constraint_bounds(self, parameter):
@@ -11153,15 +13583,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 guess['x_min'] = x_min
                 guess['x_max'] = x_max
                 
+                # Format polynomial with coefficients in scientific notation for clarity
                 poly_str = "y = "
                 for i, coeff in enumerate(coeffs):
                     power = len(coeffs) - 1 - i
                     if power == 0:
-                        poly_str += f"{coeff:.6f}"
+                        poly_str += f"{coeff:.3e}"
                     elif power == 1:
-                        poly_str += f"{coeff:.6f}*x + "
+                        poly_str += f"{coeff:.3e}*x + "
                     else:
-                        poly_str += f"{coeff:.6f}*x^{power} + "
+                        poly_str += f"{coeff:.3e}*x^{power} + "
                 print(f"  Equation: {poly_str}")
             else:
                 # Old drag format
@@ -11195,6 +13626,75 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             
             # Mark that polynomial guess was confirmed (so we don't remove it in _cancel_guess)
             self._polynomial_guess_confirmed = True
+        
+        elif comp_type == 'chebyshev':
+            # Confirm Chebyshev guess
+            if 'guess' not in self.current_component_for_guess or not self.current_component_for_guess['guess']:
+                print("[Guess] Incomplete Chebyshev guess - cancelled")
+                self._cancel_guess()
+                return
+            
+            guess = self.current_component_for_guess['guess']
+            print(f"\n{'='*70}")
+            print(f"[Guess] ✓ Confirmed for CHEBYSHEV:")
+            
+            # Handle multi-point Chebyshev format
+            if 'coefficients' in guess:
+                degree = guess.get('degree', 1)
+                coeffs = guess.get('coefficients', [])
+                x_points = guess.get('x_points', [])
+                y_points = guess.get('y_points', [])
+                domain = guess.get('domain', [x_points[0] if x_points else 0, x_points[-1] if x_points else 0])
+                print(f"  Degree: {degree}")
+                print(f"  Points: {len(x_points)}")
+                print(f"  Domain: [{domain[0]:.2f}, {domain[1]:.2f}] Å")
+                
+                # Extend x_min and x_max to cover the FULL listfit fitting range
+                if self.listfit_bounds and len(self.listfit_bounds) >= 2:
+                    x_min = min(self.listfit_bounds)
+                    x_max = max(self.listfit_bounds)
+                    print(f"  Fitted range extended to listfit bounds: λ={x_min:.2f} to {x_max:.2f} Å")
+                else:
+                    x_min = guess.get('x_min', domain[0])
+                    x_max = guess.get('x_max', domain[1])
+                
+                # Update guess with full range
+                guess['x_min'] = x_min
+                guess['x_max'] = x_max
+                
+                # Format Chebyshev coefficients for display
+                coeffs_str = ', '.join([f"{c:.3e}" for c in coeffs])
+                print(f"  Coefficients: [{coeffs_str}]")
+            else:
+                print(f"  No Chebyshev data found")
+            
+            print(f"{'='*70}\n")
+            
+            # Exit guess drawing mode BEFORE plotting
+            self.guess_drawing_mode = False
+            
+            # Remove temporary Chebyshev preview line
+            if hasattr(self, 'guess_chebyshev_line') and self.guess_chebyshev_line is not None:
+                try:
+                    self.guess_chebyshev_line.remove()
+                    print("[DEBUG] Removed temporary Chebyshev preview line")
+                except (ValueError, RuntimeError):
+                    pass
+            
+            # Remove temporary clicked points markers
+            if hasattr(self, 'chebyshev_preview_points'):
+                for marker in self.chebyshev_preview_points:
+                    try:
+                        marker.remove()
+                    except (ValueError, RuntimeError):
+                        pass
+                self.chebyshev_preview_points.clear()
+            
+            # Create persistent Chebyshev guess line on the plot
+            self._plot_guess_line(self.current_component_for_guess)
+            
+            # Mark that Chebyshev guess was confirmed
+            self._chebyshev_guess_confirmed = True
         
         # Update the table display in listfit_window
         if hasattr(self, 'listfit_window') and self.listfit_window:
@@ -11280,6 +13780,54 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             self.canvas.draw_idle()  # Use canvas.draw_idle() to refresh the plot properly
             return
         
+        # Handle Chebyshev guesses
+        if comp_type == 'chebyshev':
+            if 'guess' not in component or 'coefficients' not in component.get('guess', {}):
+                return
+            
+            guess = component.get('guess', {})
+            coeffs = guess.get('coefficients', [])
+            degree = guess.get('degree', 1)
+            domain = guess.get('domain', [guess.get('x_min', 0), guess.get('x_max', 0)])
+            
+            try:
+                # Use listfit_bounds for full x-range if available
+                if self.listfit_bounds and len(self.listfit_bounds) >= 2:
+                    x_min, x_max = self.listfit_bounds[0], self.listfit_bounds[1]
+                    x_line = np.linspace(x_min, x_max, 200)
+                    label_str = f'Cheb Guess #{comp_id} (deg {degree})'
+                    print(f"[DEBUG] Plotting Chebyshev guess #{comp_id} across x_range [{x_min}, {x_max}]")
+                else:
+                    x_min, x_max = domain[0], domain[1]
+                    x_line = np.linspace(x_min, x_max, 200)
+                    label_str = f'Cheb Guess #{comp_id}'
+                    print(f"[DEBUG] Plotting Chebyshev guess #{comp_id} across domain [{x_min}, {x_max}]")
+                
+                # Rescale x to [-1, 1] for Chebyshev evaluation
+                x_rescaled = 2 * (x_line - domain[0]) / (domain[1] - domain[0]) - 1
+                y_line = np.polynomial.chebyshev.chebval(x_rescaled, coeffs)
+                
+                # Remove old line if exists
+                if comp_id in self.guess_lines:
+                    try:
+                        self.guess_lines[comp_id].remove()
+                    except (ValueError, RuntimeError):
+                        pass
+                
+                # Plot medium sea green colored line (distinct from polynomial salmon)
+                line, = self.ax.plot(x_line, y_line, color='mediumseagreen', linestyle='-',
+                                    linewidth=2.5, alpha=0.8,
+                                    label=label_str, zorder=5)
+                self.guess_lines[comp_id] = line
+                print(f"[DEBUG] Successfully plotted Chebyshev guess #{comp_id}")
+                self.canvas.draw_idle()
+                return
+            except Exception as e:
+                print(f"[Guess] Error plotting Chebyshev guess: {e}")
+                import traceback
+                traceback.print_exc()
+                return
+        
         # Handle Gaussian/Voigt guesses
         if guess.get('center') is None or guess.get('amp') is None:
             return
@@ -11315,9 +13863,9 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             else:
                 return
             
-            # Check if there's exactly ONE polynomial guess in listfit_components
-            # If so, add the polynomial baseline to the profile (floor for profiles to stand on)
-            poly_guesses = [c for c in self.listfit_components if c.get('type') == 'polynomial' and c.get('guess')]
+            # Check if there's exactly ONE polynomial or chebyshev guess in listfit_components
+            # If so, add the polynomial/chebyshev baseline to the profile (floor for profiles to stand on)
+            poly_guesses = [c for c in self.listfit_components if c.get('type') in ['polynomial', 'chebyshev'] and c.get('guess')]
             if len(poly_guesses) == 1:
                 poly_comp = poly_guesses[0]
                 poly_guess = poly_comp.get('guess', {})
@@ -11489,16 +14037,17 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # Plot the fitted curve
             self._plot_polynomial_fitted_curve(x_line, y_line)
             
-            # Print info
+            # Print info with coefficients in scientific notation for clarity
             poly_str = "y = "
             for i, coeff in enumerate(coeffs):
                 power = len(coeffs) - 1 - i
+                # Use scientific notation for clarity, especially for tiny coefficients
                 if power == 0:
-                    poly_str += f"{coeff:.6f}"
+                    poly_str += f"{coeff:.3e}"
                 elif power == 1:
-                    poly_str += f"{coeff:.6f}*x + "
+                    poly_str += f"{coeff:.3e}*x + "
                 else:
-                    poly_str += f"{coeff:.6f}*x^{power} + "
+                    poly_str += f"{coeff:.3e}*x^{power} + "
             
             print(f"[Polynomial Guess] ✓ Fitted polynomial (order {self.polynomial_order}):")
             print(f"  {poly_str}")
@@ -11522,6 +14071,98 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                                                    label='Polynomial Guess', zorder=14)
         self.canvas.draw()
     
+    def _add_chebyshev_point(self, x, y):
+        """Add a point for Chebyshev multi-point click mode"""
+        # Initialize Chebyshev points list if needed
+        if not hasattr(self, 'chebyshev_points'):
+            self.chebyshev_points = []
+        if not hasattr(self, 'chebyshev_preview_points'):
+            self.chebyshev_preview_points = []
+        
+        # Get degree from component
+        degree = self.current_component_for_guess.get('degree', 1)
+        points_needed = degree + 1
+        
+        # Add the point
+        self.chebyshev_points.append((x, y))
+        points_have = len(self.chebyshev_points)
+        points_remaining = max(0, points_needed - points_have)
+        
+        print(f"[Chebyshev Guess] Point {points_have} clicked at λ={x:.2f} Å, flux={y:.4f}")
+        print(f"  Points needed: {points_needed}, Points remaining: {points_remaining}")
+        
+        # Plot the clicked point as a small marker
+        point_marker, = self.ax.plot([x], [y], 'o', color='mediumseagreen', markersize=8, zorder=15)
+        self.chebyshev_preview_points.append(point_marker)
+        
+        # If we have enough points, fit the Chebyshev
+        if points_have >= points_needed:
+            self._fit_chebyshev_from_points()
+        
+        self.canvas.draw()
+    
+    def _fit_chebyshev_from_points(self):
+        """Fit a Chebyshev polynomial through the collected points"""
+        if len(self.chebyshev_points) < 2:
+            print("[Chebyshev Guess] Need at least 2 points to fit Chebyshev")
+            return
+        
+        # Extract x and y coordinates
+        x_pts = np.array([pt[0] for pt in self.chebyshev_points])
+        y_pts = np.array([pt[1] for pt in self.chebyshev_points])
+        
+        # Fit Chebyshev polynomial
+        try:
+            degree = self.current_component_for_guess.get('degree', 1)
+            from numpy.polynomial import chebyshev
+            cheb_fit = chebyshev.Chebyshev.fit(x_pts, y_pts, degree, domain=[x_pts.min(), x_pts.max()])
+            
+            # Generate smooth curve for display
+            x_line = np.linspace(x_pts.min(), x_pts.max(), 100)
+            # Evaluate Chebyshev using the fitted object's call method
+            y_line = cheb_fit(x_line)
+            
+            # Store in guess
+            self.current_component_for_guess['guess'] = {
+                'coefficients': cheb_fit.coef.tolist(),
+                'degree': degree,
+                'domain': [float(cheb_fit.domain[0]), float(cheb_fit.domain[1])],
+                'x_points': x_pts.tolist(),
+                'y_points': y_pts.tolist(),
+                'x_min': float(x_pts.min()),
+                'x_max': float(x_pts.max())
+            }
+            
+            # Plot the fitted curve
+            self._plot_chebyshev_fitted_curve(x_line, y_line)
+            
+            # Print info with coefficients
+            coeffs_str = ', '.join([f"{c:.3e}" for c in cheb_fit.coef])
+            print(f"[Chebyshev Guess] ✓ Fitted Chebyshev (degree {degree}):")
+            print(f"  Coefficients: [{coeffs_str}]")
+            print(f"  Domain: [{cheb_fit.domain[0]:.2f}, {cheb_fit.domain[1]:.2f}] Å")
+            print(f"[Chebyshev Guess] Press ENTER to confirm, or ESC to cancel")
+            
+        except Exception as e:
+            print(f"[Chebyshev Guess] Error fitting Chebyshev: {e}")
+    
+    def _plot_chebyshev_fitted_curve(self, x_line, y_line):
+        """Plot the fitted Chebyshev curve"""
+        # Remove old guess Chebyshev line
+        if not hasattr(self, 'guess_chebyshev_line'):
+            self.guess_chebyshev_line = None
+        if self.guess_chebyshev_line is not None:
+            try:
+                self.guess_chebyshev_line.remove()
+            except (ValueError, RuntimeError):
+                pass
+        
+        # Draw medium sea green colored curve (distinct from salmon polynomial)
+        self.guess_chebyshev_line, = self.ax.plot(x_line, y_line, color='mediumseagreen',
+                                                   linestyle='-', linewidth=2.5, alpha=0.8,
+                                                   label='Chebyshev Guess', zorder=14)
+        self.canvas.draw()
+    
     def _cancel_guess(self):
         """Cancel guess drawing mode (removes temporary preview only, NOT persistent lines)"""
         # Remove preview lines ONLY (not persistent lines in guess_lines dict)
@@ -11532,13 +14173,28 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 pass
         
         # Remove polynomial preview markers (clicked points)
+        if not hasattr(self, 'polynomial_preview_points'):
+            self.polynomial_preview_points = []
         for marker in self.polynomial_preview_points:
             try:
                 marker.remove()
             except (ValueError, RuntimeError):
                 pass
         self.polynomial_preview_points.clear()
-        self.polynomial_points.clear()
+        if hasattr(self, 'polynomial_points'):
+            self.polynomial_points.clear()
+        
+        # Remove Chebyshev preview markers (clicked points)
+        if not hasattr(self, 'chebyshev_preview_points'):
+            self.chebyshev_preview_points = []
+        for marker in self.chebyshev_preview_points:
+            try:
+                marker.remove()
+            except (ValueError, RuntimeError):
+                pass
+        self.chebyshev_preview_points.clear()
+        if hasattr(self, 'chebyshev_points'):
+            self.chebyshev_points.clear()
         
         # NOTE: Do NOT remove self.guess_polynomial_line here if a guess was confirmed
         # The persistent line should already be in self.guess_lines and will be drawn
@@ -11549,6 +14205,16 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             except (ValueError, RuntimeError):
                 pass
         self._polynomial_guess_confirmed = False
+        
+        # Remove Chebyshev guess line preview if not confirmed
+        if not hasattr(self, 'guess_chebyshev_line'):
+            self.guess_chebyshev_line = None
+        if self.guess_chebyshev_line is not None and not hasattr(self, '_chebyshev_guess_confirmed'):
+            try:
+                self.guess_chebyshev_line.remove()
+            except (ValueError, RuntimeError):
+                pass
+        self._chebyshev_guess_confirmed = False
         
         # Clean up polynomial baseline line preview
         if self.guess_polynomial_baseline_line is not None:
@@ -11695,6 +14361,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             # Deactivate modes
             self.guess_drawing_mode = False
             self.continuum_mode = False
+            self.current_continuum_fit_id = None  # Clear fit tracking
             self.gaussian_mode = False
             self.voigt_mode = False
             self.multi_gaussian_mode = False
@@ -12084,12 +14751,34 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                             comp_dict['stddev'] = float(result.params[sigma_name].value) if result.params[sigma_name].value is not None else None
                             comp_dict['stddev_err'] = float(result.params[sigma_name].stderr) if result.params[sigma_name].stderr is not None else None
                             comp_dict['bounds'] = (float(left_bound), float(right_bound))
+                            print(f"[DEBUG] Gaussian {gauss_count}: bounds={comp_dict['bounds']}")
                             comp_dict['is_velocity_mode'] = self.is_velocity_mode
                             
                             # Include guess parameters if they exist (v1.3+)
                             guess = comp.get('guess')
                             if guess and any(v is not None for v in guess.values()):
                                 comp_dict['guess'] = guess
+                            
+                            # CRITICAL for MC EW with tied parameters:
+                            # Store the result object, component prefix, and parameter names
+                            comp_dict['result'] = result
+                            comp_dict['component_prefix'] = prefix
+                            comp_dict['param_names'] = ['amp', 'mu', 'sigma']
+                            
+                            # Extract covariance matrix from result
+                            # For Gaussian: correlate (amp, mu, sigma) which are positions 0, 1, 2 in the free params
+                            # Build mapping of parameter names to their indices in var_names
+                            if result.covar is not None:
+                                param_indices = []
+                                for pname in ['amp', 'mu', 'sigma']:
+                                    full_name = f'{prefix}{pname}'
+                                    if full_name in result.var_names:
+                                        param_indices.append(result.var_names.index(full_name))
+                                
+                                if len(param_indices) == 3:
+                                    # Extract the 3x3 submatrix for this component
+                                    comp_cov = result.covar[np.ix_(param_indices, param_indices)]
+                                    comp_dict['covariance'] = comp_cov
                         except Exception as e:
                             print(f"[DEBUG] Warning: Could not store Gaussian {gauss_count} fit data: {e}")
                     
@@ -12114,12 +14803,33 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                             comp_dict['gamma'] = float(result.params[gamma_name].value) if result.params[gamma_name].value is not None else None
                             comp_dict['gamma_err'] = float(result.params[gamma_name].stderr) if result.params[gamma_name].stderr is not None else None
                             comp_dict['bounds'] = (float(left_bound), float(right_bound))
+                            print(f"[DEBUG] Voigt {voigt_count}: bounds={comp_dict['bounds']}")
                             comp_dict['is_velocity_mode'] = self.is_velocity_mode
                             
                             # Include guess parameters if they exist (v1.3+)
                             guess = comp.get('guess')
                             if guess and any(v is not None for v in guess.values()):
                                 comp_dict['guess'] = guess
+                            
+                            # CRITICAL for MC EW with tied parameters:
+                            # Store the result object, component prefix, and parameter names
+                            comp_dict['result'] = result
+                            comp_dict['component_prefix'] = prefix
+                            comp_dict['param_names'] = ['amp', 'center', 'sigma', 'gamma']
+                            
+                            # Extract covariance matrix from result for Voigt
+                            # For Voigt: (amp, center, sigma, gamma) correlations
+                            if result.covar is not None:
+                                param_indices = []
+                                for pname in ['amp', 'center', 'sigma', 'gamma']:
+                                    full_name = f'{prefix}{pname}'
+                                    if full_name in result.var_names:
+                                        param_indices.append(result.var_names.index(full_name))
+                                
+                                if len(param_indices) == 4:
+                                    # Extract the 4x4 submatrix for this component
+                                    comp_cov = result.covar[np.ix_(param_indices, param_indices)]
+                                    comp_dict['covariance'] = comp_cov
                         except Exception as e:
                             print(f"[DEBUG] Warning: Could not store Voigt {voigt_count} fit data: {e}")
                     
@@ -12150,6 +14860,67 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                         comp_dict['coeffs'] = coeffs
                         comp_dict['coeffs_err'] = coeffs_err
                         comp_dict['bounds'] = (float(left_bound), float(right_bound))
+                        print(f"[DEBUG] Polynomial: bounds={comp_dict['bounds']}")
+                        
+                        # Extract covariance matrix for polynomial coefficients
+                        if result.covar is not None:
+                            param_indices = []
+                            for i in range(order + 1):
+                                coeff_name = f'{prefix}c{i}'
+                                if coeff_name in result.var_names:
+                                    param_indices.append(result.var_names.index(coeff_name))
+                            
+                            if len(param_indices) == len(coeffs):
+                                # Extract the submatrix for all polynomial coefficients
+                                poly_cov = result.covar[np.ix_(param_indices, param_indices)]
+                                comp_dict['covariance'] = poly_cov
+                        
+                        poly_count += 1
+                
+                elif comp['type'] == 'chebyshev':
+                    prefix = f'c{poly_count}_'
+                    coeffs = []
+                    coeffs_err = []
+                    degree = comp.get('degree', 1)
+                    
+                    try:
+                        for i in range(degree + 1):
+                            coeff_name = f'{prefix}c{i}'
+                            if coeff_name in result.params:
+                                try:
+                                    coeff_val = float(result.params[coeff_name].value) if result.params[coeff_name].value is not None else None
+                                    coeff_err = float(result.params[coeff_name].stderr) if result.params[coeff_name].stderr is not None else None
+                                    coeffs.append(coeff_val)
+                                    coeffs_err.append(coeff_err)
+                                except Exception as e:
+                                    print(f"[DEBUG] Warning: Could not extract coefficient {coeff_name}: {e}")
+                    except Exception as e:
+                        print(f"[DEBUG] Warning: Could not extract Chebyshev coefficients: {e}")
+                    
+                    if coeffs:
+                        comp_dict['degree'] = degree
+                        comp_dict['coeffs'] = coeffs
+                        comp_dict['coeffs_err'] = coeffs_err
+                        comp_dict['bounds'] = (float(left_bound), float(right_bound))
+                        comp_dict['lam_min'] = comp.get('lam_min', float(left_bound))
+                        comp_dict['lam_max'] = comp.get('lam_max', float(right_bound))
+                        print(f"[DEBUG] Chebyshev: bounds={comp_dict['bounds']}, domain=[{comp_dict['lam_min']}, {comp_dict['lam_max']}]")
+                        
+                        # Extract covariance matrix for Chebyshev coefficients
+                        if result.covar is not None:
+                            param_indices = []
+                            for i in range(degree + 1):
+                                coeff_name = f'{prefix}c{i}'
+                                if coeff_name in result.var_names:
+                                    param_indices.append(result.var_names.index(coeff_name))
+                            
+                            if len(param_indices) == len(coeffs):
+                                # Extract the submatrix for all Chebyshev coefficients
+                                cheb_cov = result.covar[np.ix_(param_indices, param_indices)]
+                                comp_dict['covariance'] = cheb_cov
+                        
+                        poly_count += 1
+                
                 elif comp['type'] == 'data_mask':
                     # Store mask parameters as-is (no fit results needed)
                     comp_dict['min_lambda'] = comp.get('min_lambda')
@@ -12393,7 +15164,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     clean_data = listfit_fit_data
                 
                 print("[DEBUG] Calling save_and_print_qsap_fit...")
-                self.save_and_print_qsap_fit(clean_data, 'Listfit', 'Listfit')
+                self.save_and_print_qsap_fit(clean_data, 'Listfit', 'Listfit', lmfit_result=result)
                 print("[DEBUG] Successfully saved fit to .qsap file")
             except Exception as e:
                 print(f"[ERROR] Failed to save fit to .qsap file: {e}")
@@ -12754,6 +15525,99 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     model = poly_model
                 else:
                     model = model + poly_model
+                poly_count += 1
+            
+            elif comp['type'] == 'chebyshev':
+                degree = comp.get('degree', 1)
+                prefix = f'c{poly_count}_'
+                
+                print(f"[DEBUG] Processing Chebyshev #{poly_count}: label={comp.get('label', 'N/A')}, degree={degree}")
+                
+                # Create Chebyshev model using lmfit's Model wrapper with custom evaluator
+                # Get domain bounds from x_fit
+                lam_min = x_fit.min()
+                lam_max = x_fit.max()
+                
+                # Create a factory function that captures domain bounds and degree
+                def make_chebyshev_model_func(degree_val, lam_min_val, lam_max_val):
+                    """Factory to create Chebyshev evaluator with captured parameters"""
+                    def chebyshev_model(x, **params):
+                        """Evaluate Chebyshev with rescaling to [-1, 1]"""
+                        # Build coefficient array from parameters
+                        # NOTE: lmfit STRIPS the prefix before passing to the evaluator,
+                        # so we receive unprefixed keys like 'c0', 'c1', 'c2' not 'c0_c0', etc.
+                        coeffs = []
+                        for j in range(degree_val + 1):
+                            key = f'c{j}'  # Unprefixed - this is what lmfit passes
+                            if key in params:
+                                coeffs.append(params[key])
+                            else:
+                                coeffs.append(0.0)
+                        
+                        # Rescale x to [-1, 1]
+                        x_rescaled = 2.0 * (x - lam_min_val) / (lam_max_val - lam_min_val) - 1.0
+                        # Evaluate Chebyshev polynomial
+                        return np.polynomial.chebyshev.chebval(x_rescaled, coeffs)
+                    
+                    return chebyshev_model
+                
+                # Create the model function
+                cheb_func = make_chebyshev_model_func(degree, lam_min, lam_max)
+                
+                # Create lmfit Model
+                cheb_model = Model(cheb_func, prefix=prefix, independent_vars=['x'])
+                
+                # Check if user provided a polynomial guess (can be used as Chebyshev approximation)
+                user_guess = comp.get('guess', {})
+                
+                # Use pre-fitted polynomial parameters if available (Stage 1 results, reuse poly fits)
+                # Chebyshev can use polynomial fit as initial guess, converting coefficients
+                if prefix in polynomial_fits and polynomial_fits[prefix] is not None:
+                    print(f"[DEBUG] Using pre-fitted polynomial parameters as Chebyshev guess for {prefix}")
+                    # Use first two coefficients from polynomial as starting point for Chebyshev
+                    for i in range(degree + 1):
+                        param_name = f'{prefix}c{i}'
+                        if i < 2:
+                            # Use polynomial coefficients for first two Chebyshev coefficients
+                            poly_param_name = f'{prefix}c{i}'
+                            if poly_param_name in polynomial_fits[prefix]:
+                                guess_value = polynomial_fits[prefix][poly_param_name].value
+                            else:
+                                guess_value = 0.0
+                        else:
+                            guess_value = 0.0
+                        cheb_model.set_param_hint(param_name, value=guess_value)
+                        print(f"[DEBUG]   {param_name} = {guess_value}")
+                else:
+                    # Estimate Chebyshev coefficients from data using numpy
+                    print(f"[DEBUG] Using estimated coefficients for Chebyshev {prefix}")
+                    try:
+                        # Fit Chebyshev directly to data
+                        from numpy.polynomial import chebyshev
+                        cheb_fit = chebyshev.Chebyshev.fit(x_fit, y_fit, degree, domain=[lam_min, lam_max])
+                        
+                        # Extract coefficients
+                        for i in range(degree + 1):
+                            param_name = f'{prefix}c{i}'
+                            guess_value = cheb_fit.coef[i] if i < len(cheb_fit.coef) else 0.0
+                            cheb_model.set_param_hint(param_name, value=guess_value)
+                            print(f"[DEBUG]   {param_name} = {guess_value}")
+                    except Exception as e:
+                        print(f"[DEBUG] Warning: Chebyshev coefficient estimation failed: {e}")
+                        # Fallback: set small initial values
+                        for i in range(degree + 1):
+                            param_name = f'{prefix}c{i}'
+                            guess_value = np.mean(y_fit) if i == 0 else 0.0
+                            cheb_model.set_param_hint(param_name, value=guess_value)
+                
+                # Store domain bounds in the component for later use (MC EW calculation)
+                comp['lam_min'] = lam_min
+                comp['lam_max'] = lam_max
+                
+                if model is None:
+                    model = cheb_model
+                else:
+                    model = model + cheb_model
                 poly_count += 1
         
         # **HANDLE REDSHIFT PARAMETERS AND TIED EXPRESSIONS**
@@ -13806,6 +16670,10 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
 
     def plot_listfit_components(self, result, components, x_fit, y_fit, err_fit, left_bound, right_bound):
         """Plot the fitted components with different colors"""
+        # Assign single fit_id for all components of this listfit
+        listfit_fit_id = self.next_fit_id()
+        self.assign_fit_color(listfit_fit_id)
+        
         x_smooth = np.linspace(x_fit.min(), x_fit.max(), len(x_fit) * 50)
         
         # Color mapping for components
@@ -13813,7 +16681,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         gaussian_cfg = self.colors['profiles']['gaussian']
         voigt_cfg = self.colors['profiles']['voigt']
         continuum_cfg = self.colors['profiles']['continuum_line']
-        colors = {'gaussian': gaussian_cfg['color'], 'voigt': voigt_cfg['color'], 'polynomial': continuum_cfg['color']}
+        colors = {'gaussian': gaussian_cfg['color'], 'voigt': voigt_cfg['color'], 'polynomial': continuum_cfg['color'], 'chebyshev': continuum_cfg['color']}
         
         # Plot mask regions as gray fill patches
         data_masks = [comp for comp in components if comp['type'] == 'data_mask']
@@ -13834,7 +16702,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     'component_obj': mask  # Store reference to the actual mask component
                 }
                 self.register_item('data_mask', f'Data Mask {mask_count+1} ({min_lambda:.2f}-{max_lambda:.2f} Å)', 
-                                 fit_dict=mask_fit_dict, patch_obj=patch, position=position_str, color='gray')
+                                 fit_dict=mask_fit_dict, patch_obj=patch, position=position_str, color='gray',
+                                 fit_id=listfit_fit_id)
                 mask_count += 1
         
         poly_mask_count = 0
@@ -13852,7 +16721,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     'component_obj': mask  # Store reference to the actual mask component
                 }
                 self.register_item('polynomial_guess_mask', f'Poly Guess Mask {poly_mask_count+1} ({min_lambda:.2f}-{max_lambda:.2f} Å)', 
-                                 fit_dict=poly_mask_fit_dict, patch_obj=patch, position=position_str, color='lightgray')
+                                 fit_dict=poly_mask_fit_dict, patch_obj=patch, position=position_str, color='lightgray',
+                                 fit_id=listfit_fit_id)
                 poly_mask_count += 1
         
         # Plot individual components
@@ -13863,7 +16733,11 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
         # Pre-collect polynomial info from this listfit for all profiles to use
         listfit_continuum = None
         polynomials = [c for c in components if c.get('type') == 'polynomial']
-        print(f"[DEBUG] plot_listfit_components: Found {len(polynomials)} polynomial component(s)")
+        chebyshevs = [c for c in components if c.get('type') == 'chebyshev']
+        
+        print(f"[DEBUG] plot_listfit_components: Found {len(polynomials)} polynomial component(s), {len(chebyshevs)} Chebyshev component(s)")
+        
+        # Extract polynomial continuum if present
         if len(polynomials) == 1:
             # Get polynomial coefficients and errors from fit result
             poly_comp = polynomials[0]
@@ -13888,6 +16762,7 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 
                 # Store as continuum dict for all profiles to use
                 listfit_continuum = {
+                    'type': 'polynomial',
                     'coeffs': poly_coeffs_reversed,
                     'covariance': covariance,
                     'bounds': (left_bound, right_bound)
@@ -13900,10 +16775,54 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
             print(f"[DEBUG] WARNING: Found {len(polynomials)} polynomials, only using first one")
             # TODO: handle multiple polynomials
         
+        # Extract Chebyshev continuum if present
+        if len(chebyshevs) == 1 and listfit_continuum is None:
+            # Get Chebyshev coefficients and errors from fit result
+            cheb_comp = chebyshevs[0]
+            prefix = f'c0_'
+            degree = cheb_comp.get('degree', 1)
+            
+            print(f"[DEBUG] Chebyshev: degree={degree}, checking for params with prefix '{prefix}'")
+            
+            if f'{prefix}c0' in result.params:
+                cheb_coeffs = []
+                cheb_coeffs_err = []
+                for i in range(degree + 1):
+                    coeff_val = result.params[f'{prefix}c{i}'].value
+                    coeff_err = result.params[f'{prefix}c{i}'].stderr if result.params[f'{prefix}c{i}'].stderr is not None else 0.0
+                    cheb_coeffs.append(coeff_val)
+                    cheb_coeffs_err.append(coeff_err)
+                
+                # Get domain bounds stored during model building
+                lam_min = cheb_comp.get('lam_min', left_bound)
+                lam_max = cheb_comp.get('lam_max', right_bound)
+                
+                # Create covariance matrix from errors
+                covariance = np.diag([e**2 if e > 0 else 1e-10 for e in cheb_coeffs_err])
+                
+                # Store as continuum dict for all profiles to use
+                listfit_continuum = {
+                    'type': 'chebyshev',
+                    'coeffs': cheb_coeffs,
+                    'covariance': covariance,
+                    'bounds': (left_bound, right_bound),
+                    'degree': degree,
+                    'lam_min': lam_min,
+                    'lam_max': lam_max
+                }
+                print(f"[DEBUG] Successfully extracted Chebyshev continuum: degree={degree}, coeffs={cheb_coeffs}, domain=[{lam_min}, {lam_max}]")
+            else:
+                print(f"[DEBUG] WARNING: Chebyshev parameter '{prefix}c0' not found in result.params!")
+                print(f"[DEBUG]   Available params: {list(result.params.keys())}")
+        elif len(chebyshevs) > 1:
+            print(f"[DEBUG] WARNING: Found {len(chebyshevs)} Chebyshev components, only using first one")
+            # TODO: handle multiple Chebyshev
+        
         for comp in components:
             comp_type = comp['type']
             
-            # Skip mask types and redshift components - they're already plotted or not plotted as lines
+            # Skip mask types and redshift components (they're handled separately)
+            # Chebyshev IS handled here in this loop with polynomial
             if comp_type in ['polynomial_guess_mask', 'data_mask', 'redshift']:
                 continue
             
@@ -13939,9 +16858,24 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 gaussian_param_names = ['amp', 'mu', 'sigma']
                 component_covariance = self._extract_component_covariance(result, prefix, gaussian_param_names)
                 
+                # Extract tie expressions from result object for MC EW reconstruction
+                tie_expressions = {}
+                all_free_param_names = []
+                free_param_values_dict = {}
+                
+                if result is not None and hasattr(result, 'params'):
+                    # Collect all parameter names and extract ties
+                    for pname, param in result.params.items():
+                        if param.expr is not None:  # This parameter is tied
+                            tie_expressions[pname] = param.expr
+                        elif param.vary:  # This is a free parameter
+                            all_free_param_names.append(pname)
+                            free_param_values_dict[pname] = param.value
+                
                 # Add to gaussian_fits for redshift mode
                 gaussian_fit = {
-                    'fit_id': self.fit_id,
+                    'fit_id': listfit_fit_id,  # Use the Listfit fit_id, not self.fit_id
+                    '_fit_id': self.fit_id,  # Keep original for backward compatibility
                     'is_velocity_mode': self.is_velocity_mode,
                     'component_id': self.component_id,
                     'amp': g_amp, 'amp_err': g_amp_err,
@@ -13957,8 +16891,21 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     'listfit_bounds': (left_bound, right_bound),
                     'gauss_index': gauss_count,
                     'covariance': component_covariance,
-                    'continuum_fit_dict': listfit_continuum  # Store the listfit continuum for EW calculation
+                    'continuum_fit_dict': listfit_continuum,  # Store the listfit continuum for EW calculation
+                    'component_prefix': f'g{gauss_count}_',  # For extracting params from reconstructed dict
+                    'param_names': ['amp', 'mu', 'sigma'],  # Parameter names after prefix
+                    'tie_expressions': tie_expressions,  # For MC EW with tied parameters
+                    'all_free_param_names': all_free_param_names,  # For MC EW reconstruction
+                    'free_param_values_all': [free_param_values_dict.get(pn, 0.0) for pn in all_free_param_names],  # For MC EW reconstruction
+                    'free_param_names_all': all_free_param_names,  # For MC EW reconstruction
                 }
+                
+                # Add full covariance if available (for MC EW with tied parameters)
+                if result is not None and result.covar is not None:
+                    gaussian_fit['full_covariance'] = np.array(result.covar, dtype=float)
+                # Store lmfit result separately to avoid cleanup issues (result objects have circular refs)
+                if listfit_fit_id not in self.lmfit_results and result is not None:
+                    self.lmfit_results[listfit_fit_id] = result
                 if listfit_continuum is None:
                     print(f"[DEBUG] Gaussian {gauss_count}: continuum_fit_dict is None!")
                 else:
@@ -13967,7 +16914,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 # Register with ItemTracker
                 position_str = f"λ: {g_mu:.2f} Å"
                 item_id = self.register_item('gaussian', f'Gaussian {gauss_count+1}', fit_dict=gaussian_fit, 
-                                           line_obj=line, position=position_str, color=color)
+                                           line_obj=line, position=position_str, color=color,
+                                           fit_id=listfit_fit_id)
                 self.component_id += 1
                 gauss_count += 1
             
@@ -14002,9 +16950,24 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 voigt_param_names = ['amp', 'center', 'sigma', 'gamma']
                 component_covariance = self._extract_component_covariance(result, prefix, voigt_param_names)
                 
+                # Extract tie expressions from result object for MC EW reconstruction
+                tie_expressions = {}
+                all_free_param_names = []
+                free_param_values_dict = {}
+                
+                if result is not None and hasattr(result, 'params'):
+                    # Collect all parameter names and extract ties
+                    for pname, param in result.params.items():
+                        if param.expr is not None:  # This parameter is tied
+                            tie_expressions[pname] = param.expr
+                        elif param.vary:  # This is a free parameter
+                            all_free_param_names.append(pname)
+                            free_param_values_dict[pname] = param.value
+                
                 # Add to voigt_fits for redshift mode
                 voigt_fit = {
-                    'fit_id': self.fit_id,
+                    'fit_id': listfit_fit_id,  # Use the Listfit fit_id, not self.fit_id
+                    '_fit_id': self.fit_id,  # Keep original for backward compatibility
                     'is_velocity_mode': self.is_velocity_mode,
                     'component_id': self.component_id,
                     'amp': v_amp, 'amp_err': v_amp_err,
@@ -14021,8 +16984,21 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     'listfit_bounds': (left_bound, right_bound),
                     'voigt_index': voigt_count,
                     'covariance': component_covariance,
-                    'continuum_fit_dict': listfit_continuum  # Store the listfit continuum for EW calculation
+                    'continuum_fit_dict': listfit_continuum,  # Store the listfit continuum for EW calculation
+                    'component_prefix': f'v{voigt_count}_',  # For extracting params from reconstructed dict
+                    'param_names': ['amp', 'center', 'sigma', 'gamma'],  # Parameter names after prefix
+                    'tie_expressions': tie_expressions,  # For MC EW with tied parameters
+                    'all_free_param_names': all_free_param_names,  # For MC EW reconstruction
+                    'free_param_values_all': [free_param_values_dict.get(pn, 0.0) for pn in all_free_param_names],  # For MC EW reconstruction
+                    'free_param_names_all': all_free_param_names,  # For MC EW reconstruction
                 }
+                
+                # Add full covariance if available (for MC EW with tied parameters)
+                if result is not None and result.covar is not None:
+                    voigt_fit['full_covariance'] = np.array(result.covar, dtype=float)
+                # Store lmfit result separately to avoid cleanup issues (result objects have circular refs)
+                if listfit_fit_id not in self.lmfit_results and result is not None:
+                    self.lmfit_results[listfit_fit_id] = result
                 if listfit_continuum is None:
                     print(f"[DEBUG] Voigt {voigt_count}: continuum_fit_dict is None!")
                 else:
@@ -14031,7 +17007,8 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                 # Register with ItemTracker
                 position_str = f"λ: {v_center:.2f} Å"
                 item_id = self.register_item('voigt', f'Voigt {voigt_count+1}', fit_dict=voigt_fit,
-                                           line_obj=line, position=position_str, color=color)
+                                           line_obj=line, position=position_str, color=color,
+                                           fit_id=listfit_fit_id)
                 self.component_id += 1
                 voigt_count += 1
             
@@ -14096,8 +17073,83 @@ class SpectrumPlotter(QtWidgets.QMainWindow):
                     'component_obj': comp  # Store reference to the actual component for deletion
                 }
                 item_id = self.register_item('polynomial', f'Polynomial (order={order})', fit_dict=poly_fit_dict, line_obj=line,
-                                           position=position_str, color=color)
+                                           position=position_str, color=color,
+                                           fit_id=listfit_fit_id)
                 poly_count += 1
+            
+            elif comp_type == 'chebyshev':
+                prefix = f'c{poly_count}_'
+                degree = comp.get('degree', 1)
+                
+                # Check if this component's parameters are in the fit result
+                if f'{prefix}c0' not in params:
+                    print(f"[DEBUG] Warning: Chebyshev component {poly_count} not found in fit result. Skipping...")
+                    poly_count += 1
+                    continue
+                
+                cheb_coeffs = []
+                cheb_coeffs_err = []
+                for i in range(degree + 1):
+                    coeff_val = params[f'{prefix}c{i}'].value
+                    coeff_err = params[f'{prefix}c{i}'].stderr if params[f'{prefix}c{i}'].stderr is not None else 0.0
+                    cheb_coeffs.append(coeff_val)
+                    cheb_coeffs_err.append(coeff_err)
+                
+                # Get domain bounds stored during model building
+                lam_min = comp.get('lam_min', left_bound)
+                lam_max = comp.get('lam_max', right_bound)
+                
+                # CRITICAL FIX: Only plot Chebyshev within the domain where it was fitted
+                # Chebyshev polynomials are unstable outside [-1, 1]
+                mask = (x_smooth >= lam_min) & (x_smooth <= lam_max)
+                x_plot = x_smooth[mask]
+                
+                # Rescale x for Chebyshev evaluation (only within domain)
+                x_rescaled = 2 * (x_plot - lam_min) / (lam_max - lam_min) - 1
+                y_plot = np.polynomial.chebyshev.chebval(x_rescaled, cheb_coeffs)
+                
+                # Add label only for the first listfit Chebyshev
+                label = 'Continuum' if 'continuum' not in self.legend_profile_types else None
+                line, = self.ax.plot(x_plot, y_plot, color=color, linestyle=continuum_cfg['linestyle'], linewidth=continuum_cfg['linewidth'], label=label)
+                if label:
+                    self.legend_profile_types.add('continuum')
+                
+                # Build covariance matrix from errors (diagonal approximation)
+                covariance = np.diag([e**2 if e > 0 else 1e-10 for e in cheb_coeffs_err]) if cheb_coeffs_err else np.diag([1e-10] * len(cheb_coeffs))
+                
+                # Add Chebyshev component to continuum_fits
+                continuum_fit = {
+                    'bounds': (left_bound, right_bound),
+                    'type': 'chebyshev',
+                    'coeffs': cheb_coeffs,  # NOT reversed for Chebyshev (uses chebval directly)
+                    'coeffs_err': cheb_coeffs_err,
+                    'degree': degree,
+                    'lam_min': lam_min,
+                    'lam_max': lam_max,
+                    'line': line,
+                    'is_velocity_mode': self.is_velocity_mode,
+                    'listfit_source': True  # Mark this as coming from listfit
+                }
+                self.continuum_fits.append(continuum_fit)
+                
+                # Register with ItemTracker - store metadata for deletion handling
+                position_str = f"λ: {left_bound:.2f}-{right_bound:.2f} Å"
+                cheb_fit_dict = {
+                    'listfit_bounds': (left_bound, right_bound),
+                    'cheb_index': poly_count,
+                    'degree': degree,
+                    'coeffs': cheb_coeffs,
+                    'coeffs_err': cheb_coeffs_err,
+                    'covariance': covariance,
+                    'lam_min': lam_min,
+                    'lam_max': lam_max,
+                    'component_obj': comp  # Store reference to the actual component for deletion
+                }
+                item_id = self.register_item('chebyshev', f'Chebyshev (degree={degree})', fit_dict=cheb_fit_dict, line_obj=line,
+                                           position=position_str, color=color,
+                                           fit_id=listfit_fit_id)
+                poly_count += 1
+
 
 
 

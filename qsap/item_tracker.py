@@ -50,10 +50,10 @@ class ItemTracker(QtWidgets.QWidget):
         # Title
         layout.addWidget(QtWidgets.QLabel("Plotted Features:"))
         
-        # Table widget with columns
+        # Table widget with columns (Fit Color strip added as column 0)
         self.item_table = QtWidgets.QTableWidget()
-        self.item_table.setColumnCount(5)
-        self.item_table.setHorizontalHeaderLabels(['Display', 'Name', 'Type', 'Color', 'Position'])
+        self.item_table.setColumnCount(6)
+        self.item_table.setHorizontalHeaderLabels(['Fit', 'Display', 'Name', 'Type', 'Color', 'Position'])
         self.item_table.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
         self.item_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.item_table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -61,11 +61,12 @@ class ItemTracker(QtWidgets.QWidget):
         self.item_table.itemSelectionChanged.connect(self.on_selection_changed)
         self.item_table.itemChanged.connect(self.on_item_changed)  # Connect to handle checkbox changes
         self.item_table.horizontalHeader().setStretchLastSection(True)
-        self.item_table.setColumnWidth(0, 70)
-        self.item_table.setColumnWidth(1, 150)
-        self.item_table.setColumnWidth(2, 100)
-        self.item_table.setColumnWidth(3, 100)
-        self.item_table.setColumnWidth(4, 150)
+        self.item_table.setColumnWidth(0, 20)   # Fit color strip (narrow)
+        self.item_table.setColumnWidth(1, 70)   # Display checkbox
+        self.item_table.setColumnWidth(2, 150)  # Name
+        self.item_table.setColumnWidth(3, 100)  # Type
+        self.item_table.setColumnWidth(4, 100)  # Color
+        self.item_table.setColumnWidth(5, 150)  # Position
         layout.addWidget(self.item_table)
         
         # Buttons
@@ -80,8 +81,19 @@ class ItemTracker(QtWidgets.QWidget):
         
         self.setLayout(layout)
     
-    def add_item(self, item_id, item_type, name, position='', color='gray', line_obj=None):
-        """Add an item to tracker"""
+    def add_item(self, item_id, item_type, name, position='', color='gray', line_obj=None, fit_id=None, fit_color='#999999'):
+        """Add an item to tracker
+        
+        Args:
+            item_id: Unique identifier for this item
+            item_type: Type of item ('gaussian', 'voigt', 'polynomial', 'marker', etc.)
+            name: Display name
+            position: Position/bounds description
+            color: Color for the item line/marker
+            line_obj: Line object reference for visibility toggling
+            fit_id: Fit ID this item belongs to (for grouping)
+            fit_color: Color of the fit (for color strip)
+        """
         self.items[item_id] = {
             'type': item_type,
             'name': name,
@@ -89,7 +101,9 @@ class ItemTracker(QtWidgets.QWidget):
             'color': color,
             'line_obj': line_obj,
             'displayed': True,  # Default to visible
-            'zorder': None  # Store original zorder to preserve it when toggling visibility
+            'zorder': None,  # Store original zorder to preserve it when toggling visibility
+            'fit_id': fit_id,  # Which fit this belongs to
+            'fit_color': fit_color  # Color strip for the fit
         }
         self.refresh_table()
         self.items_changed.emit()
@@ -109,30 +123,49 @@ class ItemTracker(QtWidgets.QWidget):
             row = self.item_table.rowCount()
             self.item_table.insertRow(row)
             
-            # Display checkbox column (column 0)
+            # Fit color strip column (column 0) - narrow color bar with fit ID
+            fit_id = item_info.get('fit_id')
+            fit_id_text = f"{fit_id}" if fit_id is not None else ""
+            fit_color_item = QtWidgets.QTableWidgetItem(fit_id_text)
+            fit_color_item.setBackground(QtGui.QColor(item_info.get('fit_color', '#999999')))
+            fit_color_item.setForeground(QtGui.QColor('white'))  # White text for contrast
+            fit_color_item.setTextAlignment(Qt.AlignCenter)  # Center the text
+            font = fit_color_item.font()
+            font.setPointSize(10)
+            font.setBold(True)
+            fit_color_item.setFont(font)  # Make text bold and larger
+            fit_color_item.setData(Qt.UserRole, item_id)
+            fit_color_item.setFlags(fit_color_item.flags() & ~Qt.ItemIsEditable)  # Make read-only
+            self.item_table.setItem(row, 0, fit_color_item)
+            
+            # Display checkbox column (column 1)
             display_checkbox = QtWidgets.QTableWidgetItem()
             display_checkbox.setCheckState(Qt.Checked if item_info.get('displayed', True) else Qt.Unchecked)
             display_checkbox.setData(Qt.UserRole, item_id)
             display_checkbox.setFlags(display_checkbox.flags() | Qt.ItemIsUserCheckable)
-            self.item_table.setItem(row, 0, display_checkbox)
+            self.item_table.setItem(row, 1, display_checkbox)
             
-            # Name column (column 1)
+            # Name column (column 2)
             name_item = QtWidgets.QTableWidgetItem(item_info['name'])
             name_item.setData(Qt.UserRole, item_id)
-            self.item_table.setItem(row, 1, name_item)
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)  # Make read-only
+            self.item_table.setItem(row, 2, name_item)
             
-            # Type column (column 2)
+            # Type column (column 3)
             type_item = QtWidgets.QTableWidgetItem(item_info['type'])
-            self.item_table.setItem(row, 2, type_item)
+            type_item.setFlags(type_item.flags() & ~Qt.ItemIsEditable)  # Make read-only
+            self.item_table.setItem(row, 3, type_item)
             
-            # Color column (column 3)
+            # Color column (column 4)
             color_item = QtWidgets.QTableWidgetItem('')  # Empty text, just show the color
             color_item.setBackground(QtGui.QColor(item_info['color']))
-            self.item_table.setItem(row, 3, color_item)
+            color_item.setFlags(color_item.flags() & ~Qt.ItemIsEditable)  # Make read-only
+            self.item_table.setItem(row, 4, color_item)
             
-            # Position column (column 4)
+            # Position column (column 5)
             pos_item = QtWidgets.QTableWidgetItem(str(item_info['position']))
-            self.item_table.setItem(row, 4, pos_item)
+            pos_item.setFlags(pos_item.flags() & ~Qt.ItemIsEditable)  # Make read-only
+            self.item_table.setItem(row, 5, pos_item)
         
         self.item_table.blockSignals(False)  # Re-enable signals
     
@@ -179,7 +212,7 @@ class ItemTracker(QtWidgets.QWidget):
         # Get the item IDs for currently selected rows
         current_selected_ids = set()
         for row in selected_rows:
-            item = self.item_table.item(row, 0)
+            item = self.item_table.item(row, 1)  # Display checkbox is now in column 1
             if item:
                 item_id = item.data(Qt.UserRole)
                 current_selected_ids.add(item_id)
@@ -207,8 +240,8 @@ class ItemTracker(QtWidgets.QWidget):
     
     def on_item_changed(self, item):
         """Handle Display checkbox state changes"""
-        # Only process if this is the Display checkbox column (column 0)
-        if self.item_table.column(item) != 0:
+        # Only process if this is the Display checkbox column (now column 1, not 0)
+        if self.item_table.column(item) != 1:
             return
         
         row = self.item_table.row(item)
@@ -216,7 +249,7 @@ class ItemTracker(QtWidgets.QWidget):
             return
         
         # Get the item_id from the checkbox
-        checkbox_item = self.item_table.item(row, 0)
+        checkbox_item = self.item_table.item(row, 1)
         if not checkbox_item:
             return
         
@@ -235,7 +268,7 @@ class ItemTracker(QtWidgets.QWidget):
         """Delete selected items"""
         selected_rows = set(index.row() for index in self.item_table.selectedIndexes())
         for row in sorted(selected_rows, reverse=True):
-            item = self.item_table.item(row, 0)
+            item = self.item_table.item(row, 1)  # Get item_id from Display checkbox column
             item_id = item.data(Qt.UserRole)
             self.item_deleted.emit(item_id)
             self.remove_item(item_id)
@@ -257,7 +290,7 @@ class ItemTracker(QtWidgets.QWidget):
         
         # Find the row for this item_id
         for row in range(self.item_table.rowCount()):
-            item = self.item_table.item(row, 0)
+            item = self.item_table.item(row, 1)  # Get item_id from Display checkbox column
             if item and item.data(Qt.UserRole) == item_id:
                 self.item_table.selectRow(row)
                 return

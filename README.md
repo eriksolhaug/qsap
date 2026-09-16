@@ -2,7 +2,7 @@
 
 *An Analysis Tool for Astronomical Spectra*
 
-## Version 1.4
+## Version 1.5
 
 ![Python](https://img.shields.io/badge/Python-3.7%2B-blue)
 ![PyQt5](https://img.shields.io/badge/PyQt5-5.15%2B-blue?logo=pyqt&logoColor=white)
@@ -809,7 +809,9 @@ REDSHIFT_3SIGMA=-0.000702,+0.000723  (3σ credible interval)
 
 ## Versions
 
-- **v1.1** (current): Complete UI redesign with tabbed Control Panel (Control Panel, Item Tracker, Settings tabs), new Options panel with fit and calculate controls, bottom-docked Terminal/Output panel, improved line list offset precision, support for air-to-vacuum wavelength conversion, wavelength unit selection (Ångström/nm/µm), configurable NaN/Inf replacement, graceful application shutdown.
+- **v1.5** (current): Covariance matrix extraction from line list fitting for calculation of equivalent width with Monte Carlo uncertainty propagation through tied parameters
+- **v1.4**: Line list fitting with shared redshift implemented - advanced multi-component fitting with tied spectral lines and wavelength-ratio sigma equalization
+- **v1.1**: Complete UI redesign with tabbed Control Panel (Control Panel, Item Tracker, Settings tabs), new Options panel with fit and calculate controls, bottom-docked Terminal/Output panel, improved line list offset precision, support for air-to-vacuum wavelength conversion, wavelength unit selection (Ångström/nm/µm), configurable NaN/Inf replacement, graceful application shutdown.
 - **v0.12** (stable): First implementation of more user-friendly GUI
 - **v0.11** (stable): Action history (undo/redo actions), fit information window, output log (printing from terminal) in spectrum viewer, improved item tracker functionality.
 - **v0.10** (stable): Added robust Listfit capabilities. Listfit now works for higher-order Polynomials (>2) and with multiple line profiles fitted simultaneously.

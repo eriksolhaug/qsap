@@ -90,6 +90,22 @@ Examples:
     from qsap.ui_utils import get_qsap_icon
     app.setWindowIcon(get_qsap_icon())
     
+    # Display welcome message
+    version = _get_version()
+    space_padding = "   " if len(version) == 3 else "  "
+    title_line = f"WELCOME TO QSAP{space_padding}v{version}"
+    subtitle_line = "Quick Spectrum Analysis Program"
+    welcome_art = f"""
+╔══════════════════════════════════════════════════════════════╗
+║                                                              ║
+║{title_line:^62}║
+║                                                              ║
+║{subtitle_line:^62}║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+    print(welcome_art)
+    
     # Load spectrum if provided
     wav = None
     spec = None
@@ -190,29 +206,11 @@ Examples:
             traceback.print_exc()
             sys.exit(1)
     else:
-        # Display welcome message with ASCII art
-        version = _get_version()
-        # Add extra space if version is three characters (x.x format)
-        space_padding = "   " if len(version) == 3 else "  "
-        title_line = f"WELCOME TO QSAP{space_padding}v{version}"
-        subtitle_line = "Quick Spectrum Analysis Program"
-        welcome_art = f"""
-╔══════════════════════════════════════════════════════════════╗
-║                                                              ║
-║{title_line:^62}║
-║                                                              ║
-║{subtitle_line:^62}║
-║                                                              ║
-╚══════════════════════════════════════════════════════════════╝
-
-▯▯▯▯▯▯▯▯▯▯▯  No spectrum file specified  ▯▯▯▯▯▯▯▯▯▯▯
-
-Starting QSAP with empty plotter.
-Use the 'Open' button in the control panel to load a spectrum.
-
-═══════════════════════════════════════════════════════════════
-"""
-        print(welcome_art)
+        # No spectrum file specified
+        print("▯▯▯▯▯▯▯▯▯▯▯  No spectrum file specified  ▯▯▯▯▯▯▯▯▯▯▯\n")
+        print("Starting QSAP with empty plotter.")
+        print("Use the 'Open' button in the control panel to load a spectrum.\n")
+        print("═══════════════════════════════════════════════════════════════\n")
     
     # Launch interactive GUI plotter (now a QMainWindow with menu bar)
     plotter = SpectrumPlotter(

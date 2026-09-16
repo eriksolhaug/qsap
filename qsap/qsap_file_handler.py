@@ -106,13 +106,14 @@ class QSAPFileHandler:
         
         return filepath, content
     
-    def create_listfit_qsap(self, fit_list, spectrum_filename, spectrum_info=None):
+    def create_listfit_qsap(self, fit_list, spectrum_filename, spectrum_info=None, lmfit_result=None):
         """Create a .qsap file for listfit (contains multiple profiles and masks)
         
         Args:
             fit_list: List of fit dicts (gaussians, voigts, polynomials, polynomial_guess_mask, data_mask, fit_diagnostics)
             spectrum_filename: Path to spectrum file
             spectrum_info: Dict with spectrum metadata
+            lmfit_result: Optional lmfit result object for extracting covariance and tie info
             
         Returns:
             Path to created file, content as string
@@ -121,8 +122,8 @@ class QSAPFileHandler:
         
         content = self._build_header('Listfit', 'Listfit', spectrum_filename, spectrum_info)
         
-        # Track type-specific counters for symbols (g0, g1, v0, p0, Z1, Z2, etc.)
-        type_counters = {'gaussian': 0, 'voigt': 0, 'polynomial': 0, 'redshift': 0}
+        # Track type-specific counters for symbols (g0, g1, v0, p0, c0, Z1, Z2, etc.)
+        type_counters = {'gaussian': 0, 'voigt': 0, 'polynomial': 0, 'chebyshev': 0, 'redshift': 0}
         
         for idx, fit in enumerate(fit_list, 1):
             fit_type = fit.get('type', 'gaussian').lower()
@@ -156,6 +157,10 @@ class QSAPFileHandler:
                 symbol = f"p{type_counters['polynomial']}"
                 content += self._build_polynomial_component(fit, idx, symbol)
                 type_counters['polynomial'] += 1
+            elif fit_type == 'chebyshev':
+                symbol = f"c{type_counters['chebyshev']}"
+                content += self._build_chebyshev_component(fit, idx, symbol)
+                type_counters['chebyshev'] += 1
             elif fit_type == 'redshift':
                 symbol = f"Z{type_counters['redshift'] + 1}"
                 content += self._build_redshift_component(fit, idx, symbol)
@@ -166,6 +171,10 @@ class QSAPFileHandler:
                 content += self._build_data_mask_component(fit, idx)
             elif fit_type == 'constraints':
                 content += self._build_constraints_block(fit)
+        
+        # Add covariance matrix and tie information if lmfit result is available
+        if lmfit_result is not None:
+            content += self._build_covariance_block(lmfit_result)
         
         with open(filepath, 'w') as f:
             f.write(content)
@@ -402,6 +411,9 @@ class QSAPFileHandler:
             bounds = fit['bounds']
             content += f"BOUNDS_LOWER={bounds[0]}\n"
             content += f"BOUNDS_UPPER={bounds[1]}\n"
+            print(f"[QSAP_WRITE] Gaussian component {component_num}: wrote bounds={bounds}", flush=True)
+        else:
+            print(f"[QSAP_WRITE] WARNING: Gaussian component {component_num} has NO bounds!", flush=True)
         
         # Quality metrics
         if 'chi2' in fit:
@@ -466,7 +478,7 @@ class QSAPFileHandler:
             content += f"TIED_REDSHIFT={fit['tied_redshift']}\n"
         
         # Covariance matrix (3x3 for Gaussian: amp, mean, stddev)
-        if 'covariance' in fit and fit['covariance']:
+        if 'covariance' in fit and fit['covariance'] is not None:
             cov = fit['covariance']
             if isinstance(cov, list):
                 cov = np.array(cov)
@@ -540,6 +552,9 @@ class QSAPFileHandler:
             bounds = fit['bounds']
             content += f"BOUNDS_LOWER={bounds[0]}\n"
             content += f"BOUNDS_UPPER={bounds[1]}\n"
+            print(f"[QSAP_WRITE] Voigt component {component_num}: wrote bounds={bounds}", flush=True)
+        else:
+            print(f"[QSAP_WRITE] WARNING: Voigt component {component_num} has NO bounds!", flush=True)
         
         # Quality metrics
         if 'chi2' in fit:
@@ -604,7 +619,7 @@ class QSAPFileHandler:
             content += f"TIED_REDSHIFT={fit['tied_redshift']}\n"
         
         # Covariance matrix (for Voigt: amplitude, center, sigma, gamma)
-        if 'covariance' in fit and fit['covariance']:
+        if 'covariance' in fit and fit['covariance'] is not None:
             cov = fit['covariance']
             if isinstance(cov, list):
                 cov = np.array(cov)
@@ -675,6 +690,9 @@ class QSAPFileHandler:
             bounds = fit['bounds']
             content += f"BOUNDS_LOWER={bounds[0]}\n"
             content += f"BOUNDS_UPPER={bounds[1]}\n"
+            print(f"[QSAP_WRITE] Polynomial component {component_num}: wrote bounds={bounds}", flush=True)
+        else:
+            print(f"[QSAP_WRITE] WARNING: Polynomial component {component_num} has NO bounds!", flush=True)
         
         # Initial guesses (if provided from listfit)
         if 'coeffs_initial' in fit:
@@ -684,6 +702,57 @@ class QSAPFileHandler:
                     content += f"COEFF_{idx}_INITIAL={coeff_init}\n"
         
         # Best fit coefficients with errors
+        if 'coeffs' in fit:
+            coeffs = fit['coeffs']
+            for idx, coeff in enumerate(coeffs):
+                coeff_err = fit.get('coeffs_err', [None] * len(coeffs))[idx]
+                content += f"COEFF_{idx}={self._format_param(coeff, coeff_err)}\n"
+        
+        content += "\n"
+        return content
+    
+    def _build_chebyshev_component(self, fit, component_num, symbol=None):
+        """Build a Chebyshev polynomial component (used in listfit)
+        
+        Args:
+            fit: Fit dictionary (must include 'coeffs', 'lam_min', 'lam_max', 'bounds')
+            component_num: Component number in overall list
+            symbol: Component symbol (e.g., 'c0', 'c1') for constraint references
+        
+        NOTE: Chebyshev coefficients are stored in the rescaled [-1, 1] frame.
+        Domain bounds (lam_min, lam_max) must be stored to reconstruct the mapping.
+        """
+        content = f"[COMPONENT_{component_num}]\n"
+        content += "TYPE=Chebyshev\n"
+        if symbol:
+            content += f"SYMBOL={symbol}\n"
+        
+        # Chebyshev degree (inferred from coefficients)
+        if 'coeffs' in fit:
+            content += f"DEGREE={len(fit['coeffs']) - 1}\n"
+        
+        # Domain bounds (CRITICAL for rescaling)
+        if 'lam_min' in fit and 'lam_max' in fit:
+            content += f"DOMAIN_MIN={self._format_value(fit['lam_min'])}\n"
+            content += f"DOMAIN_MAX={self._format_value(fit['lam_max'])}\n"
+            print(f"[QSAP_WRITE] Chebyshev component {component_num}: wrote domain=[{fit['lam_min']}, {fit['lam_max']}]", flush=True)
+        else:
+            print(f"[QSAP_WRITE] WARNING: Chebyshev component {component_num} has NO domain bounds!", flush=True)
+        
+        # Fit bounds (wavelength range where fit was performed)
+        if 'bounds' in fit:
+            bounds = fit['bounds']
+            content += f"BOUNDS_LOWER={bounds[0]}\n"
+            content += f"BOUNDS_UPPER={bounds[1]}\n"
+        
+        # Initial guesses (if provided from listfit)
+        if 'coeffs_initial' in fit:
+            coeffs_initial = fit['coeffs_initial']
+            for idx, coeff_init in enumerate(coeffs_initial):
+                if coeff_init is not None:
+                    content += f"COEFF_{idx}_INITIAL={coeff_init}\n"
+        
+        # Best fit coefficients with errors (stored in rescaled [-1, 1] frame)
         if 'coeffs' in fit:
             coeffs = fit['coeffs']
             for idx, coeff in enumerate(coeffs):
@@ -868,6 +937,138 @@ class QSAPFileHandler:
         content += "\n"
         return content
     
+    def _build_covariance_block(self, lmfit_result):
+        """Build covariance matrix and tie expression blocks for post-processing MC calculations
+        
+        Enables loading fitted profiles later and recalculating EW or other quantities
+        without re-running the fit.
+        
+        Args:
+            lmfit_result: lmfit result object with var_names, covar, params
+            
+        Returns:
+            String with [COVARIANCE_MATRIX], [FREE_PARAMETER_VALUES], [TIE_EXPRESSIONS] sections
+        """
+        import json
+        import numpy as np
+        
+        content = ""
+        
+        try:
+            # Extract free parameter names and values
+            free_param_names = lmfit_result.var_names  # List of free parameter names
+            if not free_param_names:
+                # No free parameters - all are tied/fixed, can't do MC sampling
+                return content
+            
+            free_param_values = []
+            for pname in free_param_names:
+                val = lmfit_result.params[pname].value
+                free_param_values.append(float(val) if val is not None else 0.0)
+            
+            # Extract covariance matrix (only for free parameters)
+            covar = lmfit_result.covar
+            if covar is None:
+                # No covariance available - singularor numerical issues
+                return content
+            
+            covar_array = np.array(covar, dtype=float)
+            
+            # Build [COVARIANCE_MATRIX] section
+            content += "[COVARIANCE_MATRIX]\n"
+            content += f"FREE_PARAMETERS={','.join(free_param_names)}\n"
+            content += f"MATRIX_SIZE={len(free_param_names)}\n"
+            # Flatten covariance matrix to CSV (row-major)
+            covar_flat = covar_array.flatten().tolist()
+            covar_csv = ','.join(f"{v:.10e}" for v in covar_flat)
+            content += f"COVARIANCE_FLAT={covar_csv}\n"
+            content += "\n"
+            
+            # Build [FREE_PARAMETER_VALUES] section
+            content += "[FREE_PARAMETER_VALUES]\n"
+            for pname, pval in zip(free_param_names, free_param_values):
+                content += f"{pname}={pval:.10e}\n"
+            content += "\n"
+            
+            # Build [TIE_EXPRESSIONS] section (expressions for tied parameters)
+            tie_expressions = {}
+            for pname in lmfit_result.params:
+                if pname not in free_param_names:  # This is a tied parameter
+                    expr = lmfit_result.params[pname].expr
+                    if expr:
+                        tie_expressions[pname] = expr
+            
+            if tie_expressions:
+                content += "[TIE_EXPRESSIONS]\n"
+                for pname, expr in sorted(tie_expressions.items()):
+                    content += f"{pname}={expr}\n"
+                content += "\n"
+            
+            # Build [COMPONENT_REGISTRY] section (maps params to components)
+            # Use prefix to determine component type and number
+            component_registry = {}
+            for pname in lmfit_result.params:
+                # Extract prefix (g0, g1, v0, v1, p0, z1, etc.)
+                prefix_match = None
+                if pname.startswith('g') and pname[1].isdigit():
+                    idx = 1
+                    while idx < len(pname) and pname[idx].isdigit():
+                        idx += 1
+                    if idx < len(pname) and pname[idx] == '_':
+                        prefix = pname[:idx]
+                        param_part = pname[idx+1:]
+                        comp_type = 'gaussian'
+                        prefix_match = (prefix, comp_type, param_part)
+                elif pname.startswith('v') and pname[1].isdigit():
+                    idx = 1
+                    while idx < len(pname) and pname[idx].isdigit():
+                        idx += 1
+                    if idx < len(pname) and pname[idx] == '_':
+                        prefix = pname[:idx]
+                        param_part = pname[idx+1:]
+                        comp_type = 'voigt'
+                        prefix_match = (prefix, comp_type, param_part)
+                elif pname.startswith('p') and pname[1].isdigit():
+                    idx = 1
+                    while idx < len(pname) and pname[idx].isdigit():
+                        idx += 1
+                    if idx < len(pname) and pname[idx] == '_':
+                        prefix = pname[:idx]
+                        param_part = pname[idx+1:]
+                        comp_type = 'polynomial'
+                        prefix_match = (prefix, comp_type, param_part)
+                elif pname.startswith('z') and pname[1].isdigit():
+                    prefix = pname  # z1, z2, etc. are complete param names
+                    comp_type = 'redshift'
+                    prefix_match = (prefix, comp_type, '')
+                
+                if prefix_match:
+                    prefix, comp_type, param_part = prefix_match
+                    if prefix not in component_registry:
+                        component_registry[prefix] = {'type': comp_type, 'params': []}
+                    if param_part:
+                        component_registry[prefix]['params'].append(pname)
+                    else:
+                        # Redshift component
+                        component_registry[prefix]['params'].append(pname)
+            
+            if component_registry:
+                content += "[COMPONENT_REGISTRY]\n"
+                for comp_id in sorted(component_registry.keys()):
+                    comp_info = component_registry[comp_id]
+                    comp_type = comp_info['type']
+                    params_str = ','.join(comp_info['params'])
+                    content += f"{comp_id}={comp_type}|{params_str}\n"
+                content += "\n"
+        
+        except Exception as e:
+            # If anything fails, just skip covariance output
+            print(f"[WARNING] Could not extract covariance matrix: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return content
+    
     def _format_param(self, value, error=None):
         """Format parameter with error in value±error notation"""
         if value is None:
@@ -1007,3 +1208,108 @@ class QSAPFileHandler:
         
         # Return as string
         return value_str
+    
+    def load_covariance_from_qsap(self, filepath):
+        """Load covariance matrix and tie expressions from a .qsap file for post-processing MC calculations
+        
+        Returns:
+            Dict with keys:
+            - 'free_parameter_names': list of free parameter names
+            - 'free_parameter_values': list of best-fit values
+            - 'free_parameter_covariance': numpy array (NxN)
+            - 'tie_expressions': dict mapping tied param names to expressions
+            - 'component_registry': dict mapping component IDs to param lists
+            or None if no covariance data found
+        """
+        import numpy as np
+        
+        covariance_data = {
+            'free_parameter_names': [],
+            'free_parameter_values': [],
+            'free_parameter_covariance': None,
+            'tie_expressions': {},
+            'component_registry': {}
+        }
+        
+        try:
+            with open(filepath, 'r') as f:
+                lines = f.readlines()
+            
+            current_section = None
+            matrix_size = None
+            
+            for line in lines:
+                line = line.strip()
+                
+                # Skip empty lines and comments
+                if not line or line.startswith('#'):
+                    continue
+                
+                # Section headers
+                if line.startswith('[') and line.endswith(']'):
+                    current_section = line[1:-1]  # Remove brackets
+                    continue
+                
+                # Parse key=value pairs
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    
+                    if current_section == 'COVARIANCE_MATRIX':
+                        if key == 'FREE_PARAMETERS':
+                            covariance_data['free_parameter_names'] = [s.strip() for s in value.split(',')]
+                        elif key == 'MATRIX_SIZE':
+                            matrix_size = int(value)
+                        elif key == 'COVARIANCE_FLAT':
+                            # Parse flattened covariance matrix
+                            flat_values = [float(v.strip()) for v in value.split(',')]
+                            if matrix_size and len(flat_values) == matrix_size ** 2:
+                                covariance_data['free_parameter_covariance'] = np.array(
+                                    flat_values
+                                ).reshape((matrix_size, matrix_size))
+                    
+                    elif current_section == 'FREE_PARAMETER_VALUES':
+                        # Store as dict first, then convert to array in correct order
+                        if '_free_param_dict' not in covariance_data:
+                            covariance_data['_free_param_dict'] = {}
+                        covariance_data['_free_param_dict'][key] = float(value)
+                    
+                    elif current_section == 'TIE_EXPRESSIONS':
+                        covariance_data['tie_expressions'][key] = value
+                    
+                    elif current_section == 'COMPONENT_REGISTRY':
+                        # Format: comp_id=type|param1,param2,...
+                        comp_info = value.split('|')
+                        comp_type = comp_info[0] if comp_info else 'unknown'
+                        param_list = comp_info[1].split(',') if len(comp_info) > 1 else []
+                        covariance_data['component_registry'][key] = {
+                            'type': comp_type,
+                            'params': [p.strip() for p in param_list]
+                        }
+            
+            # Convert free parameter dict to ordered array
+            if '_free_param_dict' in covariance_data:
+                free_param_dict = covariance_data.pop('_free_param_dict')
+                ordered_values = []
+                for pname in covariance_data['free_parameter_names']:
+                    ordered_values.append(free_param_dict.get(pname, 0.0))
+                covariance_data['free_parameter_values'] = ordered_values
+            
+            # Check if we have complete data
+            has_covariance = (
+                covariance_data['free_parameter_names'] and
+                covariance_data['free_parameter_values'] and
+                covariance_data['free_parameter_covariance'] is not None
+            )
+            
+            if has_covariance:
+                return covariance_data
+            else:
+                return None
+        
+        except Exception as e:
+            print(f"[MC] Error loading covariance from .qsap: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
